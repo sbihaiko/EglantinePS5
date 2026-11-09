@@ -289,9 +289,14 @@ public:
     void MakeCurrent() override {
         Check(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent");
         if (window_owner && !swap_interval_set) {
-            Check(eglSwapInterval(display, 0), "disable presentation throttling");
+            // Present in step with the display by default: an unthrottled window measures a steady
+            // 60 fps and still judders, because the presented frames are not aligned to the refresh.
+            // EDEN_SWAP_INTERVAL=0 restores the unthrottled present used for benchmarking.
+            const char* interval_env = std::getenv("EDEN_SWAP_INTERVAL");
+            const int interval = interval_env ? std::atoi(interval_env) : 1;
+            Check(eglSwapInterval(display, interval), "set presentation interval");
             swap_interval_set = true;
-            std::puts("EDEN_EGL_SWAP_INTERVAL value=0");
+            std::printf("EDEN_EGL_SWAP_INTERVAL value=%d\n", interval);
         }
         current_window_context = window_owner ? this : nullptr;
 
