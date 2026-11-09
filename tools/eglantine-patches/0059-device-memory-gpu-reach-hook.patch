@@ -1,0 +1,59 @@
+Device memory: tell the guest memory service which host pages the GPU can reach.
+
+EglantinePS5 packs cold 2 MiB slots of game memory (src/guest_memory_service.inc, EDEN_CRAM_PACK=1,
+off by default). A GPU thread that reads a packed slot faults and unpacks it, and the runs where the
+command reader ("GPU") did that were the ones with garbage draws. A weak hook,
+eden_guest_gpu_cached(host, +1/-1), is now called for every page DeviceMemoryManager maps for the
+GPU (Map/Unmap) and when a page's cached count goes from 0 to 1 or back, and the service never packs
+a slot with such a page. Without the service (host tests) the hook is null and nothing changes.
+
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -25,6 +25,9 @@
+ #include "core/device_memory_manager.h"
+ #include "core/memory.h"
+ 
++// EglantinePS5: a page of the guest's memory the GPU's caches now hold (+1) or no longer hold (-1).
++extern "C" void eden_guest_gpu_cached(const void* host, int delta) noexcept __attribute__((weak));
++
+ namespace Core {
+ 
+ namespace {
+@@ -229,6 +232,10 @@
+         }
+         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
+         tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = phys_addr;
++        // Memory the GPU can reach is never packed (EglantinePS5, src/guest_memory_service.inc).
++        if (eden_guest_gpu_cached != nullptr) {
++            eden_guest_gpu_cached(ptr, 1);
++        }
+         VideoCommon::LoadingProbe::MarkWriteback("insert CPU backing", new_vaddress);
+         InsertCPUBacking(start_page_d + i, new_vaddress, asid);
+         VideoCommon::LoadingProbe::MarkWriteback("device reverse mapping", new_vaddress);
+@@ -271,6 +278,9 @@
+         entry.cpu_backing_address = 0;
+         entry.continuity_tracker = 0;
+         if (phys_addr != 0) [[likely]] {
++            if (eden_guest_gpu_cached != nullptr) {
++                eden_guest_gpu_cached(GetPointerFromRaw<u8>(PAddr{phys_addr - 1U} << Memory::YUZU_PAGEBITS), -1);
++            }
+             u32& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
+             if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
+                 base_dev = 0;
+@@ -640,6 +650,16 @@
+ 
+         // Adds or subtracts 1, as count is a unsigned 8-bit value
+         count.fetch_add(static_cast<CounterType>(delta), std::memory_order_release);
++        // The guest memory service keeps slots the GPU's caches hold out of packing (EglantinePS5,
++        // src/guest_memory_service.inc): a page's first holder and its last one are reported.
++        if (eden_guest_gpu_cached != nullptr) {
++            const auto now = count.load(std::memory_order::relaxed);
++            if ((delta > 0 && now == 1) || (delta < 0 && now == 0)) {
++                if (const u8* host = GetPointer<u8>(page << Memory::YUZU_PAGEBITS)) {
++                    eden_guest_gpu_cached(host, delta > 0 ? 1 : -1);
++                }
++            }
++        }
+ 
+         // Assume delta is either -1 or 1
+         if (count.load(std::memory_order::relaxed) == 0) {

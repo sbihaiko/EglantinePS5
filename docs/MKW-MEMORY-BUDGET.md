@@ -90,7 +90,12 @@ cannot be given back.
 **Cold guest memory** (`EDEN_CRAM_COLD_REPORT=1`). At ~160 s, 2.5 GB of 4.4 GB held had not been
 written for 60 s or more. Sampled with LZ4, it compresses to **27%** (~0.8 ms per 2 MiB).
 
-### Packing (`EDEN_CRAM_PACK`, on by default)
+### Packing (`EDEN_CRAM_PACK=1`; off by default since 2026-11-08)
+
+Off by default: in sessions that reached a race, packing was followed by garbage GPU draws
+(1.8-2.9 billion indices) and GPU hangs, which never happened with it off; see
+`docs/MKW-MEMORY-LEAK.md`. The comparison below ran on the title screen only.
+
 
 - **Pack:** while the pool's largest free block is under 1.5 GiB, the scanner LZ4-compresses Own
   slots unwritten for 60 s or more (scanning every 5 s while short). It does up to 512 MiB per

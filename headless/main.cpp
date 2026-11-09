@@ -392,6 +392,12 @@ int main(int argc, char** argv) {
                     Eden::Report("cache", "The driver's shader cache could not move to the data folder; it starts empty");
                 (void)mkdir(cache.c_str(), 0777);
                 setenv("MESA_SHADER_CACHE_DIR", cache.c_str(), 1);
+                // The console gives a process ~267 descriptors (RLIMIT_NOFILE says 13952). Mesa's
+                // cache database keeps 4 open per part, opening parts as they are used: its default
+                // 50 parts grew to ~84 descriptors in two minutes of Mario Kart World (and could
+                // reach 200), which with the 128 the VFS keeps for loose game files ran out and the
+                // game's own file opens failed ("Too many open files"). 4 parts: 16 at most.
+                setenv("MESA_DISK_CACHE_DATABASE_NUM_PARTS", "4", 0);
                 Eden::Report("cache", ("RADV shader cache: " + cache).c_str());
             }
         }

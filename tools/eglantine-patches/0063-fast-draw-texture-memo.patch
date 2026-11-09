@@ -1,0 +1,2443 @@
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index ce5994ed12..f908ba8a93 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -108,6 +108,8 @@ add_library(video_core STATIC
+     native_qmd.h
+     native_query_trace.h
+     nx2.h
++    nx2_fast_draw.cpp
++    nx2_fast_draw.h
+     nx2_profile.h
+     present.h
+     pte_kind.h
+@@ -263,6 +265,7 @@ add_library(video_core STATIC
+     texture_cache/image_view_info.cpp
+     texture_cache/image_view_info.h
+     texture_cache/render_targets.h
++    texture_cache/sampled_views.h
+     texture_cache/samples_helper.h
+     texture_cache/stale_pages.h
+     texture_cache/texture_cache.cpp
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 1e281c655e..16de6e30d6 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -429,6 +429,39 @@ void BufferCache<P>::UpdateComputeBuffers() {
+     } while (channel_state->has_deleted_buffers);
+ }
+ 
++template <class P>
++u64 BufferCache<P>::KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const {
++    u64 hash = 0xcbf29ce484222325ULL;
++    const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
++    const auto mix_binding = [&](const Binding& binding) {
++        mix(binding.device_addr);
++        mix(binding.size);
++    };
++    if (vertex) {
++        for (const Binding& binding : channel_state->vertex_buffers) {
++            mix_binding(binding);
++        }
++    }
++    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
++        if (storage) {
++            mix(channel_state->enabled_storage_buffers[stage]);
++            mix(channel_state->written_storage_buffers[stage]);
++            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
++                mix_binding(channel_state->storage_buffers[stage][index]);
++            });
++        }
++        if (texture) {
++            mix(channel_state->enabled_texture_buffers[stage]);
++            ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
++                const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
++                mix_binding(binding);
++                mix(static_cast<u64>(binding.format));
++            });
++        }
++    }
++    return hash;
++}
++
+ template <class P>
+ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
+     if (is_indexed) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index fe5712cee7..2b5d50b466 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -347,6 +347,9 @@ public:
+ 
+     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
+ 
++    /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
++    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
++
+     template <typename Func>
+     void BufferOperations(Func&& func) {
+         do {
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 1d93195e9f..4c253dbf05 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -460,7 +460,7 @@ bool DmaPusher::Step() {
+                         split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
+                                      bytes = words * sizeof(u32)] {
+                             engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
+-                        });
++                        }, VideoCommon::GpuSplit::FastDrawNeutral);
+                     }
+                 } else {
+                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
+diff --git a/src/video_core/engines/engine_interface.h b/src/video_core/engines/engine_interface.h
+index 83dbf13059..566501ddbf 100644
+--- a/src/video_core/engines/engine_interface.h
++++ b/src/video_core/engines/engine_interface.h
+@@ -47,6 +47,9 @@ public:
+     std::vector<std::pair<u32, u32>> method_sink{};
+     GPUVAddr current_dma_segment;
+     bool current_dirty{};
++    /// Fast draw (nx2_fast_draw.h): the engine reports its own changes (Maxwell3D); a method of
++    /// any other engine run on the split's back ends the delta chain.
++    bool reports_fast_draw_breaks{};
+ protected:
+     virtual void ConsumeSinkImpl(Core::System& system) {
+         for (auto [method, value] : method_sink) {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 531f2e7c26..1761883a8e 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -48,6 +48,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
+ {
+     dirty.flags.flip();
+     InitializeRegisterDefaults();
++    reports_fast_draw_breaks = true;
+     execution_mask.reset();
+     for (size_t i = 0; i < execution_mask.size(); i++)
+         execution_mask[i] = IsMethodExecutable(u32(i));
+@@ -351,12 +352,111 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+         draw_manager.DrawDeferred(*this);
+     }
++    if (regs.reg_array[method] != argument && !IsFastDrawParameter(method) &&
++        VideoCommon::Nx2FastDraw::Enabled()) {
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
++    }
+     regs.reg_array[method] = argument;
+     for (auto const& table : dirty.tables)
+         dirty.flags[table[method]] = true;
+ }
+ 
++bool Maxwell3D::IsFastDrawParameter(u32 method) {
++    switch (method) {
++    case MAXWELL3D_REG_INDEX(const_buffer.size):
++    case MAXWELL3D_REG_INDEX(const_buffer.address_high):
++    case MAXWELL3D_REG_INDEX(const_buffer.address_low):
++    case MAXWELL3D_REG_INDEX(const_buffer.offset):
++    case MAXWELL3D_REG_INDEX(global_base_vertex_index):
++    case MAXWELL3D_REG_INDEX(global_base_instance_index):
++    // Nothing in the renderer reads vertex_id_base (only the HLE draw macros write it), so a change
++    // can't alter what a draw resolves. NVN's draw macros set it before nearly every indexed draw:
++    // ~25,000 chain breaks a second at Donkey Kong Bananza's Ingot Isle gate.
++    case MAXWELL3D_REG_INDEX(vertex_id_base):
++    case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
++    case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
++    case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
++    case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
++    case MAXWELL3D_REG_INDEX(index_buffer.format):
++        return true;
++    default:
++        return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
++               IsFastDrawVertexBuffer(method);
++    }
++}
++
++bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
++    constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
++    constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
++    if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
++        const u32 word = (method - streams) % stream_words;
++        return word == 1 || word == 2; // address_high, address_low
++    }
++    constexpr u32 sizes = 0x600 / sizeof(u32); // SET_VERTEX_STREAM_SIZE_A/B (NativeVertexStreamSize)
++    constexpr u32 limits = MAXWELL3D_REG_INDEX(vertex_stream_limits);
++    constexpr u32 limit_words = sizeof(Regs::VertexStreamLimit) / sizeof(u32);
++    return (method >= sizes && method < sizes + Regs::NumVertexArrays * 2) ||
++           (method >= limits && method < limits + Regs::NumVertexArrays * limit_words);
++}
++
++bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
++    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
++    if (method >= cb_data && method < cb_data + Regs::NumCBData) {
++        return true;
++    }
++    switch (method) {
++    case MAXWELL3D_REG_INDEX(bind_groups[0].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[1].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[2].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[3].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[4].raw_config):
++        return true;
++    default:
++        return false;
++    }
++}
++
++void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
++    namespace FastDraw = VideoCommon::Nx2FastDraw;
++    // Texture and sampler headers are read when image views are resolved, which delta draws skip.
++    constexpr u64 HeaderSize = 0x20;
++    const GPUVAddr tic = regs.tex_header.Address();
++    const u64 tic_size = (u64{regs.tex_header.limit} + 1) * HeaderSize;
++    // As TextureCache::SynchronizeDescriptors sizes the sampler table.
++    const GPUVAddr tsc = regs.tex_sampler.Address();
++    const u64 tsc_size = (u64{regs.sampler_binding == Regs::SamplerBinding::ViaHeaderBinding
++                                  ? regs.tex_header.limit
++                                  : regs.tex_sampler.limit} +
++                          1) *
++                         HeaderSize;
++    if ((begin < tic + tic_size && tic < end) || (begin < tsc + tsc_size && tsc < end)) {
++        FastDraw::Break(FastDraw::Reason::TextureHeaders);
++        return;
++    }
++    FastDraw::NoteConstantData(begin, end);
++    // The same device memory can be mapped at other GPU addresses: compare where it lands.
++    fast_draw_header_spans.Update(memory_manager, tic, tic_size);
++    fast_draw_sampler_spans.Update(memory_manager, tsc, tsc_size);
++    constexpr u64 PageSize = 0x1000; // the smallest GPU page
++    for (GPUVAddr page = begin; page < end;) {
++        const GPUVAddr page_end = (std::min)(end, (page & ~(PageSize - 1)) + PageSize);
++        if (const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(page)) {
++            const DAddr device_end = *device + (page_end - page);
++            if (fast_draw_header_spans.Intersects(*device, device_end) ||
++                fast_draw_sampler_spans.Intersects(*device, device_end)) {
++                FastDraw::Break(FastDraw::Reason::TextureHeaders);
++                return;
++            }
++            FastDraw::NoteDeviceData(*device, device_end);
++        }
++        page = page_end;
++    }
++}
++
+ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
++    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
++    }
+     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
+         LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
+     }
+@@ -582,6 +682,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
+         break;
+     case MAXWELL3D_REG_INDEX(inline_data): {
+         ASSERT(methods_pending == amount);
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::InlineData);
+         upload_state.ProcessData(base_start, amount);
+         return;
+     }
+@@ -757,6 +858,11 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
+         return; // slot field is 5 bits; the state array holds 18
+     }
+     auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
++    if (VideoCommon::Nx2FastDraw::Enabled() &&
++        (buffer.enabled != (bind_data.valid.Value() != 0) ||
++         buffer.address != regs.const_buffer.Address() || buffer.size != regs.const_buffer.size)) {
++        VideoCommon::Nx2FastDraw::NoteBind(stage_index, bind_data.shader_slot);
++    }
+     buffer.enabled = bind_data.valid.Value() != 0;
+     buffer.address = regs.const_buffer.Address();
+     buffer.size = regs.const_buffer.size;
+@@ -781,6 +887,9 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+ 
+     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+     const size_t copy_size = amount * sizeof(u32);
++    if (VideoCommon::Nx2FastDraw::Enabled()) {
++        NoteFastDrawConstantData(address, address + copy_size);
++    }
+     memory_manager.WriteBlockCached(address, start_base, copy_size);
+ 
+     // Increment the current buffer position.
+@@ -1186,7 +1295,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+     fs.parameters.clear();
+     if (fs.draw_pending) {
+         fs.draw_pending = false;
+-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
++        // ConsumeSink and the deferred draw report their own fast draw breaks.
++        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
++                    VideoCommon::GpuSplit::FastDrawNeutral);
+     }
+     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+         FrontVerify(split, fs);
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 8b662a182b..201e511dfd 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -26,6 +26,7 @@
+ #include "video_core/engines/engine_upload.h"
+ #include "video_core/gpu.h"
+ #include "video_core/macro.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/textures/texture.h"
+ #include "video_core/engines/maxwell_3d.h"
+ 
+@@ -3250,6 +3251,16 @@ public:
+     /// Handles a write to the CB_BIND register.
+     void ProcessCBBind(size_t stage_index);
+ 
++    /// Fast draw (nx2_fast_draw.h): registers that only parameterize the next draw, the next
++    /// constant buffer bind or the buffers a delta draw binds again, or that ProcessMethodCall
++    /// handles, so writing them doesn't end the delta chain.
++    static bool IsFastDrawParameter(u32 method);
++    /// Methods fast draw records as light changes (constant buffer data and binds).
++    static bool IsFastDrawDeltaMethod(u32 method);
++    /// A vertex stream's address, size or limit (not its stride or enable).
++    static bool IsFastDrawVertexBuffer(u32 method);
++    void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
++
+     /// Handles a write to the CB_DATA[i] register.
+     void ProcessCBData(u32 value);
+     /// A run of CB_DATA writes from the split GPU thread's front (GpuSplit::CbDataWrite): words
+@@ -3333,6 +3344,10 @@ private:
+ 
+     MemoryManager& memory_manager;
+ 
++    /// Device memory of the texture and sampler header tables (NoteFastDrawConstantData).
++    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_header_spans;
++    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_sampler_spans;
++
+     VideoCore::RasterizerInterface* rasterizer = nullptr;
+ 
+     /// Start offsets of each macro in macro_memory
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 747c7c2c0d..63317547c1 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -25,6 +25,7 @@
+ #include "video_core/gpu_split.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/rasterizer_interface.h"
+ 
+ namespace Tegra::Engines {
+@@ -73,6 +74,22 @@ void DrainBack() {
+     VideoCommon::GpuSplit::Get().Drain();
+ }
+ 
++// A semaphore acquire: what the CPU (or another channel) wrote before the release it waits for
++// can change what the next draws resolve to (texture handles, headers), so they don't take the
++// fast draw delta path. With the split the break runs on the back in order (an empty deferred
++// call ends the chain there): a break on the front could land before the back noted a draw sent
++// before the acquire, and the chain would run across it.
++void BreakFastDrawAtAcquire() {
++    if (!VideoCommon::Nx2FastDraw::Enabled()) {
++        return;
++    }
++    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++        split.Defer([] {});
++    } else {
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
++    }
++}
++
+ // Where the last release of each semaphore word was queued for the back (every channel's puller
+ // runs on the front, so one table without a lock). An acquire whose word is not met yet waits
+ // for the back only up to that release instead of everything queued: at Mario Kart World's
+@@ -353,7 +370,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
+         });
+         NoteRelease(dma_pusher, sequence_address, payload);
+-    } else if (g_nx2_ampere) {
++        return;
++    }
++    BreakFastDrawAtAcquire();
++    if (g_nx2_ampere) {
+         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
+         // written the commands this channel runs next: suspend the channel until the value is
+         // met instead of reading ahead (approach from changes.patch).
+@@ -486,6 +506,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
+ }
+ 
+ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
++    BreakFastDrawAtAcquire();
+     DrainBack();
+     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
+     const auto value = regs.semaphore_acquire;
+@@ -515,6 +536,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         NoteRelease(dma_pusher, address, payload);
+         return;
+     }
++    BreakFastDrawAtAcquire();
+     const auto met = [operation, payload](u32 word) {
+         return operation == 0   ? word == payload
+                : operation == 2 ? word >= payload
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 6d975a0464..7074ccfffb 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -25,6 +25,7 @@
+ #include "video_core/gpu.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/host1x/syncpoint_manager.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/readback_diagnostics.h"
+@@ -210,6 +211,8 @@ private:
+             }
+             gpu.BeginAsyncGuestWrite();
+             SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
++            // Downloads and operations write guest memory the next draws may read.
++            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+             PopAsyncFlushes(pending_flushes.front());
+             pending_flushes.pop_front();
+             auto operations = std::move(pending_operations.front());
+@@ -274,6 +277,10 @@ private:
+             }
+             gpu.BeginAsyncGuestWrite();
+             SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
++            // Downloads and operations write guest memory the next draws may read: before (a draw
++            // locking the caches after this sees it) and after (one that noted the serial while
++            // they ran).
++            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+             size_t texture_pops = 0;
+             size_t buffer_pops = 0;
+             for (const Released& released : batch) {
+@@ -299,6 +306,7 @@ private:
+                     operation();
+                 }
+             }
++            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+             {
+                 std::unique_lock lock(ring_guard);
+                 for (Released& released : batch) {
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index ec08b40855..9b4945987b 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -41,6 +41,7 @@
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/shader_notify.h"
+ 
+@@ -183,6 +184,7 @@ struct GPU::Impl {
+             auto request = std::move(sync_requests.front());
+             sync_requests.pop_front();
+             sync_request_mutex.unlock();
++            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
+             request();
+             current_sync_fence.fetch_add(1, std::memory_order_release);
+             sync_request_mutex.lock();
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 6bcd172890..0ac10a56a1 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -23,6 +23,7 @@
+ #include "video_core/engines/engine_interface.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu_split.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+ 
+@@ -380,12 +381,14 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method,
+     }
+ }
+ 
+-void GpuSplit::DeferFunction(std::function<void()>&& func) {
++void GpuSplit::DeferFunction(std::function<void()>&& func, u64 flags) {
+     auto* const heap = new std::function<void()>(std::move(func));
+-    Defer([heap] {
+-        (*heap)();
+-        delete heap;
+-    });
++    Defer(
++        [heap] {
++            (*heap)();
++            delete heap;
++        },
++        flags);
+ }
+ 
+ size_t GpuSplit::Execute(const u64* entry) {
+@@ -400,6 +403,9 @@ size_t GpuSplit::Execute(const u64* entry) {
+         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+         const u32 argument = static_cast<u32>(head >> 32);
+         auto* const engine = back_engine;
++        if (!engine->reports_fast_draw_breaks) {
++            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
++        }
+         if ((head & Direct) != 0) {
+             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+             engine->ConsumeSink(*system);
+@@ -421,6 +427,9 @@ size_t GpuSplit::Execute(const u64* entry) {
+         const u32 amount = static_cast<u32>(head >> 32);
+         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
+         auto* const engine = back_engine;
++        if (!engine->reports_fast_draw_breaks) {
++            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
++        }
+         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+         engine->ConsumeSink(*system);
+         if ((head & HasSegment) != 0) {
+@@ -433,6 +442,9 @@ size_t GpuSplit::Execute(const u64* entry) {
+     case Kind::Regs: {
+         const u32 count = static_cast<u32>((head >> 8) & 0xff);
+         auto* const engine = back_engine;
++        if (!engine->reports_fast_draw_breaks) {
++            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
++        }
+         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+         for (u32 i = 0; i < count; ++i) {
+             engine->method_sink.emplace_back(static_cast<u32>(entry[1 + i]), static_cast<u32>(entry[1 + i] >> 32));
+@@ -449,6 +461,9 @@ size_t GpuSplit::Execute(const u64* entry) {
+         return 1 + count;
+     }
+     case Kind::Call: {
++        if ((head & FastDrawNeutral) == 0) {
++            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
++        }
+         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+         return 2 + payload;
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 210e8d1a1e..edb5db0766 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -101,18 +101,23 @@ public:
+         Commit(1);
+     }
+ 
++    /// Defer flag: the call can't change what a draw resolves to, so it doesn't end the fast
++    /// draw delta chain (nx2_fast_draw.h). Every other deferred call does.
++    static constexpr u64 FastDrawNeutral = 1 << 7;
++
+     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
++    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
+     template <typename Func>
+-    void Defer(const Func& func) {
++    void Defer(const Func& func, u64 flags = 0) {
+         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+         u64* const entry = Reserve(2 + payload);
+-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
++        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
+         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
+         std::memcpy(entry + 2, &func, sizeof(Func));
+         Commit(2 + payload);
+     }
+-    void DeferFunction(std::function<void()>&& func);
++    void DeferFunction(std::function<void()>&& func, u64 flags = 0);
+ 
+     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
+     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 5f44a14ba2..efa8c6b5ce 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -159,7 +159,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                     split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); });
+                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
++                    // TickWork ends the fast draw delta chain itself when it runs a request.
++                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
++                                VideoCommon::GpuSplit::FastDrawNeutral);
+                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
+                     split.DeferFunction(std::move(run->func));
+                 } else if (const auto* read = std::get_if<CpuReadCommand>(&next.data)) {
+@@ -182,7 +184,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 }
+                 split.DeferFunction([state_ptr = &state, fence = next.fence, completion = next.completion] {
+                     SignalCommand(*state_ptr, fence, completion);
+-                });
++                }, VideoCommon::GpuSplit::FastDrawNeutral);
+                 split.Publish();
+                 continue;
+             }
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index 309b41eac6..ab1887887a 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -29,6 +29,7 @@
+ #include "common/container_hash.h"
+ #include "core/core.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/memory_manager.h"
+@@ -1684,8 +1685,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+ 
+         UNREACHABLE();
+     };
++    // HLE programs write registers directly, without the 3D engine's fast draw breaks.
++    namespace FastDraw = VideoCommon::Nx2FastDraw;
+     if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
++        FastDraw::Break(FastDraw::Reason::Method, method);
+         execute_variant(it->second.program);
++        FastDraw::Break(FastDraw::Reason::Method, method);
+         return;
+     }
+ 
+@@ -1726,7 +1731,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+         ci.program = Compile(system, maxwell3d, code);
+     }
+ 
++    FastDraw::Break(FastDraw::Reason::Method, method);
+     execute_variant(ci.program);
++    FastDraw::Break(FastDraw::Reason::Method, method);
+     if (Settings::values.dump_macros) {
+         Dump(ci.hash, code, !std::holds_alternative<std::monostate>(ci.program));
+     }
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 9cc5e48b6b..2867d3f143 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -10,6 +10,7 @@
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/logging.h"
++#include "common/scope_exit.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_page_table.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -221,12 +222,20 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_)
+ }
+ 
+ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
++    map_serial.fetch_add(1, std::memory_order_release);
++    SCOPE_EXIT {
++        map_serial.fetch_add(1, std::memory_order_release);
++    };
+     if (is_big_pages)
+         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+     return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+ }
+ 
+ GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
++    map_serial.fetch_add(1, std::memory_order_release);
++    SCOPE_EXIT {
++        map_serial.fetch_add(1, std::memory_order_release);
++    };
+     if (is_big_pages)
+         return BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+     return PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+@@ -236,6 +245,10 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
+     if (size == 0) {
+         return;
+     }
++    map_serial.fetch_add(1, std::memory_order_release);
++    SCOPE_EXIT {
++        map_serial.fetch_add(1, std::memory_order_release);
++    };
+     GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
+ 
+     for (const auto& [map_addr, map_size] : page_stash) {
+@@ -761,6 +774,16 @@ MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
+     return result;
+ }
+ 
++boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
++MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
++    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
++    if (IsWithinGPUAddressRange(gpu_addr)) {
++        GetSubmappedRangeImpl<false>(gpu_addr, (std::min)(size, address_space_size - gpu_addr),
++                                     result);
++    }
++    return result;
++}
++
+ template <bool is_gpu_address>
+ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
+     const {
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 67ed30cb7c..a41a3f5eec 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -139,6 +139,22 @@ public:
+     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
+         GPUVAddr gpu_addr, std::size_t size) const;
+ 
++    /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
++    /// end of the address space.
++    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
++        GPUVAddr gpu_addr, std::size_t size) const;
++
++    /// Changes whenever Map, MapSparse or Unmap runs on this address space (fast draw).
++    [[nodiscard]] u64 MapSerial() const {
++        return map_serial.load(std::memory_order_acquire);
++    }
++
++    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
++    /// a host pointer GetPointer returned is only good while it stays the same (texture memo).
++    [[nodiscard]] u64 HostPointerSerial() const {
++        return MapSerial() + memory.MappingGeneration();
++    }
++
+     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
+                  PTEKind kind = PTEKind::INVALID, bool is_big_pages = true);
+     GPUVAddr MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages = true);
+@@ -199,6 +215,8 @@ private:
+         boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result) const;
+ 
+     std::atomic<GPUVAddr> native_syncpoint_shim{};
++    /// Bumped before and after every Map, MapSparse and Unmap (MapSerial).
++    std::atomic<u64> map_serial{1};
+     Core::System& system;
+     MaxwellDeviceMemoryManager& memory;
+ 
+diff --git a/src/video_core/nx2_fast_draw.cpp b/src/video_core/nx2_fast_draw.cpp
+new file mode 100644
+index 0000000000..5fdfd7cc95
+--- /dev/null
++++ b/src/video_core/nx2_fast_draw.cpp
+@@ -0,0 +1,41 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++
++#include "video_core/memory_manager.h"
++#include "video_core/nx2_fast_draw.h"
++
++namespace VideoCommon::Nx2FastDraw {
++
++void DeviceSpans::Update(const Tegra::MemoryManager& memory_, GPUVAddr address_, u64 size_) {
++    const u64 serial = memory_.MapSerial();
++    if (memory == &memory_ && address == address_ && size == size_ && map_serial == serial) {
++        return;
++    }
++    memory = &memory_;
++    address = address_;
++    size = size_;
++    map_serial = serial;
++    spans.clear();
++    for (const auto& [device, bytes] : memory_.GetSubmappedDeviceRange(address_, size_)) {
++        spans.emplace_back(device, device + bytes);
++    }
++    std::ranges::sort(spans);
++    size_t merged = 0;
++    for (const auto& span : spans) {
++        if (merged != 0 && span.first <= spans[merged - 1].second) {
++            spans[merged - 1].second = (std::max)(spans[merged - 1].second, span.second);
++        } else {
++            spans[merged++] = span;
++        }
++    }
++    spans.resize(merged);
++}
++
++bool DeviceSpans::Intersects(DAddr begin, DAddr end) const {
++    const auto span = std::ranges::upper_bound(spans, begin, {}, &std::pair<DAddr, DAddr>::second);
++    return span != spans.end() && span->first < end;
++}
++
++} // namespace VideoCommon::Nx2FastDraw
+diff --git a/src/video_core/nx2_fast_draw.h b/src/video_core/nx2_fast_draw.h
+new file mode 100644
+index 0000000000..4108837389
+--- /dev/null
++++ b/src/video_core/nx2_fast_draw.h
+@@ -0,0 +1,211 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdlib>
++#include <utility>
++#include <vector>
++
++#include "common/common_types.h"
++
++namespace Tegra {
++class MemoryManager;
++}
++
++/// Fast draw delta path (ported from Lichii #858/#921).
++///
++/// A draw that follows a draw of the same pipeline with only light state changes in between takes
++/// the delta path. It keeps the previous draw's pipeline, image views, samplers and texture buffer
++/// bindings, and resolves and binds every buffer (index, vertex, uniform, storage, texture) again
++/// as a full resolve does, so guest memory written without a notification is streamed as in a
++/// full resolve.
++///
++/// Light changes are draw parameters, index buffer and vertex stream registers, constant buffer
++/// binds and inline constant buffer data (collected in g_delta: the rasterizer resolves in full
++/// when they reach the pipeline's texture handles at their GPU addresses or through another
++/// mapping of their device memory). Anything else that could change what a resolve produces bumps
++/// a serial: a 3D register that changes, any 3D method with side effects (uploads, reports,
++/// clears, barriers, ...), constant buffer data reaching the texture or sampler headers (the same
++/// way), any other engine, deferred calls on the split's back (except the ones marked
++/// GpuSplit::FastDrawNeutral), GPU::TickWork requests, semaphore acquires, texture cache writes,
++/// unmaps, deletions and rescales, shader removals, fence releases, legacy HLE macros and frames.
++/// The rasterizer takes the delta path only while the serial, the GPU memory map, the command
++/// buffer, the render pass and the bound pipeline are the ones the previous draw left, and only
++/// on the split GPU thread's back (the thread that runs both the 3D engine and the rasterizer).
++///
++/// EDEN_NX2_FAST_DRAW=0 turns it off (A/B). EDEN_NX2_FAST_DRAW_VERIFY=1 resolves those draws in
++/// full and counts where the pipeline, views, samplers or kept buffer bindings differ.
++namespace VideoCommon::Nx2FastDraw {
++
++enum class Reason : u8 {
++    Register,
++    Method,
++    ConstantData,
++    InlineData,
++    OtherEngine,
++    Call,
++    TickWork,
++    Invalidation,
++    Fence,
++    IndirectReset,
++    Frame,
++    TextureHeaders,
++    DeltaOverflow,
++    Map,
++    Count,
++};
++
++inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> reason_names{
++    "register",       "method",        "constant buffer data", "inline data",
++    "other engine",   "deferred call", "tick work",            "invalidation",
++    "fence/acquire",  "indirect reset", "frame",               "texture header data",
++    "delta overflow", "memory map",
++};
++
++/// EDEN_NX2_FAST_DRAW=0 turns fast draws off; read once.
++inline std::atomic<bool> g_enabled{[] {
++    const char* const value = std::getenv("EDEN_NX2_FAST_DRAW");
++    return value == nullptr || value[0] != '0';
++}()};
++
++/// Any thread: whether fast draws run. The rasterizer latches it per draw (on the thread that
++/// draws) and starts with a full resolve when it turns on.
++[[nodiscard]] inline bool Enabled() {
++    return g_enabled.load(std::memory_order_relaxed);
++}
++
++/// Tests only.
++inline void SetEnabledForTest(bool on) {
++    g_enabled.store(on, std::memory_order_relaxed);
++}
++
++/// EDEN_NX2_FAST_DRAW_VERIFY=1, read once.
++[[nodiscard]] inline bool VerifyEnabled() {
++    static const bool verify = [] {
++        const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_VERIFY");
++        return value != nullptr && value[0] == '1';
++    }();
++    return verify;
++}
++
++inline std::atomic<u64> g_serial{1};
++/// The last break's reason and, for Register and Method, its 3D method (diagnostics).
++inline std::atomic<u32> g_last_break{};
++
++inline void Break(Reason reason, u32 method = 0) {
++    if (Enabled()) {
++        g_serial.fetch_add(1, std::memory_order_relaxed);
++        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
++    }
++}
++
++inline u64 Serial() {
++    return g_serial.load(std::memory_order_relaxed);
++}
++
++/// The device memory a GPU range maps to. A write through another GPU address that maps the
++/// same device memory changes the range too.
++class DeviceSpans {
++public:
++    /// Translates [address, address + size) again unless that range of memory was translated last
++    /// and memory's mappings haven't changed since.
++    void Update(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
++
++    /// Whether [begin, end) of device memory overlaps the range's.
++    [[nodiscard]] bool Intersects(DAddr begin, DAddr end) const;
++
++private:
++    const Tegra::MemoryManager* memory{};
++    GPUVAddr address{};
++    u64 size{};
++    u64 map_serial{};
++    std::vector<std::pair<DAddr, DAddr>> spans; ///< Sorted, disjoint [begin, end) pairs
++};
++
++/// Light changes since the last draw that can reach texture handles. Written and read on the
++/// thread that runs the 3D engine and the rasterizer (the split's back).
++struct Delta {
++    static constexpr size_t MaxWrites = 16;
++
++    std::array<u32, 5> binds{}; ///< Constant buffer slots bound per stage
++    /// Constant buffer data written, by GPU address (unmapped addresses included)...
++    std::array<GPUVAddr, MaxWrites> write_begin{};
++    std::array<GPUVAddr, MaxWrites> write_end{};
++    u32 num_writes{};
++    /// ...and by the device address it landed on.
++    std::array<DAddr, MaxWrites> device_begin{};
++    std::array<DAddr, MaxWrites> device_end{};
++    u32 num_device_writes{};
++
++    [[nodiscard]] bool Empty() const {
++        return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
++    }
++
++    /// Whether data written reaches [address, address + size), whose device memory is spans: at
++    /// one of its GPU addresses, or through any GPU address that maps its device memory.
++    [[nodiscard]] bool Reaches(GPUVAddr address, u64 size, const DeviceSpans& spans) const {
++        for (u32 write = 0; write < num_writes; ++write) {
++            if (write_begin[write] < address + size && address < write_end[write]) {
++                return true;
++            }
++        }
++        for (u32 write = 0; write < num_device_writes; ++write) {
++            if (spans.Intersects(device_begin[write], device_end[write])) {
++                return true;
++            }
++        }
++        return false;
++    }
++};
++
++inline Delta g_delta;
++
++/// Appends [begin, end) to a delta's range list, or extends its last range when that ends at
++/// begin. False when the list is full.
++inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
++                        std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end) {
++    if (count != 0 && ends[count - 1] == begin) {
++        ends[count - 1] = end;
++        return true;
++    }
++    if (count == Delta::MaxWrites) {
++        return false;
++    }
++    begins[count] = begin;
++    ends[count] = end;
++    ++count;
++    return true;
++}
++
++inline void NoteBind(size_t stage, u32 slot) {
++    if (Enabled()) {
++        g_delta.binds[stage] |= 1U << slot;
++    }
++}
++
++/// Inline constant buffer data written to GPU addresses [begin, end).
++inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
++    if (!Enabled()) {
++        return;
++    }
++    Delta& delta = g_delta;
++    if (!AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
++        Break(Reason::DeltaOverflow);
++    }
++}
++
++/// The device addresses [begin, end) that inline constant buffer data landed on.
++inline void NoteDeviceData(DAddr begin, DAddr end) {
++    if (!Enabled()) {
++        return;
++    }
++    Delta& delta = g_delta;
++    if (!AppendRange(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end)) {
++        Break(Reason::DeltaOverflow);
++    }
++}
++
++} // namespace VideoCommon::Nx2FastDraw
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index bfb8fda103..1f5c63a3b6 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -6,9 +6,14 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <vector>
++#include <cstdlib>
++#include <chrono>
++#include <atomic>
+ #include <cstring>
+ #include <iostream>
+ #include <span>
++#include <utility>
+ 
+ #include <boost/container/small_vector.hpp>
+ #include <boost/container/static_vector.hpp>
+@@ -259,6 +264,57 @@ ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& m
+     return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
+                     DefaultSpec>(modules, infos);
+ }
++
++// EDEN_NX2_TEXTURE_MEMO=0 turns the texture memo off; read once.
++bool TextureMemoEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_TEXTURE_MEMO");
++        return value == nullptr || value[0] != '0';
++    }();
++    return enabled;
++}
++
++// EDEN_NX2_TEXTURE_MEMO_VERIFY=1, read once: draws resolved from a memo are also resolved in full
++// and compared.
++bool TextureMemoVerify() {
++    static const bool verify = [] {
++        const char* const value = std::getenv("EDEN_NX2_TEXTURE_MEMO_VERIFY");
++        return value != nullptr && value[0] == '1';
++    }();
++    return verify;
++}
++
++// Texture memo counts, logged every 10 s with EDEN_NX2_GPU_PROFILE or the verify env.
++std::atomic<u64> g_memo_hits{};
++std::atomic<u64> g_memo_misses{};
++std::atomic<u64> g_memo_mismatches{};
++
++// Counters the drawing thread writes: a plain load and store, not a locked add.
++void Count(std::atomic<u64>& counter) {
++    counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
++}
++
++void ReportTextureMemo() {
++    if (!VideoCommon::Nx2Profile::Enabled() && !TextureMemoVerify()) {
++        return;
++    }
++    using Clock = std::chrono::steady_clock;
++    static Clock::time_point next_report{};
++    const Clock::time_point now = Clock::now();
++    if (now < next_report) {
++        return;
++    }
++    const bool first = next_report == Clock::time_point{};
++    next_report = now + std::chrono::seconds{10};
++    const u64 hits = g_memo_hits.exchange(0, std::memory_order_relaxed);
++    const u64 misses = g_memo_misses.exchange(0, std::memory_order_relaxed);
++    if (!first && (hits != 0 || misses != 0)) {
++        LOG_INFO(Render_Vulkan,
++                 "Texture memo: {} draws resolved from the memo, {} in full in 10 s; {} verify "
++                 "mismatches in total",
++                 hits, misses, g_memo_mismatches.load(std::memory_order_relaxed));
++    }
++}
+ } // Anonymous namespace
+ 
+ // TODO(crueter): This is the worst-formatted code I have EVER seen
+@@ -294,6 +350,47 @@ GraphicsPipeline::GraphicsPipeline(
+         num_descriptor_entries += NumDescriptorEntries(*info);
+     }
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
++    const auto any_written = [](const auto& descriptors) {
++        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
++    };
++    writes_images = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
++        return any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
++    });
++    texture_memo_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
++        return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
++               info.image_descriptors.empty() &&
++               std::ranges::all_of(info.texture_descriptors,
++                                    [](const auto& desc) { return !desc.has_secondary; });
++    }) && num_textures != 0;
++    // Fast draw (nx2_fast_draw.h): which pipelines can keep their views and samplers, and the
++    // constant buffers their handles come from.
++    if (writes_images) {
++        delta_blocker = DeltaBlocker::WritesImages;
++    } else if (IsMeshPipeline()) {
++        delta_blocker = DeltaBlocker::Mesh;
++    }
++    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
++        const Shader::Info& info = stage_infos[stage];
++        u32& handles = handle_constant_buffers[stage];
++        for (const auto& desc : info.texture_buffer_descriptors) {
++            handles |= 1U << desc.cbuf_index;
++            if (desc.has_secondary) {
++                handles |= 1U << desc.secondary_cbuf_index;
++            }
++        }
++        for (const auto& desc : info.image_buffer_descriptors) {
++            handles |= 1U << desc.cbuf_index;
++        }
++        for (const auto& desc : info.texture_descriptors) {
++            handles |= 1U << desc.cbuf_index;
++            if (desc.has_secondary) {
++                handles |= 1U << desc.secondary_cbuf_index;
++            }
++        }
++        for (const auto& desc : info.image_descriptors) {
++            handles |= 1U << desc.cbuf_index;
++        }
++    }
+ 
+     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+     uses_push_descriptor = builder.CanUsePushDescriptor();
+@@ -386,6 +483,68 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+ 
+     const auto& regs{maxwell3d->regs};
+     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
++
++    // Texture memo: a pipeline whose descriptors are all sampled textures resolves them from what
++    // its last full resolve read while every byte of it is the same.
++    const bool use_memo{texture_memo_eligible && TextureMemoEnabled()};
++    const bool verify_memo{use_memo && TextureMemoVerify()};
++    boost::container::small_vector<GPUVAddr, 32> handle_addresses;
++    boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
++    boost::container::small_vector<VideoCommon::ImageViewInOut, 32> memo_views;
++    boost::container::small_vector<VideoCommon::SamplerId, 32> memo_samplers;
++    std::vector<VideoCommon::ImageId> memo_prepared;
++    std::vector<VideoCommon::ImageId> full_prepared;
++    bool memo_hit{};
++    if (use_memo) {
++        const auto collect_addresses{[&](size_t stage) LAMBDA_FORCEINLINE {
++            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
++            for (const auto& desc : stage_infos[stage].texture_descriptors) {
++                for (u32 index = 0; index < desc.count; ++index) {
++                    handle_addresses.push_back(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
++                                               (index << desc.size_shift));
++                }
++            }
++        }};
++        if constexpr (Spec::enabled_stages[0]) {
++            collect_addresses(0);
++        }
++        if constexpr (Spec::enabled_stages[1]) {
++            collect_addresses(1);
++        }
++        if constexpr (Spec::enabled_stages[2]) {
++            collect_addresses(2);
++        }
++        if constexpr (Spec::enabled_stages[3]) {
++            collect_addresses(3);
++        }
++        if constexpr (Spec::enabled_stages[4]) {
++            collect_addresses(4);
++        }
++        views.resize(num_image_elements);
++        samplers.resize(num_textures);
++        if (verify_memo) {
++            // The full resolve prepares the images: the memo only lists those it would prepare.
++            texture_cache.LogPrepares(&memo_prepared, true);
++        }
++        memo_hit = handle_addresses.size() == views.size() &&
++                   texture_cache.ResolveMemoizedTextures(
++                       texture_memo, std::span(handle_addresses.data(), handle_addresses.size()),
++                       std::span(views.data(), views.size()),
++                       std::span(samplers.data(), samplers.size()));
++        if (verify_memo) {
++            texture_cache.LogPrepares(nullptr, false);
++        }
++        if (memo_hit && verify_memo) {
++            memo_views.assign(views.begin(), views.end());
++            memo_samplers.assign(samplers.begin(), samplers.end());
++        }
++        if (!memo_hit || verify_memo) {
++            views.clear();
++            samplers.clear();
++        }
++    }
++    const bool resolve_in_full{!memo_hit || verify_memo};
++
+     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+         const Shader::Info& info{stage_infos[stage]};
+         buffer_cache.UnbindGraphicsStorageBuffers(stage);
+@@ -440,13 +599,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+                 add_image(desc, false);
+             }
+         }
+-        for (const auto& desc : info.texture_descriptors) {
+-            for (u32 index = 0; index < desc.count; ++index) {
+-                const auto handle{read_handle(desc, index)};
+-                views.push_back({handle.first});
+-
+-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+-                samplers.push_back(sampler);
++        if (resolve_in_full) {
++            for (const auto& desc : info.texture_descriptors) {
++                for (u32 index = 0; index < desc.count; ++index) {
++                    const auto handle{read_handle(desc, index)};
++                    views.push_back({handle.first});
++
++                    VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
++                    samplers.push_back(sampler);
++                    if (use_memo && handle_reads.size() < handle_addresses.size()) {
++                        handle_reads.push_back({handle_addresses[handle_reads.size()],
++                                                handle.first, handle.second});
++                    }
++                }
+             }
+         }
+         if constexpr (Spec::has_images) {
+@@ -477,11 +642,69 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     }
+     ASSERT(views.size() == num_image_elements);
+     ASSERT(samplers.size() == num_textures);
+-    {
++    if (memo_hit && verify_memo) {
++        texture_cache.LogPrepares(&full_prepared, false);
++    }
++    if (resolve_in_full) {
+         Profile::Scope scope{Profile::Zone::FillImageViews};
+         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                      Spec::has_images);
+     }
++    if (memo_hit && verify_memo) {
++        texture_cache.LogPrepares(nullptr, false);
++    }
++    if (use_memo) {
++        if (!memo_hit) {
++            Count(g_memo_misses);
++            // A pipeline whose draws keep changing textures stops paying for a memo nobody uses.
++            if (++texture_memo.misses <= 8 || (texture_memo.misses & 15) == 0) {
++                texture_cache.MemoizeTextures(texture_memo,
++                                              std::span(handle_reads.data(), handle_reads.size()),
++                                              std::span(views.data(), views.size()),
++                                              std::span(samplers.data(), samplers.size()));
++            }
++        } else {
++            texture_memo.misses = 0;
++            Count(g_memo_hits);
++        }
++        if (memo_hit && verify_memo) {
++            // Bindings alone miss what the paths do to the images (Lichii #904 prepared the null
++            // one).
++            for (auto* const prepared : {&memo_prepared, &full_prepared}) {
++                std::ranges::sort(*prepared);
++                prepared->erase(std::unique(prepared->begin(), prepared->end()), prepared->end());
++            }
++            const bool same =
++                std::ranges::equal(views, memo_views,
++                                   [](const auto& lhs, const auto& rhs) {
++                                       return lhs.index == rhs.index && lhs.id == rhs.id;
++                                   }) &&
++                std::ranges::equal(samplers, memo_samplers) && memo_prepared == full_prepared;
++            if (!same) {
++                Count(g_memo_mismatches);
++                LOG_ERROR(Render_Vulkan,
++                          "Texture memo: pipeline {:016x} resolved other views, samplers or "
++                          "prepared images than its memo",
++                          key.Hash());
++            }
++        }
++        ReportTextureMemo();
++    }
++    if (std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None) {
++        const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
++                                  const VideoCommon::ImageViewInOut& rhs) {
++            return lhs.index == rhs.index && lhs.id == rhs.id;
++        };
++        if (std::exchange(verify_delta, false)) {
++            delta_mismatch = !delta_views_valid ||
++                             !std::ranges::equal(views, delta_views, same_view) ||
++                             !std::ranges::equal(samplers, delta_samplers);
++        }
++        delta_views.assign(views.begin(), views.end());
++        delta_samplers.assign(samplers.begin(), samplers.end());
++        configured_stages = Spec::enabled_stages;
++        delta_views_valid = true;
++    }
+ 
+     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+     const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+@@ -615,6 +838,90 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     return ConfigureDraw(rescaling, render_area);
+ }
+ 
++bool GraphicsPipeline::DeltaImagesChange() const noexcept {
++    return texture_cache.SampledViewsChange(delta_views);
++}
++
++// The PS5 port (tools/prepare-vulkan-port.py) instruments ConfigureImpl at lines it finds once in
++// this file: the ones ConfigureDelta shares are spelled differently here.
++bool GraphicsPipeline::ConfigureDelta(bool indexed) {
++    namespace Profile = VideoCommon::Nx2Profile;
++    // ConfigureImpl without reading handles and resolving image views, samplers and texture
++    // buffers: the buffers are resolved, synchronized and bound as it does. The texture buffer
++    // bindings ConfigureImpl made stay in the buffer cache (nothing else binds graphics texture
++    // buffers between two draws of the chain).
++    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks,
++                                        &uniform_buffer_sizes);
++    {
++        Profile::Scope scope{Profile::Zone::ReadHandles};
++        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
++            if (!configured_stages[stage]) {
++                continue;
++            }
++            buffer_cache.UnbindGraphicsStorageBuffers(stage);
++            size_t ssbo_index{};
++            for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
++                ASSERT(desc.count == 1);
++                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
++                                                       desc.cbuf_offset, desc.is_written);
++                ++ssbo_index;
++            }
++        }
++    }
++    {
++        Profile::Scope scope{Profile::Zone::UpdateBuffers};
++        buffer_cache.UpdateGraphicsBuffers(indexed);
++        buffer_cache.BindHostGeometryBuffers(indexed);
++    }
++    {
++        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
++        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
++    }
++    const auto& regs{maxwell3d->regs};
++    RescalingPushConstant rescaling;
++    RenderAreaPushConstant render_area;
++    const VideoCommon::SamplerId* samplers_it{delta_samplers.data()};
++    const VideoCommon::ImageViewInOut* views_it{delta_views.data()};
++    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
++        if (!configured_stages[stage]) {
++            continue;
++        }
++        {
++            Profile::Scope scope{Profile::Zone::BindStageBuffers};
++            buffer_cache.BindHostStageBuffers(stage);
++        }
++        {
++            Profile::Scope scope{Profile::Zone::PushDescriptors};
++            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
++                                 rescaling, samplers_it, views_it);
++        }
++        if (stage_infos[stage].uses_render_area) {
++            render_area.uses_render_area = true;
++            // Switch 2 titles may never program the surface clip; use colour target 0 then.
++            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
++            const bool clip_set = clip_width != 0 && clip_height != 0;
++            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
++                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
++        }
++    }
++    if (buffer_cache.any_buffer_uploaded) {
++        buffer_cache.runtime.PostCopyBarrier();
++        buffer_cache.any_buffer_uploaded = false;
++    }
++    {
++        Profile::Scope scope{Profile::Zone::RenderTargets};
++        texture_cache.UpdateRenderTargets(/*is_clear=*/false);
++        texture_cache.CheckFeedbackLoop(
++            std::span<const VideoCommon::ImageViewInOut>{delta_views.data(), delta_views.size()});
++    }
++    if (!pipeline && IsBuilt()) {
++        return false;
++    }
++    Profile::Scope scope{Profile::Zone::ConfigureDraw};
++    const bool configured = ConfigureDraw(rescaling, render_area);
++    return configured;
++}
++
+ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+                                      const RenderAreaPushConstant& render_area) {
+     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index d3c0899503..6556edeb0c 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -13,6 +13,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <type_traits>
++#include <utility>
+ #include <vector>
+ 
+ #include "common/thread_worker.h"
+@@ -119,9 +120,17 @@ public:
+     void AddTransition(GraphicsPipeline* transition);
+ 
+     bool Configure(bool is_indexed) {
++        if (std::exchange(configure_delta, false)) {
++            return ConfigureDelta(is_indexed);
++        }
+         return configure_func(this, is_indexed);
+     }
+ 
++    /// Fast draw: the next Configure is a ConfigureDelta.
++    void ConfigureNextAsDelta() noexcept {
++        configure_delta = true;
++    }
++
+     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
+         if (key == current_key) {
+             return this;
+@@ -135,6 +144,56 @@ public:
+         return is_built.load(std::memory_order::relaxed);
+     }
+ 
++    /// Writes storage images or image buffers (their images are marked modified when resolved).
++    [[nodiscard]] bool WritesImages() const noexcept {
++        return writes_images;
++    }
++
++    /// Fast draw (nx2_fast_draw.h): whether draws can keep the image views and samplers the last
++    /// captured Configure resolved.
++    [[nodiscard]] bool TakesDeltaDraws() const noexcept {
++        return delta_blocker == DeltaBlocker::None && delta_views_valid;
++    }
++
++    /// Why TakesDeltaDraws is false (diagnostics).
++    enum class DeltaBlocker : u8 {
++        None,
++        WritesImages,
++        Mesh,
++        NotConfigured,
++        Count,
++    };
++    [[nodiscard]] DeltaBlocker DeltaDrawBlocker() const noexcept {
++        return delta_blocker != DeltaBlocker::None ? delta_blocker
++               : delta_views_valid                 ? DeltaBlocker::None
++                                                   : DeltaBlocker::NotConfigured;
++    }
++
++    /// Constant buffer slots per stage the pipeline reads texture and image handles from.
++    [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
++        return handle_constant_buffers;
++    }
++
++    /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
++    /// the constant buffers again) and records the draw's descriptors with the image views,
++    /// samplers and texture buffers the last captured Configure resolved. False when the draw
++    /// can't be recorded, as for Configure.
++    bool ConfigureDelta(bool is_indexed);
++
++    /// The next Configure keeps the views and samplers it resolves for delta draws. With
++    /// `verify`, it first compares them with the ones kept before; DeltaMismatch reports it.
++    void CaptureNextDelta(bool verify) noexcept {
++        capture_delta = true;
++        verify_delta = verify;
++    }
++    [[nodiscard]] bool DeltaMismatch() const noexcept {
++        return delta_mismatch;
++    }
++
++    /// Whether an image the kept views sample has an upload pending, a newer alias to copy in or
++    /// a replacement to make: ConfigureDelta prepares none, Configure does (Lichii #921).
++    [[nodiscard]] bool DeltaImagesChange() const noexcept;
++
+     template <typename Spec>
+     static auto MakeConfigureSpecFunc() {
+         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+@@ -181,6 +240,23 @@ private:
+     size_t num_image_elements{};
+     u32 num_textures{};
+     bool fragment_has_color0_output{};
++    bool writes_images{};
++    /// Every descriptor is a texture sampled with a handle read from one constant buffer word:
++    /// ConfigureImpl can resolve them from texture_memo.
++    bool texture_memo_eligible{};
++    VideoCommon::SampledTextureMemo texture_memo;
++
++    // Fast draw (nx2_fast_draw.h).
++    DeltaBlocker delta_blocker{};
++    bool delta_views_valid{};
++    bool capture_delta{};
++    bool configure_delta{};
++    bool verify_delta{};
++    bool delta_mismatch{};
++    std::array<bool, NUM_STAGES> configured_stages{};
++    std::array<u32, NUM_STAGES> handle_constant_buffers{};
++    std::vector<VideoCommon::ImageViewInOut> delta_views;
++    std::vector<VideoCommon::SamplerId> delta_samplers;
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 13cce5f186..93bea818a5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -8,12 +8,18 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <array>
++#include <bit>
+ #include <memory>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <tuple>
+ #include <set>
+ #include <fstream>
++#include <functional>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
+ #include <mutex>
+ #include <unordered_map>
+ 
+@@ -54,6 +60,8 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/gpu_split.h"
++#include "video_core/nx2_fast_draw.h"
+ 
+ extern "C" void eden_published_semaphore_read_reason(std::uint64_t, unsigned) __attribute__((weak));
+ 
+@@ -247,6 +255,242 @@ RasterizerVulkan::~RasterizerVulkan() {
+     scheduler.Finish();
+ }
+ 
++GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {
++    namespace FastDraw = VideoCommon::Nx2FastDraw;
++    const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
++    const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
++    const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
++        ++fast_draw_stats.full[static_cast<size_t>(reason)];
++        return nullptr;
++    };
++    if (draw.pipeline == nullptr) {
++        return full(FullDraw::NoCandidate);
++    }
++    const auto& draw_state = maxwell3d->draw_manager.draw_state;
++    if (is_indirect || draw.is_indexed != is_indexed || draw.maxwell3d != maxwell3d ||
++        draw.topology != draw_state.topology || !draw_state.inline_index_draw_indexes.empty()) {
++        return full(FullDraw::Kind);
++    }
++    if (draw.serial != FastDraw::Serial()) {
++        const u32 last_break = FastDraw::g_last_break.load(std::memory_order_relaxed);
++        if (const size_t reason = last_break & 0xff; reason < fast_draw_stats.breaks.size()) {
++            ++fast_draw_stats.breaks[reason];
++        }
++        if (const u32 method = last_break >> 8; method < FastDrawMaxwell::NUM_REGS) {
++            ++fast_draw_stats.break_methods[method];
++        }
++        return full(FullDraw::StateChanged);
++    }
++    if (draw.map_serial != gpu_memory->MapSerial()) {
++        ++fast_draw_stats.breaks[static_cast<size_t>(FastDraw::Reason::Map)];
++        return full(FullDraw::StateChanged);
++    }
++    if (draw.tick != scheduler.CurrentTick()) {
++        return full(FullDraw::Submitted);
++    }
++    if (draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive() ||
++        scheduler.BoundGraphicsPipeline() != draw.pipeline) {
++        return full(FullDraw::RenderPass);
++    }
++    if (!draw.pipeline->TakesDeltaDraws()) {
++        ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
++        return full(FullDraw::DeltaPipeline);
++    }
++    // Constant buffer binds and inline data reaching the buffers the pipeline reads texture
++    // handles from: the views and samplers have to be resolved again.
++    const auto& handles = draw.pipeline->HandleConstantBuffers();
++    for (size_t stage = 0; stage < handles.size() && !delta.Empty(); ++stage) {
++        if ((delta.binds[stage] & handles[stage]) != 0) {
++            return full(FullDraw::HandleBind);
++        }
++        if (delta.num_writes == 0) {
++            continue;
++        }
++        const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
++        for (u32 mask = handles[stage]; mask != 0; mask &= mask - 1) {
++            const u32 slot = static_cast<u32>(std::countr_zero(mask));
++            if (slot >= FastDrawMaxwell::MaxConstBuffers) {
++                return full(FullDraw::HandleData);
++            }
++            const auto& cbuf = cbufs[slot];
++            VideoCommon::Nx2FastDraw::DeviceSpans& spans = handle_spans[stage][slot];
++            spans.Update(*gpu_memory, cbuf.address, cbuf.size);
++            if (delta.Reaches(cbuf.address, cbuf.size, spans)) {
++                return full(FullDraw::HandleData);
++            }
++        }
++    }
++    taken_draw = draw;
++    return draw.pipeline;
++}
++
++bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
++    const auto full = [&](FullDraw reason) {
++        ++fast_draw_stats.full[static_cast<size_t>(reason)];
++        return false;
++    };
++    // TakeReusableDraw ran before the caches were locked, while other threads (the fencing
++    // thread, CPU write invalidations, maps) could still write, unmap or delete what the delta
++    // draw keeps.
++    if (taken_draw.serial != serial || taken_draw.map_serial != map_serial) {
++        return full(FullDraw::StateChanged);
++    }
++    if (taken_draw.tick != scheduler.CurrentTick()) {
++        return full(FullDraw::Submitted);
++    }
++    if (taken_draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive() ||
++        scheduler.BoundGraphicsPipeline() != taken_draw.pipeline) {
++        return full(FullDraw::RenderPass);
++    }
++    // A delta draw prepares none of the images it samples: one with an upload pending, a newer
++    // alias to copy in (a render target aliasing it, written by the draw before) or a
++    // replacement to make needs Configure.
++    if (taken_draw.pipeline->DeltaImagesChange()) {
++        return full(FullDraw::SampledImages);
++    }
++    return true;
++}
++
++void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
++                                        bool is_indirect, u64 serial, u64 map_serial) {
++    const auto& draw_state = maxwell3d->draw_manager.draw_state;
++    const auto topology = draw_state.topology;
++    const auto ineligible = [&]() -> std::optional<Ineligible> {
++        if (is_indirect) return Ineligible::Indirect;
++        if (mesh_draw) return Ineligible::Mesh;
++        if (!pipeline->IsBuilt()) return Ineligible::NotBuilt;
++        if (pipeline->WritesImages()) return Ineligible::WritesImages;
++        if (maxwell3d->regs.transform_feedback_enabled != 0) return Ineligible::TransformFeedback;
++        if (!draw_state.inline_index_draw_indexes.empty()) return Ineligible::InlineIndex;
++        if (topology == FastDrawMaxwell::PrimitiveTopology::Quads ||
++            topology == FastDrawMaxwell::PrimitiveTopology::QuadStrip) {
++            return Ineligible::Quads;
++        }
++        if (!scheduler.IsRenderPassActive()) return Ineligible::NoRenderPass;
++        if (scheduler.BoundGraphicsPipeline() != pipeline) return Ineligible::PipelineNotBound;
++        // The 3D engine's breaks are ordered with the draws only on the split's back.
++        if (!VideoCommon::GpuSplit::IsBackThread()) return Ineligible::OffBackThread;
++        return std::nullopt;
++    }();
++    if (ineligible) {
++        ++fast_draw_stats.ineligible[static_cast<size_t>(*ineligible)];
++        return;
++    }
++    reusable_draw = ReusableDraw{
++        .pipeline = pipeline,
++        .maxwell3d = maxwell3d,
++        .serial = serial,
++        .map_serial = map_serial,
++        .tick = scheduler.CurrentTick(),
++        .render_pass = scheduler.RenderPassSerial(),
++        .topology = topology,
++        .is_indexed = is_indexed,
++    };
++}
++
++void RasterizerVulkan::ReportFastDraws() {
++    const u64 now = VideoCommon::Nx2Profile::Now();
++    FastDrawStats& stats = fast_draw_stats;
++    if (stats.window_start == 0) {
++        stats.window_start = now;
++        return;
++    }
++    if (now - stats.window_start < 10'000'000'000ULL) {
++        return;
++    }
++    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
++    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
++        stats = FastDrawStats{.window_start = now};
++        return;
++    }
++    const double seconds = static_cast<double>(now - stats.window_start) / 1e9;
++    const auto per_second = [&](FullDraw reason) {
++        return static_cast<double>(stats.full[static_cast<size_t>(reason)]) / seconds;
++    };
++    LOG_INFO(Render_Vulkan,
++             "Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
++             "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
++             "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} handle buffer bound, "
++             "{:.0f} handle data written, {:.0f} sampled image to prepare",
++             static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
++             per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
++             per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
++             per_second(FullDraw::DeltaPipeline), per_second(FullDraw::HandleBind),
++             per_second(FullDraw::HandleData), per_second(FullDraw::SampledImages));
++    static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
++        ineligible_names{"indirect",         "mesh",         "not built",      "writes images",
++                         "transform feedback", "inline index", "quads",          "no render pass",
++                         "pipeline not bound", "off the back thread"};
++    std::string ineligible;
++    for (size_t reason = 0; reason < stats.ineligible.size(); ++reason) {
++        if (stats.ineligible[reason] != 0) {
++            ineligible += fmt::format(" {} {:.0f}", ineligible_names[reason],
++                                      static_cast<double>(stats.ineligible[reason]) / seconds);
++        }
++    }
++    const auto micros = [&](DrawPath path) {
++        const size_t index = static_cast<size_t>(path);
++        return stats.prepare_draws[index] == 0
++                   ? 0.0
++                   : static_cast<double>(stats.prepare_ns[index]) / 1e3 /
++                         static_cast<double>(stats.prepare_draws[index]);
++    };
++    const u64 all_draws = stats.prepare_draws[0] + stats.prepare_draws[1];
++    const u64 all_ns = stats.prepare_ns[0] + stats.prepare_ns[1];
++    static constexpr std::array<const char*,
++                                static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)>
++        blocker_names{"none", "writes images", "mesh", "not configured"};
++    std::string blockers;
++    for (size_t blocker = 0; blocker < stats.delta_blockers.size(); ++blocker) {
++        if (stats.delta_blockers[blocker] != 0) {
++            blockers += fmt::format(" {} {:.0f}", blocker_names[blocker],
++                                    static_cast<double>(stats.delta_blockers[blocker]) / seconds);
++        }
++    }
++    ineligible += " | pipelines without delta draws:" +
++                  (blockers.empty() ? std::string{" none"} : blockers);
++    LOG_INFO(Render_Vulkan,
++             "Fast draw ineligible per second:{} | prepare us per draw: full {:.2f}, delta {:.2f}, "
++             "all {:.2f} ({:.0f} draws/s)",
++             ineligible, micros(DrawPath::Full), micros(DrawPath::Delta),
++             all_draws == 0 ? 0.0 : static_cast<double>(all_ns) / 1e3 / static_cast<double>(all_draws),
++             static_cast<double>(all_draws) / seconds);
++    if (fast_draw_verify) {
++        LOG_INFO(Render_Vulkan,
++                 "Fast draw verify per second: {:.0f} checked, {:.0f} pipeline mismatches, {:.0f} "
++                 "view or sampler mismatches, {:.0f} kept buffer binding mismatches (totals {} {} "
++                 "{} {})",
++                 static_cast<double>(stats.verified) / seconds,
++                 static_cast<double>(stats.pipeline_mismatches) / seconds,
++                 static_cast<double>(stats.view_mismatches) / seconds,
++                 static_cast<double>(stats.binding_mismatches) / seconds, stats.verified,
++                 stats.pipeline_mismatches, stats.view_mismatches, stats.binding_mismatches);
++    }
++    std::string breaks;
++    for (size_t reason = 0; reason < stats.breaks.size(); ++reason) {
++        if (stats.breaks[reason] != 0) {
++            breaks += fmt::format(" {} {:.0f}", VideoCommon::Nx2FastDraw::reason_names[reason],
++                                  static_cast<double>(stats.breaks[reason]) / seconds);
++        }
++    }
++    std::vector<std::pair<u32, u32>> methods;
++    for (u32 method = 1; method < stats.break_methods.size(); ++method) {
++        if (stats.break_methods[method] != 0) {
++            methods.emplace_back(stats.break_methods[method], method);
++        }
++    }
++    const size_t shown = (std::min<size_t>)(methods.size(), 12);
++    std::partial_sort(methods.begin(), methods.begin() + shown, methods.end(), std::greater{});
++    std::string top;
++    for (size_t i = 0; i < shown; ++i) {
++        top += fmt::format(" {:#x}:{:.0f}", methods[i].second,
++                           static_cast<double>(methods[i].first) / seconds);
++    }
++    LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
++             breaks, top);
++    stats = FastDrawStats{.window_start = now};
++}
++
+ template <typename Func>
+ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
+@@ -268,6 +512,21 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         FlushWork();
+         gpu_memory->FlushCaching();
+     }
++    // (The block above is an anchor of the PS5 port's tools/prepare-vulkan-port.py.)
++    namespace FastDraw = VideoCommon::Nx2FastDraw;
++    const bool is_indirect = drawing_indirect;
++    // Latched here, on the thread that draws: turning fast draws on starts with a full resolve,
++    // and with them off nothing below runs. Taken after FlushCaching, which runs guest writes
++    // (and their breaks) held back for this draw.
++    if (const bool on = FastDraw::Enabled(); on != fast_draw_on) {
++        fast_draw_on = on;
++        reusable_draw = {};
++        FastDraw::g_delta = {};
++        fast_draw_stats = {};
++    }
++    fast_draw_verify = fast_draw_on && FastDraw::VerifyEnabled();
++    const bool fast_draw_timed = fast_draw_on && (fast_draw_verify || Profile::Enabled());
++    const u64 fast_draw_start = fast_draw_timed ? Profile::Now() : 0;
+ 
+     const auto report_failure = [&](std::string_view reason) {
+         static std::set<std::tuple<u64, u64, std::string_view>> seen;
+@@ -279,11 +538,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
+         }
+     };
+-    GraphicsPipeline* const pipeline{[&] {
++    GraphicsPipeline* const delta_pipeline =
++        fast_draw_on ? TakeReusableDraw(is_indexed, is_indirect) : nullptr;
++    // EDEN_NX2_FAST_DRAW_VERIFY: resolve in full and compare with what the delta path keeps.
++    GraphicsPipeline* const verify_pipeline = fast_draw_verify ? delta_pipeline : nullptr;
++    GraphicsPipeline* const pipeline{delta_pipeline && !verify_pipeline ? delta_pipeline : [&] {
+         Profile::Scope scope{Profile::Zone::PipelineLookup};
+         VideoCommon::LoadingProbe::gpu.Mark("draw pipeline");
+         return pipeline_cache.CurrentGraphicsPipeline();
+     }()};
++    const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline;
++    if (verify_pipeline != nullptr) {
++        ++fast_draw_stats.verified;
++        fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
++    }
+     if (!pipeline) {
+         report_failure("no pipeline");
+         return;
+@@ -357,6 +625,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+                 }
+                 std::vector<u64> pointers(count);
+                 gpu_memory->ReadBlockUnsafe(list_begin, pointers.data(), list_bytes);
++                // Guest memory written here: the next draws resolve in full.
++                FastDraw::Break(FastDraw::Reason::IndirectReset);
+                 static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+                 const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()),
+                                                 sizeof(record)};
+@@ -380,11 +650,37 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         }
+     }
+     // update engine as channel may be different.
++    // What the next draw's TakeReusableDraw compares with, read with the caches locked: a break
++    // from here on, this draw's own resolve included, ends the delta chain (Lichii #921).
++    const u64 draw_serial = fast_draw_on ? FastDraw::Serial() : 0;
++    const u64 draw_map_serial = fast_draw_on ? gpu_memory->MapSerial() : 0;
++    const bool delta_holds =
++        delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
++    const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
++    // What a delta draw would have kept: the texture buffer bindings (verify).
++    const bool verify_kept = verify_views && delta_holds;
++    const u64 kept_bindings =
++        verify_kept ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
++    if (path == DrawPath::Delta) {
++        pipeline->ConfigureNextAsDelta(); // Configure below runs ConfigureDelta
++    } else if (fast_draw_on) {
++        pipeline->CaptureNextDelta(verify_kept);
++    }
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+         report_failure("configure failed");
+         return;
+     }
++    if (path == DrawPath::Delta) {
++        ++fast_draw_stats.delta;
++    } else if (verify_kept) {
++        if (pipeline->DeltaMismatch()) {
++            ++fast_draw_stats.view_mismatches;
++        }
++        if (kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
++            ++fast_draw_stats.binding_mismatches;
++        }
++    }
+ 
+     {
+         Profile::Scope scope{Profile::Zone::DynamicState};
+@@ -401,6 +697,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     }
+     VideoCommon::LoadingProbe::gpu.Mark("draw submitted");
+     submitted = true;
++    if (fast_draw_on) {
++        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
++        if (fast_draw_timed) {
++            const size_t index = static_cast<size_t>(path);
++            fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
++            ++fast_draw_stats.prepare_draws[index];
++            // Every 10 s, from the thread that owns the counters.
++            ReportFastDraws();
++        }
++    }
+     static u32 native_capture_count{};
+     if (maxwell3d->GetNativeMacroEngine().native_turing &&
+         native_capture_count < 16 && [] {
+@@ -704,6 +1010,10 @@ void RasterizerVulkan::DrawIndirect() {
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+     const auto& params = maxwell3d->draw_manager.indirect_state;
+     buffer_cache.SetDrawIndirect(&params);
++    drawing_indirect = true; // fast draw: indirect draws are never delta draws
++    SCOPE_EXIT {
++        drawing_indirect = false;
++    };
+     PrepareDraw(params.is_indexed, [this, &params] {
+         if (mesh_draw) {
+             // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
+@@ -1495,6 +1805,7 @@ void RasterizerVulkan::TickFrame() {
+         std::scoped_lock lock{buffer_cache.mutex};
+         buffer_cache.TickFrame();
+     }
++    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Frame);
+ }
+ 
+ bool RasterizerVulkan::AccelerateConditionalRendering() {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index d626e1d1f8..91f749f1b6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -15,6 +15,7 @@
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/engines/maxwell_dma.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/renderer_vulkan/blit_image.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+@@ -238,6 +239,85 @@ private:
+     std::chrono::steady_clock::time_point last_cache_tick = std::chrono::steady_clock::now();
+     u64 idle_tick_gpu{}; ///< GPU tick that must complete before the next idle cache tick
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
++
++    using FastDrawMaxwell = Tegra::Engines::Maxwell3D::Regs;
++    /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
++    struct ReusableDraw {
++        GraphicsPipeline* pipeline{};
++        const Tegra::Engines::Maxwell3D* maxwell3d{};
++        u64 serial{};
++        u64 map_serial{};
++        u64 tick{};
++        u64 render_pass{};
++        FastDrawMaxwell::PrimitiveTopology topology{};
++        bool is_indexed{};
++    };
++    enum class FullDraw : u8 {
++        NoCandidate,
++        Kind,
++        StateChanged,
++        Submitted,
++        RenderPass,
++        DeltaPipeline,
++        HandleBind,
++        HandleData,
++        SampledImages,
++        Count,
++    };
++    /// Why a recorded draw can't be followed by a delta draw.
++    enum class Ineligible : u8 {
++        Indirect,
++        Mesh,
++        NotBuilt,
++        WritesImages,
++        TransformFeedback,
++        InlineIndex,
++        Quads,
++        NoRenderPass,
++        PipelineNotBound,
++        OffBackThread,
++        Count,
++    };
++    enum class DrawPath : u8 { Full, Delta, Count };
++    struct FastDrawStats {
++        u64 delta{};
++        std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
++        std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
++        /// PrepareDraw time and draws per path (timed with EDEN_NX2_GPU_PROFILE or verify only).
++        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
++        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
++        /// EDEN_NX2_FAST_DRAW_VERIFY
++        u64 verified{};
++        u64 pipeline_mismatches{};
++        u64 view_mismatches{};
++        u64 binding_mismatches{};
++        /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
++        std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
++        /// StateChanged draws by the reason of the last break, and by its 3D method.
++        std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
++        std::array<u32, FastDrawMaxwell::NUM_REGS> break_methods{};
++        u64 window_start{};
++    };
++    /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
++    /// the remembered draw either way: only a recorded draw remembers one again.
++    GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
++    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
++    /// map_serial as read then), and the images it samples need no preparing (Lichii #921).
++    bool DeltaStillHolds(u64 serial, u64 map_serial);
++    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
++                          u64 map_serial);
++    void ReportFastDraws();
++    ReusableDraw reusable_draw;
++    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
++    /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
++    std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, FastDrawMaxwell::MaxConstBuffers>,
++               FastDrawMaxwell::MaxShaderStage>
++        handle_spans;
++    FastDrawStats fast_draw_stats;
++    /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
++    bool fast_draw_on{};
++    bool fast_draw_verify{};
++    bool drawing_indirect{}; ///< DrawIndirect is preparing its draw
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 5b2a88f6a5..6198a372e0 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -135,6 +135,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+                                     const VkClearValue* clear_values, u32 clear_value_count) {
+     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
+     const VkExtent2D render_area = framebuffer->RenderArea();
++    ++render_pass_serial;
+     state.renderpass = renderpass;
+     state.framebuffer = framebuffer_handle;
+     state.render_area = render_area;
+@@ -483,6 +484,7 @@ void Scheduler::EndRenderPass()
+         if (!state.renderpass) {
+             return;
+         }
++        ++render_pass_serial;
+ 
+         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 0ab462939e..8f844efeb7 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -80,6 +80,16 @@ public:
+         return state.renderpass != VK_NULL_HANDLE;
+     }
+ 
++    /// Changes whenever a render pass begins or ends (fast draw).
++    u64 RenderPassSerial() const {
++        return render_pass_serial;
++    }
++
++    /// The graphics pipeline bound in the current command buffer, if the scheduler knows it.
++    const GraphicsPipeline* BoundGraphicsPipeline() const {
++        return state.graphics_pipeline;
++    }
++
+     /// Update the pipeline to the current execution context.
+     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+ 
+@@ -338,6 +348,7 @@ private:
+     std::function<void()> on_submit;
+ 
+     State state;
++    u64 render_pass_serial{}; ///< RenderPassSerial
+ 
+     u32 num_renderpass_images = 0;
+     std::array<VkImage, 9> renderpass_images{};
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+index f8636f0132..606b28cff7 100644
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -20,6 +20,7 @@
+ #include "shader_recompiler/object_pool.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dirty_flags.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -323,6 +324,7 @@ void ShaderCache::RemovePendingShaders() {
+     marked_for_removal.clear();
+ 
+     if (!removed_shaders.empty()) {
++        Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
+         // Remove the given shaders from the cache
+         std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
+             return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index 1ca43eff9e..f8aa065b4c 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -33,6 +33,7 @@ public:
+     void Invalidate() noexcept {
+         // Every deleted image invalidates every channel's tables: clear once, on the next read.
+         invalidated = true;
++        ++changes;
+     }
+ 
+     [[nodiscard]] std::pair<T, bool> Read(Tegra::MemoryManager const& gpu_memory, u32 index) noexcept {
+@@ -57,6 +58,7 @@ public:
+     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
+         current_gpu_addr = gpu_addr;
+         current_limit = limit;
++        ++changes;
+         // Power-of-two growth: amortised like the old 0x80000 rounding without 16 MiB per table.
+         const size_t num_descriptors = std::bit_ceil(static_cast<size_t>(limit) + 1);
+         size_t old_size = read_descriptors.size();
+@@ -76,6 +78,9 @@ public:
+     GPUVAddr current_gpu_addr{};
+     u32 current_limit{};
+     bool invalidated{};
++    /// Bumped by every Invalidate and Refresh: the ids resolved before are only good while it
++    /// stays the same (texture memo).
++    u64 changes{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/sampled_views.h b/src/video_core/texture_cache/sampled_views.h
+new file mode 100644
+index 0000000000..b197bbb5de
+--- /dev/null
++++ b/src/video_core/texture_cache/sampled_views.h
+@@ -0,0 +1,44 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++
++#include "common/common_funcs.h"
++#include "video_core/texture_cache/image_base.h"
++#include "video_core/texture_cache/image_view_base.h"
++#include "video_core/texture_cache/types.h"
++
++namespace VideoCommon {
++
++/// Whether TextureCache::PrepareImageView prepares the view's image. Neither the null view, whose
++/// image has no valid format and stays CpuModified (uploading it ends in UNREACHABLE, Lichii
++/// #904/#910), nor a buffer view, which has no image, is prepared.
++template <typename ImageViews>
++[[nodiscard]] bool PreparesImage(const ImageViews& image_views, ImageViewId id) noexcept {
++    return id && id != NULL_IMAGE_VIEW_ID && !image_views[id].IsBuffer();
++}
++
++/// Whether sampling the image now needs FillImageViews' work on it: an upload from guest memory
++/// (CpuModified, whatever part of it is dirty), a newer alias to copy in (SynchronizeAliases runs
++/// while alias_maybe_newer is set), or a replaced unwritten sparse image FillImageViews deletes.
++[[nodiscard]] inline bool SamplingChangesImage(const ImageBase& image) noexcept {
++    return True(image.flags & ImageFlagBits::CpuModified) ||
++           (!image.aliased_images.empty() && image.alias_maybe_newer) ||
++           (True(image.flags & ImageFlagBits::UnwrittenSparse) &&
++            True(image.flags & ImageFlagBits::Remapped));
++}
++
++/// Whether sampling any of the views now needs a resolve that prepares their images (fast draw
++/// delta draws keep the previous resolve's views and prepare none).
++template <typename Views, typename ImageViews, typename Images>
++[[nodiscard]] bool SampledViewsChange(const Views& views, const ImageViews& image_views,
++                                      const Images& images) noexcept {
++    return std::ranges::any_of(views, [&](const auto& view) {
++        return PreparesImage(image_views, view.id) &&
++               SamplingChangesImage(images[image_views[view.id].image_id]);
++    });
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 67e4080ab6..b8423f1f9b 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <numeric>
+ #include <cstdlib>
+ #include <limits>
+@@ -36,6 +37,7 @@
+ #include "video_core/texture_cache/texture_cache_base.h"
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/texture_barrier_epoch.h"
+ #include "video_core/cache_tracking_diagnostics.h"
+@@ -600,6 +602,149 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
+     } while (has_deleted_images || (blacklist && has_blacklisted));
+ }
+ 
++template <class P>
++bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
++                                              std::span<const GPUVAddr> handle_addresses,
++                                              std::span<ImageViewInOut> views,
++                                              std::span<SamplerId> samplers) {
++    const auto& image_table = channel_state->graphics_image_table;
++    const auto& sampler_table = channel_state->graphics_sampler_table;
++    const bool via_header_index =
++        maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
++    if (!memo.valid || memo.memory != gpu_memory || memo.image_table != &image_table ||
++        memo.image_changes != image_table.changes ||
++        memo.sampler_changes != sampler_table.changes ||
++        memo.via_header_index != via_header_index ||
++        memo.entries.size() != handle_addresses.size() || views.size() != handle_addresses.size() ||
++        samplers.size() != handle_addresses.size() ||
++        memo.host_serial != gpu_memory->HostPointerSerial()) {
++        return false;
++    }
++    // The bytes the ids came from are what they were: the handle words, then the texture and
++    // sampler descriptors they select. Nothing else decides the views and samplers.
++    for (size_t i = 0; i < handle_addresses.size(); ++i) {
++        const SampledTextureMemo::Entry& entry = memo.entries[i];
++        if (entry.handle_address != handle_addresses[i] ||
++            std::memcmp(entry.handle_host, &entry.raw, sizeof(entry.raw)) != 0 ||
++            std::memcmp(entry.tic_host, &entry.tic, sizeof(entry.tic)) != 0 ||
++            std::memcmp(entry.tsc_host, &entry.tsc, sizeof(entry.tsc)) != 0) {
++            return false;
++        }
++    }
++    // FillImageViews replaces a written unwritten-sparse image (deletes it and visits again):
++    // leave that to the full path.
++    const auto needs_replacing = [&](ImageViewId id) {
++        if (!PreparesImage(slot_image_views, id)) {
++            return false;
++        }
++        const ImageBase& image = slot_images[slot_image_views[id].image_id];
++        return True(image.flags & ImageFlagBits::UnwrittenSparse) &&
++               True(image.flags & ImageFlagBits::Remapped);
++    };
++    if (std::ranges::any_of(memo.entries, [&](const auto& entry) { return needs_replacing(entry.view); })) {
++        return false;
++    }
++    // As FillImageViews: sampling for a draw (SynchronizeAliases' feedback copies).
++    feedback_sampling = true;
++    SCOPE_EXIT {
++        feedback_sampling = false;
++    };
++    has_deleted_images = false;
++    for (size_t i = 0; i < handle_addresses.size(); ++i) {
++        const SampledTextureMemo::Entry& entry = memo.entries[i];
++        views[i] = ImageViewInOut{.index = entry.view_index, .blacklist = false, .id = entry.view};
++        samplers[i] = entry.sampler;
++        // As VisitImageView: never the null view (PrepareImageView's gate, Lichii #910/#921).
++        PrepareImageView(entry.view, false, false);
++    }
++    if (has_deleted_images || (prepare_log == nullptr &&
++                               std::ranges::any_of(memo.entries, [&](const auto& entry) {
++                                   return needs_replacing(entry.view);
++                               }))) {
++        // Preparing an image deleted or replaced others: the full path resolves the views again.
++        memo.valid = false;
++        return false;
++    }
++    return true;
++}
++
++template <class P>
++void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
++                                      std::span<const TextureHandleRead> reads,
++                                      std::span<const ImageViewInOut> views,
++                                      std::span<const SamplerId> samplers) {
++    memo.valid = false;
++    memo.entries.clear();
++    auto& image_table = channel_state->graphics_image_table;
++    auto& sampler_table = channel_state->graphics_sampler_table;
++    if (image_table.invalidated || sampler_table.invalidated || reads.size() != views.size() ||
++        reads.size() != samplers.size()) {
++        return;
++    }
++    const bool via_header_index =
++        maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
++    // Each word is read through one host pointer: only within a page.
++    const auto host_of = [&](GPUVAddr address, size_t size) -> const u8* {
++        if ((address & Core::DEVICE_PAGEMASK) + size > Core::DEVICE_PAGESIZE) {
++            return nullptr;
++        }
++        return gpu_memory->GetPointer(address);
++    };
++    memo.entries.reserve(reads.size());
++    for (size_t i = 0; i < reads.size(); ++i) {
++        const TextureHandleRead& read = reads[i];
++        if (!views[i].id || !samplers[i] || views[i].index != read.view_index ||
++            read.view_index > image_table.current_limit ||
++            read.sampler_index > sampler_table.current_limit) {
++            memo.entries.clear();
++            return;
++        }
++        const u8* const handle_host = host_of(read.address, sizeof(u32));
++        const u8* const tic_host =
++            host_of(image_table.current_gpu_addr + u64{read.view_index} * sizeof(TICEntry),
++                    sizeof(TICEntry));
++        const u8* const tsc_host =
++            host_of(sampler_table.current_gpu_addr + u64{read.sampler_index} * sizeof(TSCEntry),
++                    sizeof(TSCEntry));
++        if (handle_host == nullptr || tic_host == nullptr || tsc_host == nullptr) {
++            memo.entries.clear();
++            return;
++        }
++        SampledTextureMemo::Entry entry{
++            .handle_address = read.address,
++            .handle_host = handle_host,
++            .tic_host = tic_host,
++            .tsc_host = tsc_host,
++            .tic = image_table.descriptors[read.view_index],
++            .tsc = sampler_table.descriptors[read.sampler_index],
++            .raw = 0,
++            .view_index = read.view_index,
++            .view = views[i].id,
++            .sampler = samplers[i],
++        };
++        std::memcpy(&entry.raw, handle_host, sizeof(entry.raw));
++        // The word must still give the indices the resolve used, and the descriptors must be the
++        // ones the tables hold for them (what the ids were resolved from).
++        if (Tegra::Texture::TexturePair(entry.raw, via_header_index) !=
++                std::pair<u32, u32>{read.view_index, read.sampler_index} ||
++            std::memcmp(entry.tic_host, &entry.tic, sizeof(entry.tic)) != 0 ||
++            std::memcmp(entry.tsc_host, &entry.tsc, sizeof(entry.tsc)) != 0 ||
++            image_table.bound_ids[read.view_index] != entry.view ||
++            sampler_table.bound_ids[read.sampler_index] != entry.sampler) {
++            memo.entries.clear();
++            return;
++        }
++        memo.entries.push_back(entry);
++    }
++    memo.memory = gpu_memory;
++    memo.image_table = &image_table;
++    memo.host_serial = gpu_memory->HostPointerSerial();
++    memo.image_changes = image_table.changes;
++    memo.sampler_changes = sampler_table.changes;
++    memo.via_header_index = via_header_index;
++    memo.valid = true;
++}
++
+ template <class P>
+ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
+     if (!Settings::values.barrier_feedback_loops.GetValue()) {
+@@ -995,6 +1140,7 @@ template <class P>
+ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+     ClearStale(cpu_addr, size);
+     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+         ASSERT_MSG(False(image.flags & ImageFlagBits::PartialDownload),
+                    "MKW partial readback: a write escaped ordered pre-write completion");
+         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
+@@ -1227,6 +1373,9 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
+     boost::container::small_vector<ImageId, 16> deleted_images;
+     ForEachImageInRegionGPU(as_id, gpu_addr, size,
+                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
++    if (!deleted_images.empty()) {
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Map);
++    }
+     for (const ImageId id : deleted_images) {
+         Image& image = slot_images[id];
+         ASSERT_MSG(False(image.flags & ImageFlagBits::PartialDownload),
+@@ -2391,6 +2540,8 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
+ 
+ template <class P>
+ void TextureCache<P>::InvalidateScale(Image& image) {
++    // Its views are deleted: a fast draw delta draw keeping one must not follow.
++    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+     if (image.scale_tick <= frame_tick) {
+         image.scale_tick = frame_tick + 1;
+     }
+@@ -3846,6 +3997,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     std::erase(partial_download_images, image_id);
+     ImageBase& image = slot_images[image_id];
+     ++images_deleted;
++    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
+     // a decode was in flight has two, and the first to finish clears the flag. A decode left
+     // behind was uploaded into the next image to take this slot (another texture's data: garbage
+@@ -4145,11 +4297,18 @@ bool TextureCache<P>::ReplaceUnwrittenSparse(ImageId image_id) {
+     }
+     Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
+     image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
++    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+     return true;
+ }
+ 
+ template <class P>
+ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
++    if (prepare_log != nullptr) {
++        prepare_log->push_back(image_id);
++        if (prepare_log_dry) {
++            return;
++        }
++    }
+     Image& image = slot_images[image_id];
+     if (invalidate) {
+         RestorePartialPages(image);
+@@ -4185,14 +4344,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+ template <class P>
+ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modification,
+                                        bool invalidate) {
+-    if (!image_view_id) {
+-        return;
+-    }
+-    const ImageViewBase& image_view = slot_image_views[image_view_id];
+-    if (image_view.IsBuffer()) {
++    // The one gate for which views get prepared (sampled_views.h): never the null view.
++    if (!PreparesImage(slot_image_views, image_view_id)) {
+         return;
+     }
+-    PrepareImage(image_view.image_id, is_modification, invalidate);
++    PrepareImage(slot_image_views[image_view_id].image_id, is_modification, invalidate);
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 79d0e072a9..1ef91b4977 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -42,6 +42,7 @@
+ #include "video_core/texture_cache/image_info.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/render_targets.h"
++#include "video_core/texture_cache/sampled_views.h"
+ #include "video_core/texture_cache/stale_pages.h"
+ #include "video_core/texture_cache/types.h"
+ #include "video_core/textures/texture.h"
+@@ -65,6 +66,42 @@ struct ImageViewInOut {
+     ImageViewId id{};
+ };
+ 
++/// A texture handle a draw resolved: where its word is and the texture and sampler indices the
++/// full resolve took from it (TexturePair).
++struct TextureHandleRead {
++    GPUVAddr address{};
++    u32 view_index{};
++    u32 sampler_index{};
++};
++
++/// What a draw's sampled textures were resolved from, kept by the pipeline that drew them. The
++/// next draw with the same pipeline resolves its textures from it (ResolveMemoizedTextures) while
++/// every byte they came from is the same: the handle words, the texture and sampler descriptors
++/// and the tables, mappings and views behind them.
++struct SampledTextureMemo {
++    struct Entry {
++        GPUVAddr handle_address{};
++        const u8* handle_host{}; ///< The handle word in host memory
++        const u8* tic_host{};
++        const u8* tsc_host{};
++        TICEntry tic{};
++        TSCEntry tsc{};
++        u32 raw{}; ///< The handle word
++        u32 view_index{}; ///< The texture header index the handle gives
++        ImageViewId view{};
++        SamplerId sampler{};
++    };
++    std::vector<Entry> entries;
++    const void* memory{};      ///< The address space the pointers belong to
++    const void* image_table{}; ///< The channel's table the views were read from
++    u64 host_serial{};         ///< MemoryManager::HostPointerSerial
++    u64 image_changes{};       ///< DescriptorTable::changes of both tables
++    u64 sampler_changes{};
++    bool via_header_index{}; ///< The sampler binding the handles were split with
++    bool valid{};
++    u32 misses{}; ///< Draws in a row that did not find the memo good
++};
++
+ struct AsyncDecodeContext {
+     ImageId image_id;
+     Common::ScratchBuffer<u8> decoded_data;
+@@ -225,9 +262,36 @@ public:
+     /// Fill image_view_ids with the graphics/compute images in indices
+     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
+ 
++    /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
++    /// resolved from has changed since (true), and prepares the images as FillImageViews does.
++    /// handle_addresses are where the draw reads its texture handles from, in binding order.
++    /// Graphics only; for pipelines whose descriptors are all sampled textures.
++    [[nodiscard]] bool ResolveMemoizedTextures(SampledTextureMemo& memo,
++                                               std::span<const GPUVAddr> handle_addresses,
++                                               std::span<ImageViewInOut> views,
++                                               std::span<SamplerId> samplers);
++
++    /// Keeps what FillImageViews and GetSamplerId resolved the draw's textures from.
++    void MemoizeTextures(SampledTextureMemo& memo, std::span<const TextureHandleRead> reads,
++                         std::span<const ImageViewInOut> views, std::span<const SamplerId> samplers);
++
++    /// EDEN_NX2_TEXTURE_MEMO_VERIFY: PrepareImage adds the images it is asked to prepare to `log`
++    /// (nullptr stops it) and, with `dry`, does nothing else.
++    void LogPrepares(std::vector<ImageId>* log, bool dry) noexcept {
++        prepare_log = log;
++        prepare_log_dry = dry;
++    }
++
+     /// Handle feedback loops during draws.
+     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+ 
++    /// Whether sampling the views now needs PrepareImageView: an image with an upload pending, a
++    /// newer alias to copy in or a replacement to make (fast draw delta draws keep their views and
++    /// prepare none).
++    [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
++        return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
++    }
++
+     /// Get the sampler from the graphics/compute descriptor table in the specified index
+     Sampler* GetSampler(u32 index, bool compute);
+ 
+@@ -566,6 +630,8 @@ private:
+     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
+ 
+     bool has_deleted_images = false;
++    std::vector<ImageId>* prepare_log{}; ///< LogPrepares
++    bool prepare_log_dry{};
+     bool is_rescaling = false;
+     u64 total_used_memory = 0;
+     u64 minimum_memory;

@@ -7,6 +7,8 @@ void* ReserveAddressRange(std::size_t size) noexcept;
 bool CommitMemoryRange(void* address, std::size_t size) noexcept;
 bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept;
 int DecommitMemoryRange(void* address, std::size_t size) noexcept;
+int PageOutRange(void* address, std::size_t size) noexcept;
+int PageInRange(void* address, std::size_t size) noexcept;
 void ReleaseMemoryRange(void* address, std::size_t size) noexcept;
 } // namespace Common
 
@@ -42,6 +44,13 @@ extern "C" int eden_heap_commit(void* address, std::size_t size) {
 // 1: given back, 0: nothing done, -1: given back in part (not to be used again).
 extern "C" int eden_heap_decommit(void* address, std::size_t size) {
     return Common::DecommitMemoryRange(address, size);
+}
+// A released arena's memory (headless/heap_arenas.inc): part of a committed block, in 16 KiB pages.
+extern "C" int eden_heap_page_out(void* address, std::size_t size) {
+    return Common::PageOutRange(address, size);
+}
+extern "C" int eden_heap_page_in(void* address, std::size_t size) {
+    return WithRecovery(size, [&] { return Common::PageInRange(address, size) == 1; }) ? 1 : 0;
 }
 // A large block whose memory the pool has in no single free block: address space of its own,
 // with memory behind it in blocks of whatever size the pool has (zeroed), given back whole.

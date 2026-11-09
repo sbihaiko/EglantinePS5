@@ -32,6 +32,12 @@
 #endif
 #ifdef PS5_NATIVE
 #include <sys/param.h>
+#include "common/fs/file.h"
+#include "core/hle/kernel/svc/svc_memory_stats.h"
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/resource.h>
 #include <sys/cpuset.h>
 #endif
 
@@ -525,9 +531,35 @@ extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemo
 #endif
 
 #ifdef PS5_NATIVE
+// Open file descriptors by type, against the process limit, and the IOFiles Eden holds by folder
+// (Common::FS::ReportOpenFiles): a handle leak shows as one count growing every 20 s.
+extern "C" void eden_fd_paths_report(FILE* out);
+static void ReportFileHandles() {
+    struct rlimit limit {};
+    getrlimit(RLIMIT_NOFILE, &limit);
+    const int top = static_cast<int>(std::min<rlim_t>(limit.rlim_cur > 0 ? limit.rlim_cur : 1024, 1024));
+    int regular = 0, sockets = 0, pipes = 0, other = 0, highest = -1;
+    for (int fd = 0; fd < top; ++fd) {
+        struct stat info {};
+        if (fstat(fd, &info) != 0) continue;
+        highest = fd;
+        if (S_ISREG(info.st_mode)) ++regular;
+        else if (S_ISSOCK(info.st_mode)) ++sockets;
+        else if (S_ISFIFO(info.st_mode)) ++pipes;
+        else ++other;
+    }
+    std::fprintf(stderr, "EDEN_FD open=%d regular=%d sockets=%d pipes=%d other=%d highest=%d limit=%lld\n",
+                 regular + sockets + pipes + other, regular, sockets, pipes, other, highest,
+                 static_cast<long long>(limit.rlim_cur));
+    ::Common::FS::ReportOpenFiles(stderr);
+    eden_fd_paths_report(stderr);
+}
+
 // The largest free block of direct memory is what the next graphics allocation needs. Looked at
 // again every 100 ms; called on the GPU thread by the texture collector (KeepDirtyTextures).
 static std::atomic<unsigned long long> largest_free_block{0};
+// The driver's own buffer bytes (RADV's PS5 winsys counter, renamed by tools/isolate-radv.py).
+extern "C" unsigned long long eden_radv_private_radv_ps5_allocated_bytes __attribute__((weak));
 static void RefreshFreeMemory() {
     static std::atomic<long long> checked_ns{0};
     const long long now = NowNs();
@@ -545,7 +577,7 @@ static void RefreshFreeMemory() {
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
     static std::atomic<long long> summary_ns{0};
-    if (now - summary_ns.load(std::memory_order_relaxed) >= 20'000'000'000) {
+    if (now - summary_ns.load(std::memory_order_relaxed) >= 10'000'000'000) {
         summary_ns.store(now, std::memory_order_relaxed);
         std::size_t guest_span = 0, guest_held = 0;
         ::Common::GuestMemoryUsage(&guest_span, &guest_held);
@@ -554,7 +586,14 @@ static void RefreshFreeMemory() {
                      " (the kernel maps %llu MiB)\n",
                      largest >> 20, int(view.short_memory), guest_held >> 20,
                      kernel_memory ? kernel_memory() >> 20 : 0ULL);
+        std::fprintf(stderr, "EDEN_MEMORY_PARTS t=%lld driver_mib=%llu guest_held_mib=%zu guest_span_mib=%zu\n",
+                     now / 1'000'000'000,
+                     &eden_radv_private_radv_ps5_allocated_bytes != nullptr
+                         ? __atomic_load_n(&eden_radv_private_radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20 : 0ULL,
+                     guest_held >> 20, guest_span >> 20);
         ReportHeap("every 20 s");
+        ReportFileHandles();
+        ::Kernel::Svc::MemoryStats::Report(stderr);
         if (const auto pools = guest_pool_report.load(std::memory_order_relaxed)) pools();
     }
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).

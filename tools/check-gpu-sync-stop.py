@@ -15,6 +15,8 @@ code=r'''
 #include <semaphore>
 #include <thread>
 using u64=unsigned long long;
+// TickWork ends a fast draw chain (video_core/nx2_fast_draw.h); nothing to chain here.
+namespace VideoCommon::Nx2FastDraw {enum class Reason{TickWork};inline void Break(Reason){}}
 struct Worker {std::thread t;std::atomic_bool stopping{};void Stop(){stopping=true;if(t.joinable())t.join();}void TickGPU(bool){}void InvalidateReadbackCache(){}};
 struct GPU {
  std::mutex sync_request_mutex,sync_mutex;
@@ -78,7 +80,8 @@ bool Wait(){
 struct Memory {std::atomic<u32> value{};template<class T>T Read(unsigned){return value.load();}};
 struct Raster {std::atomic_uint calls{};void ReleaseFences(){++calls;}};
 struct DmaPusher {System system;Memory memory_manager;Raster raster;Raster*rasterizer=&raster;};
-struct Puller {struct Regs {struct Address{unsigned SemaphoreAddress(){return 0;}}semaphore_address;u32 semaphore_acquire=4,acquire_value{};bool acquire_active{},acquire_mode{},acquire_source{};}regs;
+struct Puller {void BreakFastDrawAtAcquire(){} // ends a fast draw chain (video_core/nx2_fast_draw.h)
+struct Regs {struct Address{unsigned SemaphoreAddress(){return 0;}}semaphore_address;u32 semaphore_acquire=4,acquire_value{};bool acquire_active{},acquire_mode{},acquire_source{};}regs;
 void ProcessSemaphoreAcquire(DmaPusher&dma_pusher){
 '''+acquire+r'''
 }};

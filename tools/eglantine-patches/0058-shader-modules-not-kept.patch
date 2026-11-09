@@ -1,0 +1,138 @@
+Shader modules are not kept for every pipeline: a pipeline lets go of its modules once built, and
+the shader reuse cache keeps at most EDEN_NX2_SHADER_REUSE_MIB (32) of SPIR-V, oldest keys first out.
+
+The driver keeps a copy of the SPIR-V in each VkShaderModule. Every graphics pipeline held its
+modules for good, and the reuse cache kept up to four variants of them for every translation key, so
+they only grew: Eden's largest heap holder on Mario Kart World (110 MiB in 3,585 modules at 240 s,
+growing with each pipeline a race builds). A key that left the reuse cache is translated again when
+a pipeline needs it. ConfigureFunc reads the modules before the build is queued now, since the build
+lets go of them.
+
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -324,12 +324,19 @@
+         }
+     }
+ 
++    // Before the build is queued: the build lets go of the modules (below).
++    configure_func = ConfigureFunc(*spv_modules, stage_infos);
+     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
+         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+         Validate();
+         try {
+             MakePipeline(render_pass);
++            // The pipeline holds the compiled code: the driver's copies of the SPIR-V go. Kept for
++            // every pipeline they were Eden's largest heap holder (Mario Kart World: 110 MiB in
++            // 3,585 modules, growing with each pipeline a race builds).
++            spv_modules.reset();
+         } catch (const vk::Exception& exception) {
++            spv_modules.reset();
+             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
+             std::scoped_lock lock{build_mutex};
+             is_built = true;
+@@ -355,7 +362,6 @@
+     } else {
+         func();
+     }
+-    configure_func = ConfigureFunc(*spv_modules, stage_infos);
+ }
+ 
+ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1144,6 +1144,7 @@
+     }
+     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+     auto modules{std::make_shared<GraphicsShaderModules>()};
++    size_t code_bytes{};
+ 
+     const Shader::IR::Program* previous_stage{};
+     Shader::Backend::Bindings binding;
+@@ -1168,6 +1169,7 @@
+         device.SaveShader(code);
+         VideoCommon::LoadingProbe::compiler.Mark("module", key.unique_hashes[index]);
+         (*modules)[stage_index] = BuildShader(device, code);
++        code_bytes += code.size() * sizeof(u32);
+         VideoCommon::LoadingProbe::compiler.Mark("done", key.unique_hashes[index]);
+ 
+         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
+@@ -1197,6 +1199,7 @@
+ 
+     auto shaders{std::make_shared<ReusableShaders>()};
+     shaders->modules = std::move(modules);
++    shaders->code_bytes = code_bytes;
+     for (size_t stage = 0; stage < infos.size(); ++stage) {
+         if (infos[stage]) {
+             shaders->infos[stage] = *infos[stage];
+--- a/src/video_core/renderer_vulkan/vk_shader_reuse.h
++++ b/src/video_core/renderer_vulkan/vk_shader_reuse.h
+@@ -17,6 +17,7 @@
+ 
+ #include <array>
+ #include <compare>
++#include <deque>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -191,6 +192,8 @@
+     std::array<Shader::Info, Maxwell::MaxShaderStage> infos;
+     /// What translation asked each program's environment, in the order the environments come.
+     boost::container::static_vector<TranslationReads, Maxwell::MaxShaderProgram> reads;
++    /// Bytes of SPIR-V behind the modules (the driver keeps a copy per module).
++    size_t code_bytes{};
+ 
+     /// The stage infos as GraphicsPipeline takes them: null for stages without a module.
+     [[nodiscard]] std::array<const Shader::Info*, Maxwell::MaxShaderStage> InfoPointers() const;
+@@ -226,6 +229,12 @@
+ 
+     mutable std::mutex mutex;
+     ::Common::unordered_map<ShaderTranslationKey, Variants, ShaderTranslationKeyHash> entries;
++    /// Keys oldest first, and the SPIR-V bytes their shaders hold: past the budget
++    /// (EDEN_NX2_SHADER_REUSE_MIB, 32 by default) the oldest keys go. Kept for every key, the modules
++    /// were Eden's largest heap holder on Mario Kart World (110 MiB, growing with each race); a key
++    /// that went is translated again if a pipeline needs it.
++    std::deque<ShaderTranslationKey> order;
++    size_t total_bytes{};
+ };
+ 
+ } // namespace Vulkan
+--- a/src/video_core/renderer_vulkan/vk_shader_reuse.cpp
++++ b/src/video_core/renderer_vulkan/vk_shader_reuse.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "common/assert.h"
+@@ -241,8 +242,27 @@
+     const bool known{std::ranges::any_of(variants, [&shaders](const auto& variant) {
+         return variant->reads == shaders->reads;
+     })};
+-    if (!known) {
+-        variants.push_back(std::move(shaders));
++    if (known) {
++        return;
++    }
++    if (variants.empty()) {
++        order.push_back(key);
++    }
++    total_bytes += shaders->code_bytes;
++    variants.push_back(std::move(shaders));
++    static const size_t budget = [] {
++        const char* value = std::getenv("EDEN_NX2_SHADER_REUSE_MIB");
++        return static_cast<size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 32) << 20;
++    }();
++    while (total_bytes > budget && order.size() > 1) {
++        const ShaderTranslationKey oldest{order.front()};
++        order.pop_front();
++        if (const auto it{entries.find(oldest)}; it != entries.end()) {
++            for (const auto& variant : it->second) {
++                total_bytes -= (std::min)(total_bytes, variant->code_bytes);
++            }
++            entries.erase(it);
++        }
+     }
+ }
+ 

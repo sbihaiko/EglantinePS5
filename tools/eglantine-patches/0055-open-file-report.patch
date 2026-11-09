@@ -1,0 +1,92 @@
+diff --git a/src/common/fs/file.cpp b/src/common/fs/file.cpp
+index 461a5eee35..247143a09d 100644
+--- a/src/common/fs/file.cpp
++++ b/src/common/fs/file.cpp
+@@ -8,6 +8,12 @@
+ 
+ #include "common/assert.h"
+ #include "common/fs/file.h"
++#include <string>
++#include <cstdio>
++#include <algorithm>
++#include <map>
++#include <unordered_map>
++#include <mutex>
+ #include "common/fs/fs.h"
+ #ifdef __ANDROID__
+ #include "common/fs/fs_android.h"
+@@ -244,6 +250,38 @@ FileType IOFile::GetType() const {
+     return file_type;
+ }
+ 
++namespace {
++// Open IOFiles by stream, for ReportOpenFiles (a file-handle leak shows as one place growing).
++std::mutex& OpenFilesMutex() {
++    static std::mutex mutex;
++    return mutex;
++}
++std::unordered_map<std::FILE*, std::string>& OpenFiles() {
++    static std::unordered_map<std::FILE*, std::string> files;
++    return files;
++}
++} // namespace
++
++void ReportOpenFiles(std::FILE* out) {
++    std::map<std::string, size_t> folders;
++    size_t total = 0;
++    {
++        std::scoped_lock lock{OpenFilesMutex()};
++        total = OpenFiles().size();
++        for (const auto& [stream, path] : OpenFiles()) {
++            const auto slash = path.find_last_of('/');
++            ++folders[slash == std::string::npos ? path : path.substr(0, slash)];
++        }
++    }
++    std::vector<std::pair<size_t, std::string>> largest;
++    for (auto& [folder, count] : folders) largest.emplace_back(count, folder);
++    std::sort(largest.rbegin(), largest.rend());
++    std::fprintf(out, "EDEN_OPEN_FILES iofile=%zu folders=%zu", total, folders.size());
++    for (size_t i = 0; i < largest.size() && i < 6; ++i)
++        std::fprintf(out, " | %zu %s", largest[i].first, largest[i].second.c_str());
++    std::fprintf(out, "\n");
++}
++
+ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileShareFlag flag) {
+     Close();
+ 
+@@ -284,6 +322,9 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
+         const auto ec = std::error_code{errno, std::generic_category()};
+         LOG_ERROR(Common_Filesystem, "Failed to open the file at path={}, ec_message={}",
+                   PathToUTF8String(file_path), ec.message());
++    } else {
++        std::scoped_lock lock{OpenFilesMutex()};
++        OpenFiles()[file] = PathToUTF8String(file_path);
+     }
+ }
+ 
+@@ -294,6 +335,10 @@ void IOFile::Close() {
+ 
+     errno = 0;
+ 
++    {
++        std::scoped_lock lock{OpenFilesMutex()};
++        OpenFiles().erase(file);
++    }
+     const auto close_result = std::fclose(file) == 0;
+ 
+     if (!close_result) {
+diff --git a/src/common/fs/file.h b/src/common/fs/file.h
+index b1ccfbd18a..60edff509f 100644
+--- a/src/common/fs/file.h
++++ b/src/common/fs/file.h
+@@ -17,6 +17,10 @@
+ 
+ namespace Common::FS {
+ 
++/// Writes the IOFiles open now, by folder (most first), as one EDEN_OPEN_FILES line.
++void ReportOpenFiles(std::FILE* out);
++
++
+ enum class SeekOrigin {
+     SetOrigin,       // Seeks from the start of the file.
+     CurrentPosition, // Seeks from the current file pointer position.

@@ -888,6 +888,99 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
 #endif
 }
 
+// Part of one committed block, [address, +size) in 16 KiB pages, back to the system (the address
+// space kept, the block's record split around it), and memory again over such a part. The heap gives
+// a released arena's 2 MiB back this way (headless/heap_arenas.inc): its block stays the heap's, as
+// the 16 KiB after it hold the heap's own record of the next block. 1: done; 0: nothing done (the
+// range is as it was).
+constexpr std::size_t SmallPage = 0x4000;
+int PageOutRange(void* address, std::size_t size) noexcept {
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    if (address == nullptr || size == 0 || size % SmallPage != 0 || begin % SmallPage != 0) return 0;
+#ifdef PS5_NATIVE
+    const auto end = begin + size;
+    LockCommitted();
+    CommittedBlock* owner = nullptr;
+    for (auto& block : committed_blocks)
+        if (block.address != 0 && block.address <= begin && end <= block.address + block.size) {
+            owner = &block;
+            break;
+        }
+    if (owner == nullptr) {
+        UnlockCommitted();
+        return 0;
+    }
+    const std::uintptr_t owner_end = owner->address + owner->size;
+    const std::size_t left = begin - owner->address;
+    CommittedBlock* spare = nullptr;
+    if (end < owner_end && left != 0) {
+        for (auto& block : committed_blocks)
+            if (block.address == 0) {
+                spare = &block;
+                break;
+            }
+        if (spare == nullptr) {
+            UnlockCommitted();
+            return 0;
+        }
+    }
+    const std::int64_t physical = owner->physical + static_cast<std::int64_t>(left);
+    void* at = address;
+    if (munmap(at, size) != 0) {
+        UnlockCommitted();
+        return 0;
+    }
+    void* again = at;
+    const bool reserved = sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage) == 0 && again == at;
+    if (!reserved || sceKernelReleaseDirectMemory(physical, size) != 0) {
+        // The system kept the memory: map it back where it was, as it was.
+        void* back = at;
+        if (sceKernelMapDirectMemory(&back, size, PROT_READ | PROT_WRITE, MAP_FIXED, physical, SmallPage) != 0 ||
+            back != at)
+            std::abort(); // the heap's block would be gone under it
+        UnlockCommitted();
+        return 0;
+    }
+    const CommittedBlock right{end, owner_end - end, owner->physical + static_cast<std::int64_t>(end - owner->address)};
+    if (left != 0) {
+        owner->size = left;
+        if (end < owner_end) *spare = right;
+    } else {
+        *owner = end < owner_end ? right : CommittedBlock{};
+    }
+    UnlockCommitted();
+    return 1;
+#else
+    void* at = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+    return at == address ? 1 : 0;
+#endif
+}
+int PageInRange(void* address, std::size_t size) noexcept {
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    if (address == nullptr || size == 0 || size % SmallPage != 0 || begin % SmallPage != 0) return 0;
+#ifdef PS5_NATIVE
+    std::int64_t physical = -1;
+    if (eden_direct_high(size, SmallPage, 12, &physical) != 0) return 0;
+    void* at = address;
+    if (sceKernelMapDirectMemory(&at, size, PROT_READ | PROT_WRITE, MAP_FIXED, physical, SmallPage) != 0 || at != address) {
+        (void)sceKernelReleaseDirectMemory(physical, size);
+        return 0;
+    }
+    if (!RecordCommitted(begin, size, physical)) {
+        if (munmap(at, size) == 0) {
+            void* again = at;
+            (void)sceKernelReserveVirtualRange(&again, size, MAP_FIXED, SmallPage);
+            (void)sceKernelReleaseDirectMemory(physical, size);
+        }
+        return 0;
+    }
+    return 1;
+#else
+    void* at = mmap(address, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return at == address ? 1 : 0;
+#endif
+}
+
 // A reserved range given back whole: its memory, then its address space.
 void ReleaseMemoryRange(void* address, std::size_t size) noexcept {
     if (address == nullptr || size == 0) return;
@@ -924,12 +1017,16 @@ std::size_t CommittedSplit() noexcept {
 namespace {
 constexpr std::size_t CodeStep = std::size_t{16} << 20;
 constexpr std::size_t CodeSteps = 64; // the largest cache: 1 GiB
+// A step is taken as 2 MiB pieces, each where the pool has one: late in a long session the pool's
+// free memory is scattered (MKW without Pro memory: tens of MiB free, no 16 MiB run), and a step
+// asked for whole was refused and the app aborted.
+constexpr std::size_t CodePiece = LargePage, CodePieces = CodeStep / CodePiece;
 struct CodeRange {
     std::atomic<std::uintptr_t> executable{0}; // 0: free
     std::uintptr_t writable = 0;
     std::size_t span = 0;
     std::atomic<std::size_t> committed{0};
-    std::int64_t physical[CodeSteps] = {};
+    std::int64_t physical[CodeSteps * CodePieces] = {};
 };
 std::array<CodeRange, 16> code_ranges;
 std::mutex code_mutex;
@@ -940,20 +1037,30 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
     void* const writable = reinterpret_cast<void*>(range.writable + offset);
     void* const executable = reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + offset);
 #ifdef PS5_NATIVE
-    std::int64_t physical = -1;
-    if (eden_direct_low(CodeStep, LargePage, 12, &physical) != 0) return false;
+    std::int64_t* const pieces = &range.physical[offset / CodeStep * CodePieces];
+    std::size_t taken = 0;
+    for (; taken < CodePieces; ++taken)
+        if (eden_direct_low(CodePiece, LargePage, 12, &pieces[taken]) != 0) break;
+    if (taken < CodePieces) {
+        for (std::size_t piece = 0; piece < taken; ++piece) sceKernelReleaseDirectMemory(pieces[piece], CodePiece);
+        return false;
+    }
     // A step that fails half way stays as it is: the caller has no cache to go on with.
-    void* at = writable;
-    if (sceKernelMapDirectMemory(&at, CodeStep, PROT_READ | PROT_WRITE, MAP_FIXED, physical, LargePage) != 0 ||
-        at != writable)
-        return false;
+    for (std::size_t piece = 0; piece < CodePieces; ++piece) {
+        void* at = static_cast<char*>(writable) + piece * CodePiece;
+        void* const want_writable = at;
+        if (sceKernelMapDirectMemory(&at, CodePiece, PROT_READ | PROT_WRITE, MAP_FIXED, pieces[piece], LargePage) != 0 ||
+            at != want_writable)
+            return false;
+        at = static_cast<char*>(executable) + piece * CodePiece;
+        void* const want_executable = at;
+        if (sceKernelMapDirectMemory(&at, CodePiece, PROT_READ, MAP_FIXED, pieces[piece], LargePage) != 0 ||
+            at != want_executable)
+            return false;
+    }
     std::memset(writable, 0, CodeStep);
-    at = executable;
-    if (sceKernelMapDirectMemory(&at, CodeStep, PROT_READ, MAP_FIXED, physical, LargePage) != 0 || at != executable)
-        return false;
     // As MapExecutableAlias: the mapping call refuses EXEC on some versions.
     if (mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0) return false;
-    range.physical[offset / CodeStep] = physical;
 #else
     if (mprotect(writable, CodeStep, PROT_READ | PROT_WRITE) != 0 ||
         mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0)
@@ -1027,7 +1134,15 @@ bool CommitCodeRange(const void* executable, std::size_t bytes) noexcept {
         const std::lock_guard lock{code_mutex};
         std::size_t committed = range.committed.load(std::memory_order_relaxed);
         while (committed < bytes) {
-            if (!CommitCodeStep(range, committed)) return false;
+            // Out of memory for the JIT's next 16 MiB: the guest memory service packs cold guest
+            // memory to give some back, and the step is asked for again (up to 3 times). Before, a
+            // refused step aborted the app (MKW without Pro memory, deep in a race).
+            bool stepped = CommitCodeStep(range, committed);
+            for (int attempt = 0; !stepped && attempt < 3; ++attempt) {
+                if (eden_memory_recover(CodeStep + (std::size_t{16} << 20)) == 0) break;
+                stepped = CommitCodeStep(range, committed);
+            }
+            if (!stepped) return false;
             committed += CodeStep;
             range.committed.store(committed, std::memory_order_release);
         }
@@ -1051,8 +1166,8 @@ bool FreeCodeRange(void* executable) noexcept {
         if (munmap(reinterpret_cast<void*>(range.writable), range.span) != 0 || munmap(executable, range.span) != 0)
             std::abort();
 #ifdef PS5_NATIVE
-        for (std::size_t step = 0; step < committed / CodeStep; ++step)
-            if (sceKernelReleaseDirectMemory(range.physical[step], CodeStep) != 0) std::abort();
+        for (std::size_t piece = 0; piece < committed / CodePiece; ++piece)
+            if (sceKernelReleaseDirectMemory(range.physical[piece], CodePiece) != 0) std::abort();
 #endif
         code_reserved.fetch_sub(range.span, std::memory_order_relaxed);
         code_committed.fetch_sub(committed, std::memory_order_relaxed);

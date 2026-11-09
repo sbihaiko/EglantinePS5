@@ -90,6 +90,11 @@ void ResetCounters() noexcept {
         counter->store(0, std::memory_order_relaxed);
 }
 
+// Freed pages cleared (GuestMemoryFreedPart, below).
+std::atomic<std::uint64_t> freed_part_calls{0}, freed_part_bytes{0};
+// Idle blocks RecoverMemory gave back (GiveBackIdleBlocks).
+std::atomic<std::uint64_t> idle_given_back{0}, idle_give_back_calls{0};
+
 bool LockSlot(SparseRange& range, std::size_t slot, bool count_wait = false) noexcept {
     auto& state = range.state[slot];
     bool waited = false;
@@ -165,6 +170,40 @@ struct PackedSlot {
     std::uint32_t size = 0;
 };
 std::atomic<PackedSlot*> packed_slots{nullptr}; // per slot of the guest's range, made by the scanner
+// Diagnostic (EDEN_CRAM_PACK_KEEP=1): a packed slot keeps its block, and the unpack compares what it
+// unpacked with it. A difference means the slot's data changed while it was packed (written through a
+// mapping other than the slot's own). Saves no memory: for finding what packing breaks.
+bool PackKeep() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_CRAM_PACK_KEEP");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
+std::int64_t* pack_kept = nullptr; // per slot: the block a packed slot kept, -1 none
+// Pages of each slot the GPU's caches hold (eden_guest_gpu_cached, from the core's device memory
+// manager): such a slot is not packed. With packing, Mario Kart World's emulated GPU read impossible
+// draw arguments (1.8-2.9 billion indices) and the GPU hung, only in sessions where the GPU thread
+// itself touched packed slots; the slots' data came back intact, so what the GPU reads through its
+// caches and their ordering must not meet a packed slot. That left MKW ~86 MiB to pack (it maps
+// nearly all its memory for the GPU), and it still ran out; the impossible draws come without
+// packing too. So such slots are packed by default; EDEN_CRAM_PACK_GPU=0 keeps them out.
+std::atomic<std::atomic<std::int32_t>*> gpu_cached_table{nullptr};
+std::size_t gpu_cached_slots = 0;
+std::atomic<std::uint64_t> pack_gpu_skips{0}, pack_gpu_marked{0};
+// Slots a GPU thread (the command reader "GPU", or "GPUBack") ever had to unpack: never packed again.
+// The caches' count misses what the command reader reads (command lists, draw arguments), and one
+// such unpack was enough for impossible draws.
+std::atomic<std::uint8_t>* gpu_touched = nullptr;
+// Diagnostic: which threads touched packed slots (unpacks by thread name, 16 names at most).
+struct Unpacker {
+    char name[24];
+    std::atomic<std::uint32_t> count;
+};
+Unpacker unpackers[16];
+std::atomic_flag unpackers_lock = ATOMIC_FLAG_INIT;
+void CountUnpacker(std::size_t slot) noexcept;
+std::atomic<std::uint64_t> pack_keep_compared{0}, pack_keep_differed{0};
 std::atomic<std::uint64_t> packed_count{0}, packed_bytes{0}, packs{0}, unpacks{0}, pack_skips{0};
 
 // The packed store: packed data lives in 2 MiB blocks of direct memory of its own, filled one after
@@ -248,6 +287,11 @@ void ForgetPacked(std::size_t slot) noexcept {
     table[slot] = {};
 }
 
+// Blocks packing freed, kept for unpacking (KeepForUnpack below).
+constexpr std::size_t UnpackKeepBlocks = 256;
+std::int64_t unpack_keep[UnpackKeepBlocks];
+std::atomic<std::size_t> unpack_keep_count{0};
+std::atomic_flag unpack_keep_lock = ATOMIC_FLAG_INIT;
 #ifdef PS5_NATIVE
 // A zeroed block from the reserve (the pool refused one).
 bool ReserveBlock(std::int64_t* physical) noexcept {
@@ -283,7 +327,51 @@ void FillReserve(std::size_t blocks = ReserveTarget()) noexcept {
         if (physical >= 0 && sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) std::abort();
     }
 }
+// Blocks packing freed, kept for unpacking only (an unpack overwrites the whole block, so they are
+// not zeroed). A burst of packing under a short pool is followed by reads of some of those slots: a
+// read whose unpack found no block waited in its fault handler for up to 2 s, and with dozens of them
+// the threads the GPU's work waits on stalled until the driver declared the device lost (Mario Kart
+// World: every GPU hang came seconds after ~1.3 GB was packed). EDEN_CRAM_UNPACK_KEEP_MIB (default
+// 256, at most 512) sets how many are kept.
+std::size_t UnpackKeepTarget() noexcept {
+    static const std::size_t blocks = [] {
+        const char* value = std::getenv("EDEN_CRAM_UNPACK_KEEP_MIB");
+        const std::size_t mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 256;
+        return std::min(UnpackKeepBlocks, mib / (SparseSlot >> 20));
+    }();
+    return blocks;
+}
+bool KeepForUnpack(std::int64_t physical) noexcept {
+    Spin(unpack_keep_lock);
+    const std::size_t count = unpack_keep_count.load(std::memory_order_relaxed);
+    const bool kept = count < UnpackKeepTarget();
+    if (kept) {
+        unpack_keep[count] = physical;
+        unpack_keep_count.store(count + 1, std::memory_order_relaxed);
+    }
+    unpack_keep_lock.clear(std::memory_order_release);
+    return kept;
+}
+bool UnpackBlock(std::int64_t* physical) noexcept {
+    Spin(unpack_keep_lock);
+    const std::size_t count = unpack_keep_count.load(std::memory_order_relaxed);
+    const bool ok = count > 0;
+    if (ok) {
+        *physical = unpack_keep[count - 1];
+        unpack_keep_count.store(count - 1, std::memory_order_relaxed);
+    }
+    unpack_keep_lock.clear(std::memory_order_release);
+    return ok;
+}
+void EmptyUnpackKeep() noexcept {
+    Spin(unpack_keep_lock);
+    for (std::size_t i = 0; i < unpack_keep_count.load(std::memory_order_relaxed); ++i)
+        if (sceKernelReleaseDirectMemory(unpack_keep[i], SparseSlot) != 0) std::abort();
+    unpack_keep_count.store(0, std::memory_order_relaxed);
+    unpack_keep_lock.clear(std::memory_order_release);
+}
 void EmptyReserve() noexcept {
+    EmptyUnpackKeep();
     Spin(reserve_lock);
     for (std::size_t i = 0; i < reserve_count.load(std::memory_order_relaxed); ++i)
         if (sceKernelReleaseDirectMemory(reserve[i], SparseSlot) != 0) std::abort();
@@ -445,7 +533,9 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
     if (table == nullptr || table[slot].data == nullptr) std::abort();
     const std::uintptr_t at = SlotAddress(range, slot);
     std::int64_t physical = -1;
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
+    if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !UnpackBlock(&physical) &&
+        !ReserveBlock(&physical))
+        return false;
     // Unpacked in a view of its own and only then mapped at the slot: mapped first, a reader that
     // had not faulted yet would see the block half unpacked.
     void* view = reinterpret_cast<void*>(cpu_mapping_hint);
@@ -456,6 +546,28 @@ bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
     const int out = LZ4_decompress_safe(static_cast<const char*>(table[slot].data), static_cast<char*>(view),
                                         static_cast<int>(table[slot].size), static_cast<int>(SparseSlot));
     if (out != static_cast<int>(SparseSlot)) std::abort(); // the guest's data is gone: never carry on
+    if (pack_kept != nullptr && pack_kept[slot] >= 0) {
+        void* kept_view = reinterpret_cast<void*>(cpu_mapping_hint);
+        if (sceKernelMapDirectMemory(&kept_view, SparseSlot, PROT_READ, 0, pack_kept[slot], SparseSlot) == 0) {
+            pack_keep_compared.fetch_add(1, std::memory_order_relaxed);
+            const auto* a = static_cast<const std::uint64_t*>(view);
+            const auto* b = static_cast<const std::uint64_t*>(kept_view);
+            for (std::size_t i = 0; i < SparseSlot / 8; ++i)
+                if (a[i] != b[i]) {
+                    if (pack_keep_differed.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        char line[200];
+                        const int n = std::snprintf(line, sizeof(line),
+                            "EDEN_CRAM_PACK_KEEP slot %zu changed while packed: word %zu unpacked %#llx kept %#llx\n",
+                            slot, i, (unsigned long long)a[i], (unsigned long long)b[i]);
+                        if (n > 0) Note(line);
+                    }
+                    break;
+                }
+            (void)munmap(kept_view, SparseSlot);
+        }
+        (void)sceKernelReleaseDirectMemory(pack_kept[slot], SparseSlot);
+        pack_kept[slot] = -1;
+    }
     if (munmap(view, SparseSlot) != 0) std::abort();
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
@@ -699,6 +811,27 @@ bool WaitForBlock(Promote&& promote) noexcept {
 
 // How many writes of the guest's memory are waiting for a block now (headless/performance.cpp):
 // while any is, the graphics caches are told no memory is free.
+// A page of the guest's memory the GPU's caches now hold (+1) or no longer hold (-1), from the core's
+// device memory manager. Counted per slot; packing skips slots with any (PackSlot).
+extern "C" void eden_guest_gpu_cached(const void* host, int delta) noexcept {
+    SparseRange* const range = guest_range.load(std::memory_order_acquire);
+    if (range == nullptr) return;
+    const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
+    const auto at = reinterpret_cast<std::uintptr_t>(host);
+    if (at < begin || at >= range->end) return;
+    auto* table = gpu_cached_table.load(std::memory_order_acquire);
+    if (table == nullptr) {
+        const std::size_t slots = (range->end - begin) / SparseSlot;
+        auto* made = new (std::nothrow) std::atomic<std::int32_t>[slots]();
+        if (made == nullptr) return;
+        gpu_cached_slots = slots;
+        if (gpu_cached_table.compare_exchange_strong(table, made, std::memory_order_acq_rel)) table = made;
+        else delete[] made;
+    }
+    const std::size_t slot = (at - begin) / SparseSlot;
+    if (slot < gpu_cached_slots) table[slot].fetch_add(delta, std::memory_order_acq_rel);
+}
+
 extern "C" unsigned eden_guest_memory_wanted(void) noexcept {
     return memory_waiters.load(std::memory_order_acquire);
 }
@@ -798,6 +931,7 @@ bool HandleGuestWriteFault(void* fault) noexcept {
             done = PromoteShared(*range, slot);
         } else if (state == SlotPacked) {
             done = UnpackSlot(*range, slot);
+            if (done) CountUnpacker(slot);
         }
         return done;
     };
@@ -1035,6 +1169,13 @@ bool ScanShare(SparseRange& range, std::size_t keep, std::size_t other) noexcept
 // each scan pass packs up to PackPerPass slots unwritten for ColdSeconds or more, the
 // coldest first. A slot packed before waits twice as many passes each time (it came back), and
 // one that does not compress to PackMaxRatio is left as it is.
+// On unless EDEN_CRAM_PACK=0 (2026-11-09). It only starts once the pool's largest free block is
+// below EDEN_CRAM_PACK_BELOW_MIB, so a game that fits never packs. Without PS5 Pro memory (12,224
+// MiB) Mario Kart World ran out at every race load without it; with it (GPU-reachable slots
+// included, below) it ran a whole race and into the next (docs/MKW-MEMORY-LEAK.md). It was off from
+// 2026-11-08: sessions that packed showed impossible draws and GPU hangs, but those draws turned out
+// to come without packing too (the race-load event), and the hangs with GPU threads waiting for
+// memory went with the unpack reserve (EDEN_CRAM_UNPACK_KEEP_MIB).
 bool PackEnabled() noexcept {
     static const bool on = [] {
         const char* value = std::getenv("EDEN_CRAM_PACK");
@@ -1044,7 +1185,17 @@ bool PackEnabled() noexcept {
     return on;
 }
 constexpr std::size_t PackPerPass = 256;                       // 512 MiB of slots
-constexpr std::size_t PackBelowLargest = std::size_t{1536} << 20;
+// EDEN_CRAM_PACK_BELOW_MIB / EDEN_CRAM_PACK_COLD_S: when packing starts (largest free block) and how long
+// a slot must stay unwritten (tuning; defaults 3072 MiB and 30 s: MKW without Pro memory needs packing
+// to start well before the race load, which takes ~1.5 GB at once).
+std::size_t EnvOr(const char* name, std::size_t fallback) noexcept {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : fallback;
+}
+std::size_t PackBelowLargest() noexcept {
+    static const std::size_t bytes = EnvOr("EDEN_CRAM_PACK_BELOW_MIB", 3072) << 20;
+    return bytes;
+}
 constexpr double PackMaxRatio = 0.6;
 std::vector<std::uint8_t> pack_times; // per slot, the scanner's: how often it was packed
 std::atomic<bool> pack_refused{false};
@@ -1064,7 +1215,7 @@ bool PoolShortForPacking() noexcept {
     std::size_t largest = 0;
     return total > 0 && &sceKernelAvailableDirectMemorySize != nullptr &&
            sceKernelAvailableDirectMemorySize(0, total, SparseSlot, &start, &largest) == 0 &&
-           largest < PackBelowLargest;
+           largest < PackBelowLargest();
 #else
     return false;
 #endif
@@ -1075,6 +1226,21 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     if (table == nullptr) return false;
+    static const bool pack_gpu = [] {
+        const char* value = std::getenv("EDEN_CRAM_PACK_GPU");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (auto* gpu_cached = gpu_cached_table.load(std::memory_order_acquire);
+        !pack_gpu && gpu_cached != nullptr && slot < gpu_cached_slots &&
+        gpu_cached[slot].load(std::memory_order_acquire) > 0) {
+        pack_gpu_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!pack_gpu && gpu_touched != nullptr && slot < gpu_cached_slots &&
+        gpu_touched[slot].load(std::memory_order_acquire) != 0) {
+        pack_gpu_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     LockSlot(range, slot);
     if (SlotState(range, slot) != SlotOwn) {
         UnlockSlot(range, slot, SlotState(range, slot));
@@ -1103,7 +1269,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         return false;
     }
     // The slot's block, mapped nowhere now: the store may take it when the pool has no block.
-    std::int64_t donate = range.physical[slot];
+    std::int64_t donate = PackKeep() && pack_kept != nullptr ? -1 : range.physical[slot];
     void* const data = StoreAlloc(static_cast<std::size_t>(size), &donate);
     if (data == nullptr) {
         // No room anywhere (the store's address space is full): the block, untouched, comes back.
@@ -1113,7 +1279,11 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         return false;
     }
     std::memcpy(data, pack_scratch.data(), static_cast<std::size_t>(size));
-    if (donate >= 0 && sceKernelReleaseDirectMemory(donate, SparseSlot) != 0) std::abort();
+    if (PackKeep() && pack_kept != nullptr) {
+        pack_kept[slot] = range.physical[slot];
+    } else if (donate >= 0 && !KeepForUnpack(donate) && sceKernelReleaseDirectMemory(donate, SparseSlot) != 0) {
+        std::abort();
+    }
     range.physical[slot] = -1;
     guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
     table[slot] = {data, static_cast<std::uint32_t>(size)};
@@ -1141,7 +1311,12 @@ bool ColdReport() noexcept {
     }();
     return on;
 }
-constexpr std::size_t ColdSeconds = 60, ColdSamples = 24;
+constexpr std::size_t ColdSamples = 24;
+std::size_t ColdSecondsNow() noexcept {
+    static const std::size_t seconds = EnvOr("EDEN_CRAM_PACK_COLD_S", 30);
+    return seconds;
+}
+#define ColdSeconds ColdSecondsNow()
 std::vector<std::uint64_t> cold_hash;
 std::vector<std::uint32_t> cold_since; // per Own slot: when its hash last changed (s, steady clock)
 std::uint32_t ColdNow() noexcept {
@@ -1149,7 +1324,14 @@ std::uint32_t ColdNow() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 std::size_t cold_rotor = 0;
-std::atomic<std::uint64_t> cold_1{0}, cold_3{0}, cold_6{0}, cold_own{0};
+std::atomic<std::uint64_t> cold_1{0}, cold_3{0}, cold_6{0}, cold_own{0}, cold_zero{0}, cold_zero_old{0};
+// Diagnostic (MKW leak): every 64th word of the slot is zero.
+bool ColdLooksZero(std::uintptr_t at) noexcept {
+    const auto* word = reinterpret_cast<const volatile std::uint64_t*>(at);
+    for (std::size_t i = 0; i < SparseSlot / 8; i += 64)
+        if (word[i] != 0) return false;
+    return true;
+}
 std::atomic<std::uint64_t> cold_sampled_bytes{0}, cold_compressed_bytes{0}, cold_compress_ns{0};
 
 std::uint64_t ColdHash(std::uintptr_t at) noexcept {
@@ -1161,7 +1343,71 @@ std::uint64_t ColdHash(std::uintptr_t at) noexcept {
 
 void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& candidates) noexcept;
 
+// Diagnostic: the zero block (every untouched slot shows it, and the sparse tables' unused parts) must
+// stay zero. Written through a mapping that should not allow it, every untouched slot of the game
+// would read that garbage. Checked each pass through a read-only view of its own.
+std::atomic<std::uint64_t> zero_block_dirty{0};
+void CheckZeroBlock() noexcept {
+#ifdef PS5_NATIVE
+    static const volatile std::uint64_t* view = []() -> const volatile std::uint64_t* {
+        void* at = reinterpret_cast<void*>(cpu_mapping_hint);
+        if (zero_block < 0 || sceKernelMapDirectMemory(&at, SparseSlot, PROT_READ, 0, zero_block, SparseSlot) != 0)
+            return nullptr;
+        return static_cast<const volatile std::uint64_t*>(at);
+    }();
+    if (view == nullptr) return;
+    for (std::size_t i = 0; i < SparseSlot / 8; i += 8)
+        if (view[i] != 0) {
+            if (zero_block_dirty.fetch_add(1, std::memory_order_relaxed) < 4) {
+                char line[160];
+                const int n = std::snprintf(line, sizeof(line), "EDEN_CRAM_ZERO_BLOCK written: word %zu is %#llx\n", i,
+                                            (unsigned long long)view[i]);
+                if (n > 0) Report(line);
+            }
+            return;
+        }
+#endif
+}
+
+#ifdef PS5_NATIVE
+extern "C" int pthread_getname_np(pthread_t, char*, std::size_t);
+#endif
+void CountUnpacker(std::size_t slot) noexcept {
+    char name[24] = "?";
+#ifdef PS5_NATIVE
+    (void)pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
+    name[sizeof(name) - 1] = 0;
+    if ((std::strcmp(name, "GPU") == 0 || std::strcmp(name, "GPUBack") == 0) && gpu_touched != nullptr &&
+        slot < gpu_cached_slots && gpu_touched[slot].exchange(1, std::memory_order_acq_rel) == 0)
+        pack_gpu_marked.fetch_add(1, std::memory_order_relaxed);
+    while (unpackers_lock.test_and_set(std::memory_order_acquire)) {}
+    for (auto& entry : unpackers) {
+        if (entry.name[0] == 0) std::memcpy(entry.name, name, sizeof(name));
+        if (std::strcmp(entry.name, name) == 0) {
+            entry.count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
+    unpackers_lock.clear(std::memory_order_release);
+}
+void ReportUnpackers() noexcept {
+    char line[512];
+    int length = std::snprintf(line, sizeof(line), "EDEN_CRAM_UNPACKERS");
+    for (auto& entry : unpackers) {
+        if (entry.name[0] == 0 || length <= 0 || length >= static_cast<int>(sizeof(line)) - 40) break;
+        length += std::snprintf(line + length, sizeof(line) - length, " %s=%u", entry.name,
+                                entry.count.load(std::memory_order_relaxed));
+    }
+    if (length > 0 && length < static_cast<int>(sizeof(line)) - 1) {
+        line[length] = '\n';
+        line[length + 1] = 0;
+        Report(line);
+    }
+}
+
 void ColdPass(SparseRange& range, std::size_t slots) noexcept {
+    CheckZeroBlock();
     const std::lock_guard pack_lock{pack_mutex};
     holding_pack = true;
     struct Held { ~Held() { holding_pack = false; } } held;
@@ -1175,7 +1421,7 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
         pack_ready.reserve(slots);
     }
     candidates.clear();
-    std::uint64_t own = 0, c1 = 0, c3 = 0, c6 = 0;
+    std::uint64_t own = 0, c1 = 0, c3 = 0, c6 = 0, zero = 0, zero_old = 0;
     const std::uint32_t now = ColdNow();
     for (std::size_t slot = 0; slot < slots; ++slot) {
         if (SlotState(range, slot) != SlotOwn) {
@@ -1194,7 +1440,13 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
         c3 += age >= 60;
         c6 += age >= 120;
         if (age >= ColdSeconds) candidates.push_back(slot);
+        if (ColdReport() && ColdLooksZero(SlotAddress(range, slot))) {
+            ++zero;
+            zero_old += age >= 60;
+        }
     }
+    cold_zero.store(zero, std::memory_order_relaxed);
+    cold_zero_old.store(zero_old, std::memory_order_relaxed);
     cold_own.store(own, std::memory_order_relaxed);
     cold_1.store(c1, std::memory_order_relaxed);
     cold_3.store(c3, std::memory_order_relaxed);
@@ -1216,14 +1468,16 @@ void ColdPass(SparseRange& range, std::size_t slots) noexcept {
     cold_compress_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     const std::uint64_t sampled = cold_sampled_bytes.load(std::memory_order_relaxed);
-    char line[320];
+    char line[400];
     const int length = std::snprintf(line, sizeof(line),
         "EDEN_CRAM_COLD own=%lluMiB unwritten_20s=%lluMiB unwritten_60s=%lluMiB unwritten_120s=%lluMiB "
-        "lz4_sampled=%lluMiB lz4_ratio=%.3f lz4_ms=%llu\n",
+        "lz4_sampled=%lluMiB lz4_ratio=%.3f lz4_ms=%llu zero_sampled=%lluMiB zero_unwritten_60s=%lluMiB\n",
         (unsigned long long)(own * 2), (unsigned long long)(c1 * 2), (unsigned long long)(c3 * 2),
         (unsigned long long)(c6 * 2), (unsigned long long)(sampled >> 20),
         sampled ? double(cold_compressed_bytes.load(std::memory_order_relaxed)) / double(sampled) : 0.0,
-        (unsigned long long)(cold_compress_ns.load(std::memory_order_relaxed) / 1000000));
+        (unsigned long long)(cold_compress_ns.load(std::memory_order_relaxed) / 1000000),
+        (unsigned long long)(cold_zero.load(std::memory_order_relaxed) * 2),
+        (unsigned long long)(cold_zero_old.load(std::memory_order_relaxed) * 2));
     if (length > 0) Report(line);
 }
 
@@ -1234,6 +1488,15 @@ void PackPass(SparseRange& range, std::size_t slots, std::vector<std::size_t>& c
     if (packed_slots.load(std::memory_order_acquire) == nullptr) {
         auto* table = new (std::nothrow) PackedSlot[slots]();
         if (table == nullptr) return;
+        if (gpu_touched == nullptr) {
+            gpu_touched = new (std::nothrow) std::atomic<std::uint8_t>[slots]();
+            if (gpu_cached_slots == 0) gpu_cached_slots = slots;
+        }
+        if (PackKeep()) {
+            pack_kept = new (std::nothrow) std::int64_t[slots];
+            if (pack_kept != nullptr)
+                for (std::size_t i = 0; i < slots; ++i) pack_kept[i] = -1;
+        }
         packed_slots.store(table, std::memory_order_release);
         pack_times.assign(slots, 0);
         recover_order.reserve(slots);
@@ -1318,7 +1581,7 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         "EDEN_CRAM %s held=%zuMiB own=%zu shared=%zu zero=%zu faults=%llu promotions=%llu copies=%llu waits=%llu "
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
         "passes=%llu scan_ms=%llu fine=%zu fine_held=%zuMiB fined=%llu unfined=%llu fine_failures=%llu "
-        "reserve=%zuMiB host_transferred=%lluMiB\n",
+        "reserve=%zuMiB host_transferred=%lluMiB freed_parts=%llu freed_parts_cleared=%lluMiB\n",
         when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine,
         (unsigned long long)counters.faults.load(), (unsigned long long)counters.promotions.load(),
         (unsigned long long)counters.copies.load(), (unsigned long long)counters.waits.load(),
@@ -1329,7 +1592,8 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         fine, fine_kept * FinePage >> 20, (unsigned long long)counters.fined.load(),
         (unsigned long long)counters.unfined.load(), (unsigned long long)counters.fine_failures.load(),
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
-        (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20));
+        (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20),
+        (unsigned long long)freed_part_calls.load(), (unsigned long long)(freed_part_bytes.load() >> 20));
     if (length > 0) Report(line);
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
     struct Top { const WriterSite* site; std::uint64_t count; } top[10]{};
@@ -1363,14 +1627,21 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         }
     }
     if (PackEnabled()) {
-        char pack_line[256];
+        char pack_line[400];
         const int pack_length = std::snprintf(pack_line, sizeof(pack_line),
-            "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu\n", when,
+            "EDEN_CRAM_PACK %s packed=%lluMiB stored=%lluMiB packs=%llu unpacks=%llu skips=%llu unpack_keep=%lluMiB"
+            " kept_compared=%llu kept_differed=%llu zero_block_dirty=%llu gpu_skips=%llu gpu_marked=%llu\n", when,
             (unsigned long long)(packed_count.load(std::memory_order_relaxed) * (SparseSlot >> 20)),
             (unsigned long long)(packed_bytes.load(std::memory_order_relaxed) >> 20),
             (unsigned long long)packs.load(std::memory_order_relaxed), (unsigned long long)unpacks.load(std::memory_order_relaxed),
-            (unsigned long long)pack_skips.load(std::memory_order_relaxed));
+            (unsigned long long)pack_skips.load(std::memory_order_relaxed), (unsigned long long)(unpack_keep_count.load(std::memory_order_relaxed) * 2),
+            (unsigned long long)pack_keep_compared.load(std::memory_order_relaxed),
+            (unsigned long long)pack_keep_differed.load(std::memory_order_relaxed),
+            (unsigned long long)zero_block_dirty.load(std::memory_order_relaxed),
+            (unsigned long long)pack_gpu_skips.load(std::memory_order_relaxed),
+            (unsigned long long)pack_gpu_marked.load(std::memory_order_relaxed));
         if (pack_length > 0) Report(pack_line);
+        ReportUnpackers();
     }
 }
 
@@ -1633,6 +1904,44 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
 // those unwritten for 10 s or more, until `bytes` went back. Returns what went back.
 std::atomic<std::uint64_t> recover_calls{0}, recovered_bytes{0};
 namespace {
+#ifdef PS5_NATIVE
+// The last resort of RecoverMemory: blocks the service holds idle (kept for unpacking, then the
+// guest's reserve) go back to the pool. Late in a long session without Pro memory the heap and
+// the JIT were refused their next piece and the app ended, while 768 MiB sat in these two; a
+// guest write or unpack that later finds the pool empty asks for packing as before.
+std::size_t GiveBackIdleBlocks(std::size_t bytes) noexcept {
+    std::size_t freed = 0;
+    while (freed < bytes) {
+        std::int64_t physical = -1;
+        Spin(unpack_keep_lock);
+        if (const std::size_t count = unpack_keep_count.load(std::memory_order_relaxed); count > 0) {
+            physical = unpack_keep[count - 1];
+            unpack_keep_count.store(count - 1, std::memory_order_relaxed);
+        }
+        unpack_keep_lock.clear(std::memory_order_release);
+        if (physical < 0) {
+            Spin(reserve_lock);
+            if (const std::size_t count = reserve_count.load(std::memory_order_relaxed); count > 0) {
+                physical = reserve[count - 1];
+                reserve_count.store(count - 1, std::memory_order_relaxed);
+            }
+            reserve_lock.clear(std::memory_order_release);
+        }
+        if (physical < 0) break;
+        if (sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) std::abort();
+        freed += SparseSlot;
+    }
+    if (freed != 0) {
+        idle_given_back.fetch_add(freed, std::memory_order_relaxed);
+        if (idle_give_back_calls.fetch_add(1, std::memory_order_relaxed) < 24) {
+            char line[96];
+            const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM idle blocks given back: %zu MiB\n", freed >> 20);
+            if (length > 0) Report(line);
+        }
+    }
+    return freed;
+}
+#endif
 std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
 #ifdef PS5_NATIVE
     SparseRange* const range = service_range.load(std::memory_order_acquire);
@@ -1643,15 +1952,16 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
         trimmed = static_cast<std::size_t>(eden_radv_private_radv_ps5_eden_trim(bytes));
     if (trimmed >= bytes) return trimmed;
     bytes -= trimmed;
-    if (range == nullptr || !PackEnabled() || pack_refused.load(std::memory_order_relaxed) || holding_pack) return trimmed;
+    if (range == nullptr || !PackEnabled() || pack_refused.load(std::memory_order_relaxed) || holding_pack)
+        return trimmed + GiveBackIdleBlocks(bytes);
     std::unique_lock pack_lock{pack_mutex, std::defer_lock};
     if (wait) pack_lock.lock();
-    else if (!pack_lock.try_lock()) return trimmed;
+    else if (!pack_lock.try_lock()) return trimmed + GiveBackIdleBlocks(bytes);
     holding_pack = true;
     struct Held { ~Held() { holding_pack = false; } } held;
     if (packed_slots.load(std::memory_order_acquire) == nullptr || cold_since.empty() ||
         recover_order.capacity() < cold_since.size())
-        return trimmed;
+        return trimmed + GiveBackIdleBlocks(bytes);
     const std::uint32_t now = ColdNow();
     recover_order.clear();
     for (std::size_t slot = 0; slot < cold_since.size(); ++slot)
@@ -1675,6 +1985,7 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
                                           wait ? "" : "_try", bytes >> 20, freed >> 20);
         if (length > 0) Report(line);
     }
+    if (freed < bytes) freed += GiveBackIdleBlocks(bytes - freed);
     return trimmed + freed;
 #else
     (void)bytes;
@@ -1778,6 +2089,41 @@ void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept {
             counters.returns_free.fetch_add(1, std::memory_order_relaxed);
         }
         UnlockSlot(*range, static_cast<std::size_t>(slot), SlotZero);
+    }
+}
+
+// The guest's kernel freed pages that do not make a free block of 2 MiB (a region's tail, a page
+// group's blocks): GuestMemoryFreed never sees them, and the slot they sit in stays held whole.
+// MKW unmaps ~1.7 GB in a 5-minute session in pieces of ~370 KiB, and ~640 MiB of it was never
+// given back. Nothing in the guest can read freed pages (the kernel fills or hands them out again
+// before use), so they are cleared where the slot has a block of its own; the scanner then gives
+// back the slot (all zero) or its pages of zeroes (Fine). EDEN_GUEST_FREE_ZERO=0 leaves them.
+bool ZeroFreedParts() noexcept {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_GUEST_FREE_ZERO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+void GuestMemoryFreedPart(std::uint64_t offset, std::size_t bytes) noexcept {
+    SparseRange* const range = guest_range.load(std::memory_order_acquire);
+    if (range == nullptr || !range->promote || bytes == 0 || !ZeroFreedParts()) return;
+    const std::size_t slots = (range->end - range->begin.load(std::memory_order_relaxed)) / SparseSlot;
+    freed_part_calls.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint64_t at = offset, end = offset + bytes; at < end;) {
+        const std::size_t slot = static_cast<std::size_t>(at / SparseSlot);
+        const std::uint64_t slot_end = std::min<std::uint64_t>(end, (at / SparseSlot + 1) * SparseSlot);
+        if (slot >= slots) break;
+        LockSlot(*range, slot);
+        const std::uint8_t state = SlotState(*range, slot);
+        if (state == SlotOwn) {
+            std::memset(reinterpret_cast<void*>(SlotAddress(*range, slot) + at % SparseSlot), 0,
+                        static_cast<std::size_t>(slot_end - at));
+            freed_part_bytes.fetch_add(slot_end - at, std::memory_order_relaxed);
+        }
+        UnlockSlot(*range, slot, state);
+        at = slot_end;
     }
 }
 

@@ -54,6 +54,32 @@ static struct radv_ps5_memory *radv_ps5_trim_tracked[RADV_PS5_TRIM_TRACKED];
 static uint32_t radv_ps5_trim_count;
 static uint64_t radv_ps5_trim_returned, radv_ps5_trim_retaken;
 
+/* A granule goes back only after no resource has been on it for this long: Eden destroys an image
+ * when its texture cache evicts it, while command lists recorded before (the split GPU thread runs
+ * frames behind) may still read or write it. Giving its memory back at once left the GPU writing
+ * through the zero block: GPU_FAULT_PAGE_FAULT_ASYNC on Mario Kart World 30 s after the first trim.
+ * RADV_PS5_TRIM_QUARANTINE_MS overrides (default 2000). */
+static uint32_t
+radv_ps5_trim_now_ms(void)
+{
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   const uint32_t ms = (uint32_t)((uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u);
+   return ms ? ms : 1;
+}
+static uint32_t
+radv_ps5_trim_quarantine_ms(void)
+{
+   static uint32_t value;
+   if (!value) {
+      const char *text = getenv("RADV_PS5_TRIM_QUARANTINE_MS");
+      value = text ? (uint32_t)strtoul(text, NULL, 10) : 2000u;
+      if (!value)
+         value = 1;
+   }
+   return value;
+}
+
 static bool
 radv_ps5_trim_eligible(const struct radv_ps5_memory *memory)
 {
@@ -94,6 +120,8 @@ radv_ps5_trim_untrack(struct radv_ps5_memory *memory)
    }
    free(memory->uses);
    memory->uses = NULL;
+   free(memory->idle_ms);
+   memory->idle_ms = NULL;
    radv_ps5_trim_release();
 }
 
@@ -114,6 +142,12 @@ radv_ps5_memory_use(struct radv_ps5_memory *memory, uint64_t offset, uint64_t si
          radv_ps5_trim_release();
          return true;
       }
+      if (!(memory->idle_ms = calloc(granules, sizeof(*memory->idle_ms)))) {
+         free(memory->uses);
+         memory->uses = NULL;
+         radv_ps5_trim_release();
+         return true;
+      }
       radv_ps5_trim_tracked[radv_ps5_trim_count++] = memory;
    }
    const uint64_t first = offset / RADV_PS5_LARGE_BYTES;
@@ -121,8 +155,8 @@ radv_ps5_memory_use(struct radv_ps5_memory *memory, uint64_t offset, uint64_t si
    bool ok = true;
    for (uint64_t g = first; g <= last; ++g) {
       if (delta < 0) {
-         if (memory->uses[g])
-            memory->uses[g]--;
+         if (memory->uses[g] && --memory->uses[g] == 0)
+            memory->idle_ms[g] = radv_ps5_trim_now_ms();
          continue;
       }
       if (memory->pieces && memory->pieces[g] < 0) {
@@ -157,13 +191,18 @@ radv_ps5_eden_trim(uint64_t want)
    if (!radv_ps5_trim_trylock())
       return 0;
    const int64_t zero = radv_ps5_zero_block();
-   uint64_t returned = 0;
+   const uint32_t now = radv_ps5_trim_now_ms(), quarantine = radv_ps5_trim_quarantine_ms();
+   uint64_t returned = 0, held_back = 0;
    for (uint32_t i = 0; i < radv_ps5_trim_count && zero >= 0 && (!want || returned < want); ++i) {
       struct radv_ps5_memory *memory = radv_ps5_trim_tracked[i];
       const uint64_t granules = memory->bytes / RADV_PS5_LARGE_BYTES;
       for (uint64_t g = 0; g < granules && (!want || returned < want); ++g) {
          if (memory->uses[g] || (memory->pieces && memory->pieces[g] < 0))
             continue;
+         if (memory->idle_ms[g] && now - memory->idle_ms[g] < quarantine) {
+            held_back += RADV_PS5_LARGE_BYTES;
+            continue;
+         }
          if (!radv_ps5_trim_pieces(memory))
             break;
          uint8_t *const at = memory->cpu + g * RADV_PS5_LARGE_BYTES;
@@ -181,10 +220,10 @@ radv_ps5_eden_trim(uint64_t want)
    }
    radv_ps5_trim_returned += returned;
    static uint32_t told;
-   if (returned && told++ < 24)
+   if ((returned || held_back) && told++ < 24)
       fprintf(stderr, "radv/ps5: trim gave back %" PRIu64 " MiB (asked %" PRIu64 "; %" PRIu64 " MiB back, %" PRIu64
-              " MiB taken again so far)\n", returned >> 20, want >> 20, radv_ps5_trim_returned >> 20,
-              radv_ps5_trim_retaken >> 20);
+              " MiB taken again so far; %" PRIu64 " MiB unused for less than %u ms kept)\n", returned >> 20,
+              want >> 20, radv_ps5_trim_returned >> 20, radv_ps5_trim_retaken >> 20, held_back >> 20, quarantine);
    radv_ps5_trim_release();
    return returned;
 }
@@ -204,6 +243,8 @@ edits = {
         '''   int64_t *pieces;
    /* Per 2 MiB granule: resources bound over it (''' + MARK + '''). */
    uint16_t *uses;
+   /* Per 2 MiB granule: when its last resource went (ms, CLOCK_MONOTONIC; 0 never bound). */
+   uint32_t *idle_ms;
 };
 
 bool radv_ps5_memory_use(struct radv_ps5_memory *memory, uint64_t offset, uint64_t size, int delta);

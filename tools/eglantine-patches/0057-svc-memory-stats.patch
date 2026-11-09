@@ -1,0 +1,261 @@
+diff --git a/src/core/hle/kernel/svc/svc_code_memory.cpp b/src/core/hle/kernel/svc/svc_code_memory.cpp
+index 9febc5f529..d12fbd4867 100644
+--- a/src/core/hle/kernel/svc/svc_code_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_code_memory.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/hle/kernel/svc/svc_memory_stats.h"
+ #include "common/scope_exit.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_code_memory.h"
+@@ -33,6 +34,7 @@ constexpr bool IsValidUnmapFromOwnerCodeMemoryPermission(MemoryPermission perm)
+ } // namespace
+ 
+ Result CreateCodeMemory(Core::System& system, Handle* out, u64 address, uint64_t size) {
++    MemoryStats::Note(MemoryStats::CreateCodeMemory, size, true);
+     LOG_TRACE(Kernel_SVC, "called, address={:#x}, size={:#x}", address, size);
+ 
+     // Validate address / size.
+@@ -67,6 +69,7 @@ Result CreateCodeMemory(Core::System& system, Handle* out, u64 address, uint64_t
+ Result ControlCodeMemory(Core::System& system, Handle code_memory_handle,
+                          CodeMemoryOperation operation, u64 address, uint64_t size,
+                          MemoryPermission perm) {
++    MemoryStats::Note(MemoryStats::ControlCodeMemory, size, true);
+ 
+     LOG_TRACE(Kernel_SVC,
+               "called, code_memory_handle={:#x}, operation={:#x}, address={:#x}, size={:#x}, "
+diff --git a/src/core/hle/kernel/svc/svc_memory.cpp b/src/core/hle/kernel/svc/svc_memory.cpp
+index 970912fe50..4813f4228c 100644
+--- a/src/core/hle/kernel/svc/svc_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_memory.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/hle/kernel/svc/svc_memory_stats.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/svc.h"
+@@ -79,6 +80,7 @@ Result MapUnmapMemorySanityChecks(const KProcessPageTable& manager, u64 dst_addr
+ } // namespace
+ 
+ Result SetMemoryPermission(Core::System& system, u64 address, u64 size, MemoryPermission perm) {
++    MemoryStats::Note(MemoryStats::SetMemoryPermission, size, true);
+     LOG_DEBUG(Kernel_SVC, "called, address={:#016x}, size={:#x}, perm={:#08x}", address, size,
+               perm);
+ 
+@@ -100,6 +102,7 @@ Result SetMemoryPermission(Core::System& system, u64 address, u64 size, MemoryPe
+ }
+ 
+ Result SetMemoryAttribute(Core::System& system, u64 address, u64 size, u32 mask, u32 attr) {
++    MemoryStats::Note(MemoryStats::SetMemoryAttribute, size, true);
+     LOG_DEBUG(Kernel_SVC,
+               "called, address={:#016x}, size={:#x}, mask={:#08x}, attribute={:#08x}", address,
+               size, mask, attr);
+@@ -132,6 +135,7 @@ Result SetMemoryAttribute(Core::System& system, u64 address, u64 size, u32 mask,
+ 
+ /// Maps a memory range into a different range.
+ Result MapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
++    MemoryStats::Note(MemoryStats::MapMemory, size, true);
+     LOG_TRACE(Kernel_SVC, "called, dst_addr={:#x}, src_addr={:#x}, size={:#x}", dst_addr,
+               src_addr, size);
+ 
+@@ -147,6 +151,7 @@ Result MapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
+ 
+ /// Unmaps a region that was previously mapped with svcMapMemory
+ Result UnmapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
++    MemoryStats::Note(MemoryStats::UnmapMemory, size, true);
+     LOG_TRACE(Kernel_SVC, "called, dst_addr={:#x}, src_addr={:#x}, size={:#x}", dst_addr,
+               src_addr, size);
+ 
+diff --git a/src/core/hle/kernel/svc/svc_memory_stats.h b/src/core/hle/kernel/svc/svc_memory_stats.h
+new file mode 100644
+index 0000000000..e46b67ed1e
+--- /dev/null
++++ b/src/core/hle/kernel/svc/svc_memory_stats.h
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++// Counts of the guest's memory system calls (diagnostic): how often a game changes its heap or
++// maps memory over a session, and how many bytes those calls name. Reported by the frontend
++// (EDEN_SVC_MEMORY in stderr.log).
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++
++#include "common/common_types.h"
++
++namespace Kernel::Svc::MemoryStats {
++
++enum Call : int {
++    SetHeapSize, MapPhysicalMemory, UnmapPhysicalMemory, MapMemory, UnmapMemory,
++    SetMemoryPermission, SetMemoryAttribute, CreateTransferMemory, MapSharedMemory,
++    CreateCodeMemory, ControlCodeMemory, MapProcessMemory, Count
++};
++
++inline constexpr std::array<const char*, Count> Names{
++    "SetHeapSize", "MapPhysicalMemory", "UnmapPhysicalMemory", "MapMemory", "UnmapMemory",
++    "SetMemoryPermission", "SetMemoryAttribute", "CreateTransferMemory", "MapSharedMemory",
++    "CreateCodeMemory", "ControlCodeMemory", "MapProcessMemory"};
++
++struct Counter {
++    std::atomic<u64> calls{}, bytes{}, failed{};
++};
++
++inline std::array<Counter, Count>& Counters() {
++    static std::array<Counter, Count> counters;
++    return counters;
++}
++
++/// The heap size the game asked for last (SetHeapSize), and its largest.
++inline std::atomic<u64>& LastHeapSize() {
++    static std::atomic<u64> value{};
++    return value;
++}
++inline std::atomic<u64>& LargestHeapSize() {
++    static std::atomic<u64> value{};
++    return value;
++}
++
++inline void Note(Call call, u64 bytes, bool ok) {
++    auto& counter = Counters()[call];
++    counter.calls.fetch_add(1, std::memory_order_relaxed);
++    counter.bytes.fetch_add(bytes, std::memory_order_relaxed);
++    if (!ok) {
++        counter.failed.fetch_add(1, std::memory_order_relaxed);
++    }
++}
++
++/// One line: every call kind used so far, with calls, failures and MiB named (cumulative).
++inline void Report(std::FILE* out) {
++    std::fprintf(out, "EDEN_SVC_MEMORY heap_last=%lluMiB heap_max=%lluMiB",
++                 static_cast<unsigned long long>(LastHeapSize().load() >> 20),
++                 static_cast<unsigned long long>(LargestHeapSize().load() >> 20));
++    for (int i = 0; i < Count; ++i) {
++        const auto& counter = Counters()[i];
++        const u64 calls = counter.calls.load(std::memory_order_relaxed);
++        if (calls == 0) {
++            continue;
++        }
++        std::fprintf(out, " %s=%llu/%lluMiB", Names[i], static_cast<unsigned long long>(calls),
++                     static_cast<unsigned long long>(counter.bytes.load(std::memory_order_relaxed) >> 20));
++        if (const u64 failed = counter.failed.load(std::memory_order_relaxed)) {
++            std::fprintf(out, "(%llu failed)", static_cast<unsigned long long>(failed));
++        }
++    }
++    std::fprintf(out, "\n");
++}
++
++} // namespace Kernel::Svc::MemoryStats
+diff --git a/src/core/hle/kernel/svc/svc_physical_memory.cpp b/src/core/hle/kernel/svc/svc_physical_memory.cpp
+index 46302ed32c..710c226968 100644
+--- a/src/core/hle/kernel/svc/svc_physical_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_physical_memory.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/hle/kernel/svc/svc_memory_stats.h"
+ #include <cstdlib>
+ 
+ #include "core/core.h"
+@@ -14,6 +15,7 @@ namespace Kernel::Svc {
+ 
+ /// Set the process heap to a given Size. It can both extend and shrink the heap.
+ Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
++    MemoryStats::Note(MemoryStats::SetHeapSize, size, true);
+     LOG_TRACE(Kernel_SVC, "called, heap_size={:#x}", size);
+ 
+     auto& process = GetCurrentProcess(system.Kernel());
+@@ -29,11 +31,18 @@ Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
+ 
+     // We succeeded.
+     *out_address = GetInteger(address);
++    MemoryStats::LastHeapSize().store(size, std::memory_order_relaxed);
++    if (size > MemoryStats::LargestHeapSize().load(std::memory_order_relaxed)) {
++        MemoryStats::LargestHeapSize().store(size, std::memory_order_relaxed);
++        LOG_INFO(Kernel_SVC, "SetHeapSize: the heap grows to {} MiB at {:#x}", size >> 20,
++                 GetInteger(address));
++    }
+     R_SUCCEED();
+ }
+ 
+ /// Maps memory at a desired address
+ Result MapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
++    MemoryStats::Note(MemoryStats::MapPhysicalMemory, size, true);
+     LOG_DEBUG(Kernel_SVC, "called, addr={:#016x}, size={:#x}", addr, size);
+ 
+     if (!Common::IsAligned(addr, Core::Memory::YUZU_PAGESIZE)) {
+@@ -83,6 +92,7 @@ Result MapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
+ 
+ /// Unmaps memory previously mapped via MapPhysicalMemory
+ Result UnmapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
++    MemoryStats::Note(MemoryStats::UnmapPhysicalMemory, size, true);
+     LOG_DEBUG(Kernel_SVC, "called, addr={:#016x}, size={:#x}", addr, size);
+ 
+     if (!Common::IsAligned(addr, Core::Memory::YUZU_PAGESIZE)) {
+diff --git a/src/core/hle/kernel/svc/svc_process_memory.cpp b/src/core/hle/kernel/svc/svc_process_memory.cpp
+index 4490ba8d05..56906d861f 100644
+--- a/src/core/hle/kernel/svc/svc_process_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_process_memory.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/hle/kernel/svc/svc_memory_stats.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/svc.h"
+@@ -61,6 +62,7 @@ Result SetProcessMemoryPermission(Core::System& system, Handle process_handle, u
+ 
+ Result MapProcessMemory(Core::System& system, u64 dst_address, Handle process_handle,
+                         u64 src_address, u64 size) {
++    MemoryStats::Note(MemoryStats::MapProcessMemory, size, true);
+     LOG_TRACE(Kernel_SVC,
+               "called, dst_address={:#x}, process_handle={:#x}, src_address={:#x}, size={:#x}",
+               dst_address, process_handle, src_address, size);
+diff --git a/src/core/hle/kernel/svc/svc_shared_memory.cpp b/src/core/hle/kernel/svc/svc_shared_memory.cpp
+index 23e01fdf45..24f01cd7c7 100644
+--- a/src/core/hle/kernel/svc/svc_shared_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_shared_memory.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/hle/kernel/svc/svc_memory_stats.h"
+ #include "common/scope_exit.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -31,6 +32,7 @@ constexpr bool IsValidSharedMemoryPermission(MemoryPermission perm) {
+ 
+ Result MapSharedMemory(Core::System& system, Handle shmem_handle, u64 address, u64 size,
+                        Svc::MemoryPermission map_perm) {
++    MemoryStats::Note(MemoryStats::MapSharedMemory, size, true);
+     LOG_TRACE(Kernel_SVC,
+               "called, shared_memory_handle={:#x}, addr={:#x}, size={:#x}, permissions={:#08x}",
+               shmem_handle, address, size, map_perm);
+diff --git a/src/core/hle/kernel/svc/svc_transfer_memory.cpp b/src/core/hle/kernel/svc/svc_transfer_memory.cpp
+index e539eee911..12aa9761c3 100644
+--- a/src/core/hle/kernel/svc/svc_transfer_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_transfer_memory.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/hle/kernel/svc/svc_memory_stats.h"
+ #include "common/scope_exit.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -30,6 +31,7 @@ constexpr bool IsValidTransferMemoryPermission(MemoryPermission perm) {
+ /// Creates a TransferMemory object
+ Result CreateTransferMemory(Core::System& system, Handle* out, u64 address, u64 size,
+                             MemoryPermission map_perm) {
++    MemoryStats::Note(MemoryStats::CreateTransferMemory, size, true);
+     auto& kernel = system.Kernel();
+ 
+     // Validate the size.

@@ -124,6 +124,20 @@ static void *take(struct space *space, size_t size) {
     return result;
 }
 void *sceLibcMspaceMalloc(void *space, size_t size) { return take(space, size); }
+// An mspace destroyed with a block still in use is the bug releasing arenas must never have.
+int sceLibcMspaceDestroy(void *handle) {
+    struct space *space = handle;
+    assert(space->magic == 0x5bace5bace5bace5ull);
+    pthread_mutex_lock(&space->lock);
+    for (struct block *b = (struct block *)space->start; (char *)b < space->end;
+         b = (struct block *)((char *)b + sizeof(struct block) + b->size)) {
+        assert(b->magic == BLOCK_MAGIC);
+        if (b->used) { fprintf(stderr, "mspace %p destroyed with a block in use: %p, %zu bytes at offset %zu\n", handle, (void *)(b + 1), b->size, (size_t)((char *)b - (char *)handle)); abort(); }
+    }
+    space->magic = 0;
+    pthread_mutex_unlock(&space->lock);
+    return 0;
+}
 void *sceLibcMspaceCalloc(void *space, size_t count, size_t size) {
     void *address = take(space, count * size);
     return address ? memset(address, 0, count * size) : NULL;
@@ -216,6 +230,24 @@ int eden_heap_decommit(void *address, size_t size) {
     atomic_fetch_add(&decommitted_bytes, size);
     return 1;
 }
+// A released arena's payload: unreadable until paged in again, so a stale use faults.
+static atomic_size_t paged_out_bytes;
+int eden_heap_page_out(void *address, size_t size) {
+    assert(((uintptr_t)address & 0x3fff) == 0 && (size & 0x3fff) == 0);
+    if (mprotect(address, size, PROT_NONE) != 0) return 0;
+    (void)madvise(address, size, MADV_DONTNEED);
+    atomic_fetch_sub(&committed_bytes, size);
+    atomic_fetch_add(&paged_out_bytes, size);
+    return 1;
+}
+static atomic_uint paged_in;
+int eden_heap_page_in(void *address, size_t size) {
+    assert(((uintptr_t)address & 0x3fff) == 0 && (size & 0x3fff) == 0);
+    atomic_fetch_add(&paged_in, 1);
+    if (mprotect(address, size, PROT_READ | PROT_WRITE) != 0) return 0;
+    atomic_fetch_add(&committed_bytes, size);
+    return 1;
+}
 // A large block in pieces of memory (the pool has no one piece for it): here simply a mapping.
 static int refuse_split;   // nor in pieces
 static atomic_uint split_blocks;
@@ -241,6 +273,7 @@ size_t eden_heap_committed(void);
 size_t eden_heap_large_held(unsigned *blocks);
 void eden_heap_spill_stats(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
 size_t eden_heap_trim(void);
+size_t eden_heap_arenas_given_back(void);
 void eden_heap_usage(size_t *held, size_t *in_use, size_t *returned);
 
 static void fill(unsigned char *block, size_t size, unsigned seed) {
@@ -399,9 +432,16 @@ int main(int argc, char **argv) {
         assert(eden_heap_arena_owner((void *)(begin + EDEN_HEAP_ARENA_PAYLOAD)) == NULL);
         assert(eden_heap_arena_owner((void *)(begin + EDEN_HEAP_ARENA_SIZE - 1)) == NULL);
     }
-    pthread_t threads[8];
+    // Empty arenas are given back (eden_heap_trim) while the workers take, free and resize small
+    // blocks in them: an arena destroyed with a thread inside, or with a block in use, faults,
+    // damages a pattern, or trips the stand-in's sceLibcMspaceDestroy.
+    pthread_t threads[8], arena_trimmer;
+    atomic_store(&trimming, 1);
+    assert(pthread_create(&arena_trimmer, NULL, trimmer, NULL) == 0);
     for (uintptr_t i = 0; i < 8; ++i) assert(pthread_create(&threads[i], NULL, worker, (void *)(i + 1)) == 0);
     for (int i = 0; i < 8; ++i) pthread_join(threads[i], NULL);
+    atomic_store(&trimming, 0);
+    pthread_join(arena_trimmer, NULL);
     // Threads that keep more than an arena's worth of small blocks: arenas of their own take every
     // one (none goes to the heap's shared spaces), and the next threads, which take their records,
     // use those arenas again instead of making more.
@@ -411,13 +451,18 @@ int main(int argc, char **argv) {
     const unsigned arenas_per_keeper = (KEPT * (KEPT_SIZE + 64) + EDEN_HEAP_ARENA_PAYLOAD - 1) / EDEN_HEAP_ARENA_PAYLOAD + 1;
     keep_and_free(4, kept);
     const unsigned arenas_kept = eden_heap_arenas_created();
-    if (!(arenas_kept > arenas_before && arenas_kept <= arenas_before + 4 * arenas_per_keeper && spills_now() == spills_before)) {
+    // Arenas of their own, or the workers' emptied ones taken again (emptiest-arena reuse): either
+    // way none of the small blocks goes to the shared spaces. (Requiring new arenas here failed on
+    // every run once the workers left arenas empty.)
+    if (!(arenas_kept <= arenas_before + 4 * arenas_per_keeper && spills_now() == spills_before)) {
         fprintf(stderr, "keepers: arenas %u -> %u, small requests in the shared spaces %llu -> %llu\n",
                 arenas_before, arenas_kept, spills_before, spills_now());
         abort();
     }
     keep_and_free(4, kept);
-    if (!(eden_heap_arenas_created() == arenas_kept && spills_now() == spills_before)) {
+    // The same keepers again reuse those arenas: at most one more per keeper (without reuse each
+    // would make a full set again; which arena is the emptiest depends on how threads interleave).
+    if (!(eden_heap_arenas_created() <= arenas_kept + 4 && spills_now() == spills_before)) {
         fprintf(stderr, "keepers again: arenas %u -> %u, small requests in the shared spaces %llu -> %llu\n",
                 arenas_kept, eden_heap_arenas_created(), spills_before, spills_now());
         abort();
@@ -457,7 +502,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "nothing was given back while the spaces emptied\n");
             abort();
         }
+        // The workers' and keepers' arenas emptied: all but a few went back to their spaces.
+        if (!refuse_range && (eden_heap_arenas_given_back() == 0 || atomic_load(&paged_out_bytes) == 0)) {
+            fprintf(stderr, "no empty arena was given back\n");
+            abort();
+        }
     }
+    if (!refuse_range)
+        fprintf(stderr, "arenas given back: %zu MiB paged out, %u taken again\n",
+                atomic_load(&paged_out_bytes) >> 20, atomic_load(&paged_in));
     const size_t after_threads = eden_heap_committed();
     const size_t peak = atomic_load(&ps5_heap_peak_bytes);
     assert(eden_heap_arenas_created() >= 8);

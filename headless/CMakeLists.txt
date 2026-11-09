@@ -2055,16 +2055,17 @@ file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/k_page_heap.cpp" page_heap_
 # to the heap in pieces (a region's tail, a page group's blocks), so a hook on Free saw almost no
 # whole slot (MKW: returns_free=0 while the guest held 4.7 GB). The heap merges free buddies into
 # larger blocks under its pool lock; once a block of 2 MiB or more is free, nothing in the guest
-# can use its pages, and the slots it covers go back (they read zero until written again).
+# can use its pages, and the slots it covers go back (they read zero until written again). A smaller
+# free block is cleared where its slot is held (GuestMemoryFreedPart), for the scanner to give back.
 set(page_heap_free_block_site "void KPageHeap::FreeBlock(KPhysicalAddress block, s32 index) {\n    do {\n        block = m_blocks[index++].PushBlock(block);\n    } while (block != 0);\n}\n")
 string(FIND "${page_heap_source}" "${page_heap_free_block_site}" page_heap_free_block_at)
 if(page_heap_free_block_at LESS 0)
     message(FATAL_ERROR "Pinned page heap FreeBlock changed; review the guest memory service.")
 endif()
 string(REPLACE "${page_heap_free_block_site}"
-    "void KPageHeap::FreeBlock(KPhysicalAddress block, s32 index) {\n    for (;;) {\n        const KPhysicalAddress merged = m_blocks[index].PushBlock(block);\n        if (merged == 0) {\n            if (const size_t size = m_blocks[index].GetSize(); size >= ::Common::GuestFreedSlotBytes) {\n                ::Common::GuestMemoryFreed(GetInteger(block) - Core::DramMemoryMap::Base, size);\n            }\n            return;\n        }\n        block = merged;\n        ++index;\n    }\n}\n"
+    "void KPageHeap::FreeBlock(KPhysicalAddress block, s32 index) {\n    for (;;) {\n        const KPhysicalAddress merged = m_blocks[index].PushBlock(block);\n        if (merged == 0) {\n            if (const size_t size = m_blocks[index].GetSize(); size >= ::Common::GuestFreedSlotBytes) {\n                ::Common::GuestMemoryFreed(GetInteger(block) - Core::DramMemoryMap::Base, size);\n            } else {\n                ::Common::GuestMemoryFreedPart(GetInteger(block) - Core::DramMemoryMap::Base, size);\n            }\n            return;\n        }\n        block = merged;\n        ++index;\n    }\n}\n"
     page_heap_source "${page_heap_source}")
-string(PREPEND page_heap_source "#include <cstddef>\n#include <cstdint>\n#include \"core/device_memory.h\"\nnamespace Common { void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept; inline constexpr std::size_t GuestFreedSlotBytes = std::size_t{2} << 20; }\n")
+string(PREPEND page_heap_source "#include <cstddef>\n#include <cstdint>\n#include \"core/device_memory.h\"\nnamespace Common { void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept; void GuestMemoryFreedPart(std::uint64_t offset, std::size_t bytes) noexcept; inline constexpr std::size_t GuestFreedSlotBytes = std::size_t{2} << 20; }\n")
 write_derived("${PORT_BUILD_DIR}/k_page_heap.cpp" "${page_heap_source}")
 # Into core_sources (kernel.cpp's list above), which is what the core is built from: a list of
 # their own here was overwritten by the line after it, and the original pool and heap were built.

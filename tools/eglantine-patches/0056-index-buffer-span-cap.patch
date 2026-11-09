@@ -1,0 +1,75 @@
+Index buffers and draws: the span in 64 bits, no bound from an index limit of 0, and a 128 MiB cap.
+
+Switch 2 titles leave the index limit at 0, and the count/first registers can hold values no draw
+uses. Mario Kart World's race load reached UpdateIndexBuffer with ~1.8 billion indices; the 32-bit
+products wrapped to a 2.9 GB "index buffer", the buffer cache merged 101 buffers into it and asked
+the pool for 2.9 GB of staging at once, and the session ended out of device memory every time. The
+span is now worked out in 64 bits, an end below the start means no bound, and a binding is capped
+at 128 MiB (64 M 16-bit indices; the largest plausible span seen was 67 MB). A warning (16 at most)
+names each capped span, and an indexed draw whose indices reach past the cap is dropped (run on the
+GPU, a 559 million index draw kept the queue busy past the driver's 10 s limit: device lost).
+
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1504,8 +1504,26 @@
+     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
+     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
+     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
+-    const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
++    // Switch 2 titles leave the index limit at 0 (end below start: no bound), and the count and first
++    // registers can hold values no draw uses: Mario Kart World's race load came here with 1.8 billion
++    // indices, and the 32-bit products wrapped to a 2.9 GB "index buffer" that merged 101 buffers
++    // and asked the pool for 2.9 GB of staging at once (out of device memory every time). The span
++    // is worked out in 64 bits, an end below the start means no bound, and a binding is capped at
++    // 128 MiB (64 M 16-bit indices); indices past it read as out of bounds.
++    constexpr u64 MaxIndexBinding = u64{128} << 20;
++    const u64 address_size64 = gpu_addr_end > gpu_addr_begin ? gpu_addr_end - gpu_addr_begin : ~u64{0};
++    const u64 draw_size64 = (u64{index_buffer_ref.count} + u64{index_buffer_ref.first}) *
++                            u64{index_buffer_ref.FormatSizeInBytes()};
++    const u64 wanted64 = (std::min)(address_size64, draw_size64);
++    if (wanted64 > MaxIndexBinding) {
++        static std::atomic<unsigned> clamped{0};
++        if (clamped.fetch_add(1, std::memory_order_relaxed) < 16) {
++            LOG_WARNING(HW_GPU, "Index buffer span of {} MiB (count {}, first {}) capped at {} MiB",
++                        wanted64 >> 20, index_buffer_ref.count, index_buffer_ref.first, MaxIndexBinding >> 20);
++        }
++    }
++    const u32 address_size = static_cast<u32>((std::min)(address_size64, MaxIndexBinding));
++    const u32 draw_size = static_cast<u32>((std::min)(draw_size64, MaxIndexBinding));
+     const u32 size = (std::min)(address_size, draw_size);
+     if (size >= 16_MiB) {
+         static std::atomic<unsigned> samples{0};
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -6,6 +6,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <array>
+ #include <memory>
+ #include <cstdio>
+@@ -527,6 +528,22 @@
+ 
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
++    // An indexed draw past the 128 MiB index binding (BufferCache::UpdateIndexBuffer) is dropped: its
++    // count register holds no real draw (Mario Kart World's race load: 559 million indices), and run
++    // on the GPU it kept the queue busy past the driver's 10 s limit and the device was lost.
++    if (is_indexed) {
++        const auto& index_buffer = maxwell3d->draw_manager.draw_state.index_buffer;
++        const u64 bytes = (u64{index_buffer.count} + u64{index_buffer.first}) *
++                          u64{index_buffer.FormatSizeInBytes()};
++        if (bytes > (u64{128} << 20)) {
++            static std::atomic<unsigned> dropped{0};
++            if (dropped.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_WARNING(Render_Vulkan, "Indexed draw of {} indices (first {}) dropped: past the index binding",
++                            index_buffer.count, index_buffer.first);
++            }
++            return;
++        }
++    }
+     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
+                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);

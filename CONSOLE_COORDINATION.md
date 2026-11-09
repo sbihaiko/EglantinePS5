@@ -15,3 +15,6 @@ All sessions must adopt the helper; it cannot protect against scripts that
 bypass it. Do not remove either lock file. Use one lease for deployment,
 scripted input, capture, evidence collection, and any restoration. Restore only
 when the installed executable still matches the experiment's candidate.
+
+For process memory maps and the kernel log of a run, see `docs/CONSOLE-DEBUG-TOOLS.md`
+(`tools/ps5debug.py`, `tools/klog.py`).
