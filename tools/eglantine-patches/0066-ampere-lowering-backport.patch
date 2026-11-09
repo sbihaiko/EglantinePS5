@@ -4623,6 +4623,57 @@ index 0000000..5507f81
 +    return true;
 +}
 +} // namespace Shader::Ampere
+diff --git a/src/tests/video_core/ampere_f2i.cpp b/src/tests/video_core/ampere_f2i.cpp
+index 5491934..85fceda 100644
+--- a/src/tests/video_core/ampere_f2i.cpp
++++ b/src/tests/video_core/ampere_f2i.cpp
+@@ -360,8 +360,7 @@ TEST_CASE("Ampere formatted buffer stores preserve descriptors data and predicat
+             }};
+             const auto lowered = LowerToMaxwell(code);
+             REQUIRE(static_cast<bool>(lowered));
+-            REQUIRE(lowered.required_surface_buffer == 3);
+-            REQUIRE(lowered.required_texture_buffer == ~0U);
++            REQUIRE(lowered.required_texture_buffer == 3);
+             REQUIRE(lowered.instructions.size() == 2);
+             REQUIRE(lowered.instructions.front() ==
+                     (0xeb20000000000000ULL | (u64{guard} << 16) | 4 | (15ULL << 20) |
+diff --git a/src/tests/video_core/ampere_program_override.cpp b/src/tests/video_core/ampere_program_override.cpp
+index fd4d775..04f4074 100644
+--- a/src/tests/video_core/ampere_program_override.cpp
++++ b/src/tests/video_core/ampere_program_override.cpp
+@@ -37,7 +37,6 @@ std::vector<u8> Fixture(u32 version) {
+     program.source_size = sizeof(Source);
+     program.source_instruction_offsets = {0, 1};
+     program.required_texture_buffer = 3;
+-    program.required_surface_buffer = 7;
+     return EncodeProgramOverride(Source, program);
+ }
+ } // namespace
+@@ -52,7 +51,6 @@ TEST_CASE("Ampere overrides decode historical six-word OV1 and OV2 layouts",
+         REQUIRE(program.source_size == sizeof(Source));
+         REQUIRE(program.instructions == std::vector<u64>(Canonical.begin(), Canonical.end()));
+         REQUIRE(program.required_texture_buffer == 3);
+-        REQUIRE(program.required_surface_buffer == ~0U);
+         REQUIRE(program.source_instruction_offsets ==
+                 (version == 0x3230564f ? std::vector<u32>{0, 1} : std::vector<u32>{}));
+     }
+@@ -102,16 +100,6 @@ TEST_CASE("Ampere overrides preserve versioned maps and descriptor bank bounds",
+             REQUIRE(static_cast<bool>(DecodeProgramOverride(bytes, Source)) == valid);
+         }
+     }
+-    for (const u32 surface : {0U, 17U, 18U, ~0U, ~0U - 1}) {
+-        auto bytes = Fixture(0x3330564f);
+-        SetWord(bytes, 6, surface);
+-        const auto program = DecodeProgramOverride(bytes, Source);
+-        const bool valid = surface < 18 || surface == ~0U;
+-        REQUIRE((ProgramOverrideSourceSize(bytes) != 0) == valid);
+-        REQUIRE(static_cast<bool>(program) == valid);
+-        if (valid)
+-            REQUIRE(program.required_surface_buffer == surface);
+-    }
+     auto unmapped = LegacyFixture(0x3130564f);
+     SetWord(unmapped, 5, 2);
+     REQUIRE(ProgramOverrideSourceSize(unmapped) == 0);
 diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
 index bd6840a..4977b62 100644
 --- a/src/video_core/shader_environment.cpp
