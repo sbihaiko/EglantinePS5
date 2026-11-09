@@ -137,8 +137,9 @@ jobs:
             ${{ env.RADV_NATIVE }}/radv-release
             ${{ env.RADV_NATIVE }}/ps5-payload-sdk
             ${{ env.RADV_NATIVE }}/zlib
+            ../mihawk-vulkan-review/.deps/work/radv-src
             build/radv-isolated
-          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+          key: radv-4-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
 
       - name: Restore ccache
         id: ccache
@@ -207,8 +208,9 @@ jobs:
             ${{ env.RADV_NATIVE }}/radv-release
             ${{ env.RADV_NATIVE }}/ps5-payload-sdk
             ${{ env.RADV_NATIVE }}/zlib
+            ../mihawk-vulkan-review/.deps/work/radv-src
             build/radv-isolated
-          key: radv-3-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
+          key: radv-4-${{ hashFiles('tools/deps.json', 'tools/patch-radv-wsi.py', 'tools/build-radv-dependencies.sh', 'tools/isolate-radv.py', 'tools/ci/ubuntu-24.04-packages.txt', 'tools/ci/setup-ubuntu-24.04.sh') }}
 
       - name: Match the tag to the package version
         if: startsWith(github.ref, 'refs/tags/')
