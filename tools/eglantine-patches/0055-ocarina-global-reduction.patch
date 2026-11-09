@@ -282,7 +282,7 @@ index 2a7111a593..93d60f28b9 100644
  Id EmitGlobalAtomicAddF32x2(EmitContext& ctx);
  Id EmitGlobalAtomicMinF16x2(EmitContext& ctx);
 diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-index c2fdd7e4f3..47e33c00dd 100644
+index c2fdd7e4f3..b0f64dfcac 100644
 --- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
 +++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
 @@ -8,6 +8,9 @@
@@ -341,7 +341,7 @@ index c2fdd7e4f3..47e33c00dd 100644
              OpStore(ssbo_pointer, data);
              OpReturn();
          });
-@@ -1100,6 +1104,88 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+@@ -1100,6 +1104,91 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
          define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
      std::tie(load_global_func_u32x4, write_global_func_u32x4) =
          define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
@@ -379,8 +379,11 @@ index c2fdd7e4f3..47e33c00dd 100644
 +        return;
 +    }
 +    if (info.nvn_buffer_used.none()) {
++        // Nothing to route to, but the functions below still have to exist: an unbuilt function
++        // makes the emitter throw and the whole compute pipeline fail. With no bound buffer
++        // define_body emits no branch, so each function returns zero -- the same shape the global
++        // load and store functions already take in a program with no NVN buffers.
 +        LOG_WARNING(Shader_SPIRV, "Global atomic with no bound NVN storage buffer: dropped");
-+        return;
 +    }
 +    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
 +    for (size_t index = 0; index < used.size(); ++index) {
