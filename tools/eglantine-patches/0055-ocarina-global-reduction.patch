@@ -1,0 +1,538 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+index d1c08c1131..b7e72634d8 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -107,6 +107,19 @@ Id StorageAtomicU32x2(EmitContext& ctx, const IR::Value& binding, const IR::Valu
+     ctx.OpStore(pointer, result);
+     return original_value;
+ }
++/// A 32-bit global atomic through its routing function (DefineGlobalMemoryFunctions).
++Id GlobalAtomic(EmitContext& ctx, EmitContext::GlobalAtomic kind, Id type,
++                const IR::Value& address, Id value) {
++    if (!ctx.profile.support_int64) {
++        throw NotImplementedException("Global atomic addressing requires 64-bit integers");
++    }
++    const Id function{ctx.global_atomic_funcs[static_cast<size_t>(kind)]};
++    if (!Sirit::ValidId(function)) {
++        throw NotImplementedException("Global atomic {} with no routable storage buffer",
++                                      static_cast<size_t>(kind));
++    }
++    return ctx.OpFunctionCall(type, function, ctx.Def(address), value);
++}
+ } // Anonymous namespace
+ 
+ Id EmitSharedAtomicIAdd32(EmitContext& ctx, Id offset, Id value) {
+@@ -417,164 +430,164 @@ Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const I
+     return ctx.OpPackHalf2x16(ctx.U32[1], result);
+ }
+ 
+-Id EmitGlobalAtomicIAdd32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::IAdd, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicSMin32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::SMin, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicUMin32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::UMin, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicSMax32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::SMax, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicUMax32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::UMax, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicInc32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicInc32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Inc, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicDec32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicDec32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Dec, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicAnd32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicAnd32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::And, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicOr32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicOr32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Or, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicXor32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicXor32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Xor, ctx.U32[1], address, value);
+ }
+ 
+-Id EmitGlobalAtomicExchange32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicExchange32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Exchange, ctx.U32[1], address, value);
+ }
+ 
+ Id EmitGlobalAtomicIAdd64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicIAdd64");
+ }
+ 
+ Id EmitGlobalAtomicSMin64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicSMin64");
+ }
+ 
+ Id EmitGlobalAtomicUMin64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicUMin64");
+ }
+ 
+ Id EmitGlobalAtomicSMax64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicSMax64");
+ }
+ 
+ Id EmitGlobalAtomicUMax64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicUMax64");
+ }
+ 
+ Id EmitGlobalAtomicInc64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicInc64");
+ }
+ 
+ Id EmitGlobalAtomicDec64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicDec64");
+ }
+ 
+ Id EmitGlobalAtomicAnd64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicAnd64");
+ }
+ 
+ Id EmitGlobalAtomicOr64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicOr64");
+ }
+ 
+ Id EmitGlobalAtomicXor64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicXor64");
+ }
+ 
+ Id EmitGlobalAtomicExchange64(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicExchange64");
+ }
+ 
+ Id EmitGlobalAtomicIAdd32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicIAdd32x2");
+ }
+ 
+ Id EmitGlobalAtomicSMin32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicSMin32x2");
+ }
+ 
+ Id EmitGlobalAtomicUMin32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicUMin32x2");
+ }
+ 
+ Id EmitGlobalAtomicSMax32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicSMax32x2");
+ }
+ 
+ Id EmitGlobalAtomicUMax32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicUMax32x2");
+ }
+ 
+ Id EmitGlobalAtomicInc32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicInc32x2");
+ }
+ 
+ Id EmitGlobalAtomicDec32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicDec32x2");
+ }
+ 
+ Id EmitGlobalAtomicAnd32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicAnd32x2");
+ }
+ 
+ Id EmitGlobalAtomicOr32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicOr32x2");
+ }
+ 
+ Id EmitGlobalAtomicXor32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicXor32x2");
+ }
+ 
+ Id EmitGlobalAtomicExchange32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicExchange32x2");
+ }
+ 
+-Id EmitGlobalAtomicAddF32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++Id EmitGlobalAtomicAddF32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::AddF32, ctx.F32[1], address, value);
+ }
+ 
+ Id EmitGlobalAtomicAddF16x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicAddF16x2");
+ }
+ 
+ Id EmitGlobalAtomicAddF32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicAddF32x2");
+ }
+ 
+ Id EmitGlobalAtomicMinF16x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicMinF16x2");
+ }
+ 
+ Id EmitGlobalAtomicMinF32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicMinF32x2");
+ }
+ 
+ Id EmitGlobalAtomicMaxF16x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicMaxF16x2");
+ }
+ 
+ Id EmitGlobalAtomicMaxF32x2(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction");
++    throw NotImplementedException("SPIR-V Instruction: EmitGlobalAtomicMaxF32x2");
+ }
+ 
+ } // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+index 2a7111a593..93d60f28b9 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -421,17 +421,17 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
+                              Id value);
+ Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                              Id value);
+-Id EmitGlobalAtomicIAdd32(EmitContext& ctx);
+-Id EmitGlobalAtomicSMin32(EmitContext& ctx);
+-Id EmitGlobalAtomicUMin32(EmitContext& ctx);
+-Id EmitGlobalAtomicSMax32(EmitContext& ctx);
+-Id EmitGlobalAtomicUMax32(EmitContext& ctx);
+-Id EmitGlobalAtomicInc32(EmitContext& ctx);
+-Id EmitGlobalAtomicDec32(EmitContext& ctx);
+-Id EmitGlobalAtomicAnd32(EmitContext& ctx);
+-Id EmitGlobalAtomicOr32(EmitContext& ctx);
+-Id EmitGlobalAtomicXor32(EmitContext& ctx);
+-Id EmitGlobalAtomicExchange32(EmitContext& ctx);
++Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicInc32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicDec32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicAnd32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicOr32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicXor32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicExchange32(EmitContext& ctx, const IR::Value& address, Id value);
+ Id EmitGlobalAtomicIAdd64(EmitContext& ctx);
+ Id EmitGlobalAtomicSMin64(EmitContext& ctx);
+ Id EmitGlobalAtomicUMin64(EmitContext& ctx);
+@@ -454,7 +454,7 @@ Id EmitGlobalAtomicAnd32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicOr32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicXor32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicExchange32x2(EmitContext& ctx);
+-Id EmitGlobalAtomicAddF32(EmitContext& ctx);
++Id EmitGlobalAtomicAddF32(EmitContext& ctx, const IR::Value& address, Id value);
+ Id EmitGlobalAtomicAddF16x2(EmitContext& ctx);
+ Id EmitGlobalAtomicAddF32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicMinF16x2(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index c2fdd7e4f3..47e33c00dd 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -8,6 +8,9 @@
+ #include <array>
+ #include <bit>
+ #include <climits>
++#include <optional>
++
++#include "common/logging.h"
+ 
+ #include <boost/container/static_vector.hpp>
+ 
+@@ -540,7 +543,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
+     DefineImages(program.info, image_binding, bindings.image_scaling_index);
+     DefineAttributeMemAccess(program.info);
+     DefineWriteStorageCasLoopFunction(program.info);
+-    DefineGlobalMemoryFunctions(program.info);
++    DefineGlobalMemoryFunctions(program);
+     DefineRescalingInput(program.info);
+     DefineRenderArea(program.info);
+ }
+@@ -1021,7 +1024,8 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
+     write_storage_cas_loop_func = func;
+ }
+ 
+-void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
++void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
++    const Info& info{program.info};
+     if (!info.uses_global_memory || !profile.support_int64) {
+         return;
+     }
+@@ -1059,7 +1063,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+             const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
+-            callback(ssbo_pointer);
++            callback(ssbo_pointer, ssbo_id, ssbo_index);
+             AddLabel(else_label);
+         }
+     }};
+@@ -1068,7 +1072,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
+         const Id addr{OpFunctionParameter(U64)};
+         define_body(ssbo_member, addr, element_pointer, shift,
+-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
++                    [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
+         OpReturnValue(ConstantNull(type));
+         OpFunctionEnd();
+         return func_id;
+@@ -1078,7 +1082,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
+         const Id addr{OpFunctionParameter(U64)};
+         const Id data{OpFunctionParameter(type)};
+-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
++        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
+             OpStore(ssbo_pointer, data);
+             OpReturn();
+         });
+@@ -1100,6 +1104,88 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
+     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
+         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
++
++    // Global atomics the storage buffer pass could not route to a binding: walk the bound NVN
++    // storage buffers here and run the operation on the word that holds the address. INC, DEC and
++    // the float add have no host atomic of their own and go through the storage buffer CAS loops.
++    using enum GlobalAtomic;
++    const auto kind_of = [](IR::Opcode opcode) -> std::optional<GlobalAtomic> {
++        switch (opcode) {
++        case IR::Opcode::GlobalAtomicIAdd32: return IAdd;
++        case IR::Opcode::GlobalAtomicSMin32: return SMin;
++        case IR::Opcode::GlobalAtomicUMin32: return UMin;
++        case IR::Opcode::GlobalAtomicSMax32: return SMax;
++        case IR::Opcode::GlobalAtomicUMax32: return UMax;
++        case IR::Opcode::GlobalAtomicInc32: return Inc;
++        case IR::Opcode::GlobalAtomicDec32: return Dec;
++        case IR::Opcode::GlobalAtomicAnd32: return And;
++        case IR::Opcode::GlobalAtomicOr32: return Or;
++        case IR::Opcode::GlobalAtomicXor32: return Xor;
++        case IR::Opcode::GlobalAtomicExchange32: return Exchange;
++        case IR::Opcode::GlobalAtomicAddF32: return AddF32;
++        default: return std::nullopt;
++        }
++    };
++    std::array<bool, static_cast<size_t>(Count)> used{};
++    for (const IR::Block* const block : program.blocks) {
++        for (const IR::Inst& inst : block->Instructions()) {
++            if (const auto kind = kind_of(inst.GetOpcode())) {
++                used[static_cast<size_t>(*kind)] = true;
++            }
++        }
++    }
++    if (std::ranges::none_of(used, [](bool kind) { return kind; })) {
++        return;
++    }
++    if (info.nvn_buffer_used.none()) {
++        LOG_WARNING(Shader_SPIRV, "Global atomic with no bound NVN storage buffer: dropped");
++        return;
++    }
++    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
++    for (size_t index = 0; index < used.size(); ++index) {
++        if (!used[index]) {
++            continue;
++        }
++        const auto kind{static_cast<GlobalAtomic>(index)};
++        const Id type{kind == AddF32 ? F32[1] : U32[1]};
++        const Id func_id{
++            OpFunction(type, spv::FunctionControlMask::MaskNone, TypeFunction(type, U64, type))};
++        const Id addr{OpFunctionParameter(U64)};
++        const Id value{OpFunctionParameter(type)};
++        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                    [&](Id pointer, Id ssbo, Id word) {
++                        const auto atomic = [&](Id (Sirit::Module::*op)(Id, Id, Id, Id, Id)) {
++                            return (this->*op)(U32[1], pointer, scope, zero, value);
++                        };
++                        switch (kind) {
++                        case IAdd: OpReturnValue(atomic(&Sirit::Module::OpAtomicIAdd)); break;
++                        case SMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMin)); break;
++                        case UMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMin)); break;
++                        case SMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMax)); break;
++                        case UMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMax)); break;
++                        case And: OpReturnValue(atomic(&Sirit::Module::OpAtomicAnd)); break;
++                        case Or: OpReturnValue(atomic(&Sirit::Module::OpAtomicOr)); break;
++                        case Xor: OpReturnValue(atomic(&Sirit::Module::OpAtomicXor)); break;
++                        case Exchange: OpReturnValue(atomic(&Sirit::Module::OpAtomicExchange)); break;
++                        case Inc:
++                            OpReturnValue(
++                                OpFunctionCall(U32[1], increment_cas_ssbo, word, value, ssbo));
++                            break;
++                        case Dec:
++                            OpReturnValue(
++                                OpFunctionCall(U32[1], decrement_cas_ssbo, word, value, ssbo));
++                            break;
++                        case AddF32:
++                            OpReturnValue(OpFunctionCall(F32[1], f32_add_cas, word, value, ssbo));
++                            break;
++                        case Count: break;
++                        }
++                    });
++        // No buffer matched: drop the reduction, as the storage path does for an unrouted address.
++        OpReturnValue(ConstantNull(type));
++        OpFunctionEnd();
++        global_atomic_funcs[index] = func_id;
++    }
+ }
+ 
+ void EmitContext::DefineRescalingInput(const Info& info) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index e35e7e1df1..59926a614c 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -361,6 +361,23 @@ public:
+ 
+     Id write_storage_cas_loop_func{};
+ 
++    enum class GlobalAtomic : size_t {
++        IAdd,
++        SMin,
++        UMin,
++        SMax,
++        UMax,
++        Inc,
++        Dec,
++        And,
++        Or,
++        Xor,
++        Exchange,
++        AddF32,
++        Count,
++    };
++    std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
++
+     Id load_global_func_u32{};
+     Id load_global_func_u32x2{};
+     Id load_global_func_u32x4{};
+@@ -445,7 +462,7 @@ private:
+     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
+     void DefineAttributeMemAccess(const Info& info);
+     void DefineWriteStorageCasLoopFunction(const Info& info);
+-    void DefineGlobalMemoryFunctions(const Info& info);
++    void DefineGlobalMemoryFunctions(const IR::Program& program);
+     void DefineRescalingInput(const Info& info);
+     void DefineRescalingInputPushConstant();
+     void DefineRescalingInputUniformConstant();
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 8ead45d346..55b4ad5c37 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -989,26 +989,22 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+             break;
+         }
+         case 0x98e: { // RED.E.{ADD..XOR}.STRONG.GPU U32 (op in bits 87-89), register address.
+-            if ((insn.words[2] & ~0x0380003fU) == 0x0c10e100 && insn.Bits(24, 8) == 255) {
+-                // [URa + offset]: a uniform 64-bit address with a signed byte offset.
+-                const u32 address = uniform_register(insn.Bits(64, 6));
+-                const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
+-                if (address == ~0U || (address & 1) || offset < -0x80000 || offset > 0x7ffff)
+-                    return fail(index, "native global reduction uniform address");
+-                emit(0xebf8000000000000ULL | predicate | insn.Bits(32, 8) | (u64{address} << 8) |
+-                     (u64{insn.Bits(87, 3)} << 23) | (u64{static_cast<u32>(offset) & 0xfffff} << 28) |
+-                     (u64{1} << 48));
+-                break;
+-            }
+-            // Register address with a signed offset, any type (bits 73-75) and op (87-90); bit 72 = 64-bit address.
++            const u32 type = insn.Bits(73, 3);
++            const u32 operation = insn.Bits(87, 3);
++            const bool uniform_address = insn.Bits(24, 8) == 255;
++            const u32 variable = 0x03800e00U | (uniform_address ? 0x3fU : 0U);
++            const u32 mode = uniform_address ? 0x0c10e100U : 0x0010e100U;
+             const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
+-            const u32 type = insn.Bits(73, 3), operation = insn.Bits(87, 4), address = insn.Bits(24, 8);
+-            if (insn.Bits(91, 1) || type > 5 || operation > 7 || offset < -0x80000 || offset > 0x7ffff ||
+-                insn.Bits(32, 8) >= 250 || (address != 255 && (address >= 249 || (insn.Bits(72, 1) && (address & 1)))))
++            if ((insn.words[2] & ~variable) != mode ||
++                (type != 0 && type != 1 && type != 3) || (type == 3 && operation != 0))
+                 return fail(index, "native global reduction mode");
++            const u32 address = uniform_address ? uniform_register(insn.Bits(64, 6))
++                                                : insn.Bits(24, 8);
++            if (address == ~0U || (address & 1) || offset < -0x80000 || offset > 0x7ffff)
++                return fail(index, "native global reduction address");
+             emit(0xebf8000000000000ULL | predicate | insn.Bits(32, 8) | (u64{address} << 8) |
+                  (u64{type} << 20) | (u64{operation} << 23) |
+-                 (u64{static_cast<u32>(offset) & 0xfffff} << 28) | (u64{insn.Bits(72, 1)} << 48));
++                 (u64{static_cast<u32>(offset) & 0xfffff} << 28) | (u64{1} << 48));
+             break;
+         }
+         case 0x2bd: // UFLO.U32, the highest set-bit index (.SH, bit 74: its shift amount).
+@@ -2633,6 +2629,14 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+         }
+         case 0x819: { // SHF.HI, immediate shift
+             const bool is_signed = insn.Bits(73, 2) == 2;
++            if (!insn.Bits(80, 1) && insn.Bits(76, 1) && insn.Bits(73, 2) == 1 &&
++                !insn.Bits(75, 1) && insn.words[1] <= 32) {
++                // SHF.R.U64 funnel: the translator reads bits 20-38 as the immediate, so the U64
++                // clamp (bit 38) would turn every shift into 63; shifts up to 32 need no clamp.
++                emit(base(0x38f8000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
++                     (u64{insn.words[1]} << 20) | (u64{insn.Bits(64, 8)} << 39));
++                break;
++            }
+             if (!insn.Bits(80, 1) && !insn.Bits(76, 1) && insn.Bits(64, 8) == 255 &&
+                 insn.Bits(73, 2) == 3 && !insn.Bits(75, 1) && insn.words[1] <= 32) {
+                 emit(base(0x3848000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.words[1]} << 20));
+@@ -2644,7 +2648,9 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+                 emit(base(0x3828000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.words[1]} << 20));
+                 break;
+             }
+-            if ((insn.Bits(73, 2) != 3 && !is_signed) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
++            // U64 left shifts through 32 have the same high word as a 32-bit funnel shift.
++            const bool u64_left = insn.Bits(73, 2) == 1 && !insn.Bits(76, 1);
++            if ((insn.Bits(73, 2) != 3 && !is_signed && !u64_left) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
+             const u32 low = insn.Bits(24, 8), high = insn.Bits(64, 8), shift = insn.words[1];
+             if (insn.Bits(76, 1)) {
+                 if (low != 255) return fail(index, "native nonzero low right-shift word");
