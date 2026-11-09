@@ -97,6 +97,14 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     fi
 fi
+# The cached driver is useless without the Mesa tree its headers come from: headless/nir_backend.cmake
+# reads nir.h out of .deps/work/radv-src, and the CI cache restores the built driver only.
+if [[ -f build/radv-isolated/libvulkan_radeon.ps5.a &&
+      ! -d ../mihawk-vulkan-review/.deps/work/radv-src/src/compiler/nir ]]; then
+    step "RADV: the pinned Mesa source tree is missing"
+    bash tools/build-radv-dependencies.sh
+    rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+fi
 if [[ ! -f build/radv-isolated/libvulkan_radeon.ps5.a ]]; then
     if [[ ! -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV (Mesa) for the PS5 - this takes a while"
