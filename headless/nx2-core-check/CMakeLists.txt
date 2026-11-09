@@ -16,7 +16,7 @@ FetchContent_MakeAvailable(Catch2)
 file(GLOB ampere_tests CONFIGURE_DEPENDS "${EDEN_SOURCE}/src/tests/video_core/ampere_*.cpp")
 # These two integration tests link the complete shader compiler and run in upstream tests.
 # This host check exercises the header-only native capture/lowering and memory helpers.
-list(FILTER ampere_tests EXCLUDE REGEX "ampere_(bindless_tex|sured)\\.cpp$")
+list(FILTER ampere_tests EXCLUDE REGEX "ampere_(bindless_tex|sured|geometry)\\.cpp$")
 add_executable(nx2-core-check ${ampere_tests}
     logging.cpp
     "${EDEN_SOURCE}/src/tests/common/host_command_completion.cpp"
