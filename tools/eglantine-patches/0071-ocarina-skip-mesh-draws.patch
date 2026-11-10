@@ -1,0 +1,52 @@
+diff --git a/src/video_core/oot_network.h b/src/video_core/oot_network.h
+index 552e5485d7..290d9ad596 100644
+--- a/src/video_core/oot_network.h
++++ b/src/video_core/oot_network.h
+@@ -69,4 +69,22 @@ inline bool BypassEnabled(u64 program_id) {
+     return value == nullptr || std::strcmp(value, "game") != 0;
+ }
+ 
++/// Task/mesh draws. The game culls its vegetation on the GPU: compute programs write per-type task
++/// counts and instance records that its task and mesh programs read. Those compute programs do not
++/// build on this core yet (their global atomics and bare storage pointers need upstream's native
++/// storage buffer tracking), so the task program (1a55fa57a335b963) reads records nobody wrote and
++/// the mesh draws come out as bright stretched triangles flickering across the scene. Until the
++/// culling runs the draws are skipped, which is what happened while the task program was still
++/// rejected by the lowering. EDEN_OOT_MESH_DRAWS=draw issues them (for work on the culling).
++inline bool SkipMeshDraws(u64 program_id) {
++    if (program_id != ProgramId) {
++        return false;
++    }
++    static const bool draw = [] {
++        const char* value = std::getenv("EDEN_OOT_MESH_DRAWS");
++        return value != nullptr && std::strcmp(value, "draw") == 0;
++    }();
++    return !draw;
++}
++
+ } // namespace VideoCommon::OotNetwork
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 93bea818a5..b2f5a4b911 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,3 +1,4 @@
++#include "video_core/oot_network.h"
+ #include "video_core/nx2_loading_probe.h"
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+@@ -563,6 +564,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         report_failure("no VK_EXT_mesh_shader");
+         return;
+     }
++    if (mesh_draw && VideoCommon::OotNetwork::SkipMeshDraws(Settings::GetCurrentProgramID())) {
++        // Ocarina of Time's vegetation: its task programs read what compute programs that do not
++        // build yet would have written (oot_network.h).
++        static bool logged = false;
++        if (!std::exchange(logged, true)) {
++            LOG_INFO(Render_Vulkan, "Ocarina of Time: task/mesh draws are skipped (EDEN_OOT_MESH_DRAWS=draw issues them)");
++        }
++        return;
++    }
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     buffer_cache_runtime.BeginReadbackWriteBatch();
+     SCOPE_EXIT { buffer_cache_runtime.AbortReadbackWriteBatch(); };
