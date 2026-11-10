@@ -72,7 +72,7 @@ void LoadPipelines(
             std::vector<FileEnvironment> envs(num_envs);
             for (FileEnvironment& env : envs) {
                 CheckEnvironment(file, end);
-                env.Deserialize(file);
+                env.Deserialize(file, end);
             }
             if (envs.front().ShaderStage() == Shader::Stage::Compute) {
                 load_compute(file, std::move(envs.front()));
