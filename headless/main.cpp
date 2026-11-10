@@ -66,6 +66,7 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "guest_clock.h"
 #include "performance.h"
 #include "crash_site.h"
+#include "hang_dump.h"
 #include "hang_watchdog.h"
 #include "core/memory.h"
 #include "video_core/dma_pusher.h"
@@ -1731,8 +1732,10 @@ int main(int argc, char** argv) {
                 Eden::HangWatch::Start([](const char* reason) {
                     auto* const running = hang_system;
                     if (!running || !running->IsPoweredOn()) return;
+                    // Straight to stderr: the Eden log caps at 100 MiB and stops taking lines long
+                    // before the stall (hang_dump.h).
                     if (auto* process = running->ApplicationProcess())
-                        Eden::CrashSite::DumpThreads(reason, *process);
+                        Eden::HangDump::Threads(reason, *process);
                 });
                 // The memory report's kernel-side figure (performance.cpp), for this game.
                 static Core::System* reporting_system = nullptr;
