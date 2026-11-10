@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <atomic>
+#include <chrono>
 #include "performance.h"
 #include "crash_report.h"
 #include "hud.h"
@@ -560,7 +561,12 @@ static void ReportFileHandles() {
 static std::atomic<unsigned long long> largest_free_block{0};
 // The driver's own buffer bytes (RADV's PS5 winsys counter, renamed by tools/isolate-radv.py).
 extern "C" unsigned long long eden_radv_private_radv_ps5_allocated_bytes __attribute__((weak));
-static void RefreshFreeMemory() {
+// report=false on the cache and GPU paths: they only need the atomics. The periodic report is
+// printed by the summary thread (StartSummaryThread below), never from a thread that holds a
+// rasterizer or submit lock — a synchronous write to /data under either one stalls the GPU for
+// seconds and stops the picture at the same point of the game every time (issue #21 of
+// viejunerd/Eglantine-PS5-: "the game stops at the same point in the intro every time").
+static void RefreshFreeMemory(bool report) {
     static std::atomic<long long> checked_ns{0};
     const long long now = NowNs();
     if (const long long last = checked_ns.load(std::memory_order_relaxed); last != 0 && now - last < 100'000'000)
@@ -577,7 +583,7 @@ static void RefreshFreeMemory() {
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
     static std::atomic<long long> summary_ns{0};
-    if (now - summary_ns.load(std::memory_order_relaxed) >= 10'000'000'000) {
+    if (report && now - summary_ns.load(std::memory_order_relaxed) >= 10'000'000'000) {
         summary_ns.store(now, std::memory_order_relaxed);
         std::size_t guest_span = 0, guest_held = 0;
         ::Common::GuestMemoryUsage(&guest_span, &guest_held);
@@ -609,16 +615,45 @@ static void RefreshFreeMemory() {
 static bool GuestMemoryWanted() {
     return eden_guest_memory_wanted && eden_guest_memory_wanted() != 0;
 }
+void StartSummaryThread();
 static bool GraphicsMemoryShort() {
+    StartSummaryThread();
     if (GuestMemoryWanted()) return true;
-    RefreshFreeMemory();
+    RefreshFreeMemory(false);
     return graphics_memory_short.load(std::memory_order_relaxed);
 }
 // What the caches' "memory in use" is measured against (performance.h, graphics_memory_free).
 static unsigned long long GraphicsMemoryFree() {
     if (GuestMemoryWanted()) return 1; // not 0: the caches read 0 as "not known"
-    RefreshFreeMemory();
+    RefreshFreeMemory(false);
     return largest_free_block.load(std::memory_order_relaxed);
+}
+// The one thread that prints the periodic reports: the pool and the heap in stderr.log every 10 s,
+// and the Vulkan and guest-run windows every 5 s. It used to be the present thread (the 5 s block
+// in graphics.cpp) and the texture collector's path (the 10 s block above), so a slow write to
+// /data stopped the picture instead of only delaying a diagnostic. EDEN_SUMMARY_THREAD=0 leaves
+// everything on the old threads.
+static void SummaryLoop() {
+    long long windows_ns = 0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const long long now = NowNs();
+        RefreshFreeMemory(true);
+        if (now - windows_ns >= 5'000'000'000) {
+            windows_ns = now;
+            ReportVulkan();
+            ReportGuestRun();
+        }
+    }
+}
+void StartSummaryThread() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* value = std::getenv("EDEN_SUMMARY_THREAD");
+        if (value != nullptr && value[0] == '0' && value[1] == '\0') return;
+        std::thread(SummaryLoop).detach();
+        std::printf("EDEN_SUMMARY_THREAD started\n");
+    });
 }
 [[maybe_unused]] static const bool graphics_memory_probe_installed =
     (graphics_memory_probe.store(&GraphicsMemoryShort, std::memory_order_relaxed),

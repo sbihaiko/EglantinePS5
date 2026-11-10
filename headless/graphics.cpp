@@ -779,8 +779,9 @@ void GraphicsWindow::OnFrameDisplayed() {
                             interval_hist[1], interval_hist[2], interval_hist[3], interval_hist[4]);
                 interval_hist = {};
 #endif
-                Eden::Performance::ReportVulkan();
-                Eden::Performance::ReportGuestRun();
+                // The Vulkan and guest-run windows are printed by the summary thread, not here:
+                // this is the present thread, and a write that stalls costs a frame
+                // (performance.cpp, StartSummaryThread).
                 if (Eden::Fastmem::Window64Base() != 0) {
                     char window64[1024];
                     Eden::Fastmem::Window64Report(window64, sizeof(window64));

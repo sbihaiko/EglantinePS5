@@ -668,6 +668,10 @@ inline void CountJit(std::atomic<unsigned long long>& counter) {
 // GPU thread only (Vulkan frame report): cumulative GPU-thread idle/dispatch/wait
 // totals with the owner's CPU clock, then a guest-core CPU snapshot.
 void ReportGpuThread(unsigned frame);
+// Starts the one thread that prints the periodic reports (the pool and heap every 10 s, the Vulkan
+// and guest-run windows every 5 s), so no rasterizer or submit lock is held across a write to
+// /data. Idempotent; EDEN_SUMMARY_THREAD=0 leaves the reports on the threads that used to print them.
+void StartSummaryThread();
 void ReportMemoryPressure(unsigned seconds);
 // The heap's line in stderr.log: what it holds of the pool, what of that its blocks use, what it has given back.
 void ReportHeap(const char* why);

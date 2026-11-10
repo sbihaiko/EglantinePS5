@@ -1725,6 +1725,10 @@ int main(int argc, char** argv) {
                 }
                 Eden::TakeGuestFault(); // Nothing from an earlier session belongs to this one.
                 Eden::Loading::Set(Eden::Loading::Step::starting);
+                // The periodic reports get their own thread (performance.h, StartSummaryThread):
+                // a write to /data under a rasterizer or submit lock stalls the GPU, which is what
+                // stops the picture at the same point of the game every time.
+                Eden::Performance::StartSummaryThread();
                 // A silent freeze leaves no crash file, so the watchdog dumps every guest thread
                 // when presents stop (hang_watchdog.h, EDEN_HANG_WATCHDOG_SECS).
                 static Core::System* hang_system = nullptr;
