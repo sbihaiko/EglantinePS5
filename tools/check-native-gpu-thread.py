@@ -49,8 +49,13 @@ assert 'ThreadManager::~ThreadManager() { Stop(); }' in worker
 gpu = (cache / 'native-local/headless/gpu.cpp').read_text()
 assert 'GPU::~GPU() { impl->NotifyShutdown(); }' in gpu
 shutdown = gpu.split('    void NotifyShutdown() {', 1)[1].split('    /// Obtain', 1)[0]
-assert 'sync_cv.notify_all();\n        }\n        gpu_thread.Stop();' in shutdown
-assert shutdown.index('gpu_thread.Stop();') < shutdown.index('sync_requests.clear();') < shutdown.index('sync_requests_stopped = true;')
+# The core's shutdown now stops the thread through gpu_thread.NotifyShutdown() and then drops the
+# sync requests and releases their waiters, so guest threads blocked in host code wake up.
+assert 'gpu_thread.NotifyShutdown();' in shutdown
+assert shutdown.index('gpu_thread.NotifyShutdown();') < shutdown.index('sync_requests.clear();')
+assert shutdown.index('sync_requests.clear();') < shutdown.index('sync_requests_dropped = true;')
+assert shutdown.index('sync_requests_dropped = true;') < shutdown.index('shutting_down.store(true')
+assert 'sync_cv.notify_all();' in shutdown
 if '~Impl() = default;' in (upstream / 'video_core/gpu.cpp').read_text():
     assert '~Impl() { gpu_thread.Stop(); if (renderer && Settings::IsOpenGL()) { renderer->Context().MakeCurrent(); glFinish(); } }' in gpu
 else:
