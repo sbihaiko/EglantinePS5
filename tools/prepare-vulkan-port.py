@@ -1504,6 +1504,42 @@ adapt('src/video_core/texture_cache/texture_cache.h',
 # the texture-buffer loop looked like the cost of bind and measured 2.8%.
 adapt('src/video_core/buffer_cache/buffer_cache.h',
       'vulkan-cache/video_core/buffer_cache/buffer_cache.h', [
+    # Ocarina of Time uses several GPU channels. DeleteBuffer cleared only the current channel's
+    # bindings, so another channel could keep the deleted id and later resolve it to an unrelated
+    # buffer that reused the slot. From g1i7ch/lichii-ocarina c3442ea23e (after
+    # A-Man-With-A-Plan-dev/Eglantine 43b6b17c3a).
+    ('    replace(channel_state->compute_storage_buffers);\n\n'
+     '    // Mark the whole buffer as CPU written to stop tracking CPU writes\n',
+     '    replace(channel_state->compute_storage_buffers);\n'
+     '    for (const size_t other_id : this->active_channel_ids) {\n'
+     '        auto& other = this->channel_storage[other_id];\n'
+     '        if (&other == channel_state) {\n'
+     '            continue;\n'
+     '        }\n'
+     '        auto& other_flags = other.maxwell3d.dirty.flags;\n'
+     '        if (other.index_buffer.buffer_id == buffer_id) {\n'
+     '            other.index_buffer.buffer_id = BufferId{};\n'
+     '            other_flags[Dirty::IndexBuffer] = true;\n'
+     '        }\n'
+     '        for (u32 index = 0; index < other.vertex_buffers.size(); ++index) {\n'
+     '            if (other.vertex_buffers[index].buffer_id == buffer_id) {\n'
+     '                other.vertex_buffers[index].buffer_id = BufferId{};\n'
+     '                other_flags[Dirty::VertexBuffers] = true;\n'
+     '                other_flags[Dirty::VertexBuffer0 + index] = true;\n'
+     '            }\n'
+     '        }\n'
+     '        std::ranges::for_each(other.uniform_buffers, replace);\n'
+     '        std::ranges::for_each(other.storage_buffers, replace);\n'
+     '        replace(other.transform_feedback_buffers);\n'
+     '        replace(other.compute_uniform_buffers);\n'
+     '        replace(other.compute_storage_buffers);\n'
+     '        if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {\n'
+     '            other.dirty_uniform_buffers.fill(~u32{0});\n'
+     '            other.uniform_buffer_binding_sizes.fill({});\n'
+     '        }\n'
+     '        other.has_deleted_buffers = true;\n'
+     '    }\n\n'
+     '    // Mark the whole buffer as CPU written to stop tracking CPU writes\n'),
     ('        if (buffer_bytes >= 1_GiB) {\n'
      '            RunGarbageCollector(buffer_bytes >= 2_GiB);\n'
      '        }\n',
