@@ -335,6 +335,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
      'namespace {\n// The scheduler\'s tick when the last draw, clear or dispatch was recorded (GPU thread).\nu64 recorded_tick = 0;\n} // namespace\n\n'
      'void RasterizerVulkan::FlushCommands() {\n    if (draw_counter == 0) {\n        return;\n    }\n    draw_counter = 0;\n'
      '    if (scheduler.CurrentTick() != recorded_tick) {\n        return; // a submission has taken every draw already\n    }\n    scheduler.Flush();\n}'),
+    # Core patch 0905 (ours): the end of a command list, and a fence with downloads or queries,
+    # submit only when the last submission is older than the batching window.
+    ('        return; // a submission has taken every draw already\n    }\n    scheduler.Flush();\n}',
+     '        return; // a submission has taken every draw already\n    }\n'
+     '    if (!scheduler.DeferFlush()) {\n        scheduler.Flush();\n    }\n}'),
     ('    const u32 CHECK_MASK = ::Eden::Performance::dispatch_mask.load(std::memory_order_relaxed);\n',
      '    const u32 CHECK_MASK = ::Eden::Performance::dispatch_mask.load(std::memory_order_relaxed);\n    recorded_tick = scheduler.CurrentTick();\n'),
     # Each draw counts toward the frame's busyness (headless/astc_policy.h: a CPU-converted ASTC

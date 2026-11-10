@@ -1,0 +1,251 @@
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 0ac10a56a1..a4cc811c26 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -488,17 +488,26 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         if (available == read_position) {
+             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+             // The front usually sends more within microseconds: spin briefly before sleeping.
+-            for (u32 spins = 0; spins < 8192 && available == read_position; ++spins) {
++            for (u32 spins = 0; spins < 8192 && available == read_position &&
++                                !hook_requested.load(std::memory_order_relaxed);
++                 ++spins) {
+                 Pause();
+                 available = published.load(std::memory_order_acquire);
+             }
++            if (available == read_position && idle_hook != nullptr) {
++                hook_requested.store(false, std::memory_order_seq_cst);
++                idle_hook(idle_argument);
++                available = published.load(std::memory_order_acquire);
++            }
+             if (available == read_position) {
+                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
+                 // at `published`, so a publish in between ends the wait at once.
+                 back_waiting.store(true, std::memory_order_seq_cst);
+                 const u32 seen = wake.load(std::memory_order_seq_cst);
+                 available = published.load(std::memory_order_seq_cst);
+-                if (available == read_position && !stop_token.stop_requested()) {
++                // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
++                if (available == read_position && !stop_token.stop_requested() &&
++                    !hook_requested.load(std::memory_order_seq_cst)) {
+                     wake.wait(seen, std::memory_order_seq_cst);
+                 }
+                 back_waiting.store(false, std::memory_order_relaxed);
+@@ -512,6 +521,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             Tegra::g_nx2_back_position.store(read_position, std::memory_order_relaxed);
+             const size_t size = Execute(&ring[index]);
+             read_position += size != 0 ? size : RingWords - index;
++            if (hook_requested.load(std::memory_order_relaxed) &&
++                idle_hook != nullptr) [[unlikely]] {
++                hook_requested.store(false, std::memory_order_seq_cst);
++                idle_hook(idle_argument);
++            }
+             // Hand ring space back now and then while working through a long batch.
+             // Often enough for the front's partial waits (DrainTo a pending release) too.
+             if (read_position - last_store >= 256 && read_position != available) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index edb5db0766..08db318e89 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -54,6 +54,18 @@ public:
+         return front_macros;
+     }
+ 
++    /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
++    void SetIdleHook(void (*hook)(void*), void* argument) {
++        idle_hook = hook;
++        idle_argument = argument;
++    }
++    /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
++    void RequestIdleHook() {
++        hook_requested.store(true, std::memory_order_seq_cst);
++        wake.fetch_add(1, std::memory_order_seq_cst);
++        wake.notify_one();
++    }
++
+     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
+     /// commands read without cache flushes). Called by the front between commands.
+     void MaybeStart(Core::System& system);
+@@ -312,6 +324,9 @@ private:
+ 
+     static GpuSplit instance;
+     static inline thread_local bool back_thread_context{};
++    void (*idle_hook)(void*){};
++    void* idle_argument{};
++    alignas(64) std::atomic<bool> hook_requested{};
+ 
+     alignas(64) std::atomic<u64> published{};
+     alignas(64) std::atomic<u64> consumed{};
+diff --git a/src/video_core/renderer_vulkan/vk_fence_manager.cpp b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+index 6bb72614de..edc759aee4 100644
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+@@ -3,6 +3,8 @@
+ 
+ #include <memory>
+ 
++#include "common/logging.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+ #include "video_core/renderer_vulkan/vk_fence_manager.h"
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+@@ -23,6 +25,10 @@ void InnerFence::Queue(VideoCore::RasterizerInterface& rasterizer) {
+     }
+     // Get the current tick so we can wait for it
+     wait_tick = scheduler.CurrentTick();
++    // Within the batching window the fence goes with the next submission (Scheduler::DeferFlush).
++    if (scheduler.DeferFlush()) {
++        return;
++    }
+     rasterizer.FlushCommands();
+     if (scheduler.CurrentTick() == wait_tick) {
+         scheduler.Flush();
+@@ -40,6 +46,17 @@ void InnerFence::Wait() {
+     if (is_stubbed) {
+         return;
+     }
++    // A deferred fence flush (Scheduler::DeferFlush) may not be submitted yet. Only the split's
++    // back may submit; other threads (the fencing thread) ask it to and wait.
++    if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
++        !VideoCommon::GpuSplit::IsBackThread()) {
++        if (!scheduler.WaitSubmitted(wait_tick)) {
++            LOG_WARNING(Render_Vulkan, "Fence tick {} not submitted in 2 s", wait_tick);
++            return;
++        }
++        scheduler.GetMasterSemaphore().Wait(wait_tick);
++        return;
++    }
+     scheduler.Wait(wait_tick);
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 1fe49d21dc..02317c2f42 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -249,9 +249,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       wfi_event(device.GetLogical().CreateEvent()) {
+     scheduler.SetQueryCache(query_cache);
+     buffer_cache_runtime.ProbeMappedReadback(descriptor_pool, compute_pass_descriptor_queue);
++    VideoCommon::GpuSplit::Get().SetIdleHook(
++        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
++        &scheduler);
+ }
+ 
+ RasterizerVulkan::~RasterizerVulkan() {
++    VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+     scheduler.WaitWorker();
+     scheduler.Finish();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6198a372e0..a346245412 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -21,6 +21,7 @@
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/readback_diagnostics.h"
+ #include "video_core/renderer_vulkan/vk_command_pool.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+@@ -73,12 +74,56 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
+     }
++    // Deferred work goes with this submission (DeferFlush).
++    last_flush = std::chrono::steady_clock::now();
++    flush_pending = false;
+     // When flushing, we only send data to the worker thread; no waiting is necessary.
+     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
+     AllocateNewContext();
+     return signal_value;
+ }
+ 
++bool Scheduler::DeferFlush() {
++    // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
++    // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
++    // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
++    static const s64 interval_us = [] {
++        const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
++        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
++    }();
++    if (interval_us <= 0 || !VideoCommon::GpuSplit::IsBackThread() ||
++        std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
++        return false;
++    }
++    flush_pending = true;
++    return true;
++}
++
++void Scheduler::FlushDeferred() {
++    if (flush_pending) {
++        Flush();
++    }
++}
++
++bool Scheduler::WaitSubmitted(u64 tick) {
++    if (IsSubmitted(tick)) {
++        return true;
++    }
++    VideoCommon::GpuSplit::Get().RequestIdleHook();
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
++    for (u32 spins = 0; !IsSubmitted(tick); ++spins) {
++        if (std::chrono::steady_clock::now() >= deadline) {
++            return false;
++        }
++        if (spins < 64) {
++            std::this_thread::yield();
++        } else {
++            std::this_thread::sleep_for(std::chrono::microseconds{50});
++        }
++    }
++    return true;
++}
++
+ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+     VideoCommon::ReadbackDiagnostics::Scope diagnostic{
+         VideoCommon::ReadbackDiagnostics::Event::DeviceFinish};
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 8f844efeb7..c4048a46a0 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <functional>
+@@ -52,6 +53,21 @@ public:
+     /// Sends the current execution context to the GPU and waits for it to complete.
+     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+ 
++    /// On the split GPU thread, a fence or the end of a command list submits only if the last
++    /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
++    /// once); otherwise it goes with the next one. The back submits deferred work before it
++    /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
++    bool DeferFlush();
++    /// Submits deferred work (the split's back, from its idle hook).
++    void FlushDeferred();
++    /// Threads other than the split's back: waits until tick is submitted, asking the back to
++    /// submit deferred work. False if that took over 2 s.
++    bool WaitSubmitted(u64 tick);
++    /// Whether everything up to tick has been handed to the worker for submission.
++    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
++        return tick < master_semaphore->CurrentTick();
++    }
++
+     /// Waits for the worker thread to finish executing everything. After this function returns it's
+     /// safe to touch worker resources.
+     void WaitWorker();
+@@ -207,6 +223,9 @@ public:
+     std::mutex submit_mutex;
+ 
+ private:
++    std::chrono::steady_clock::time_point last_flush{};
++    bool flush_pending{};
++
+     class Command {
+     public:
+         virtual ~Command() = default;

@@ -1,0 +1,83 @@
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index 6b1b08a3a6..da09be03c8 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -51,6 +51,8 @@ enum class Zone : u32 {
+     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
+     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
+     SplitWait,    ///< Split GPU thread: the back waits for work
++    Submit,       ///< Scheduler::Flush: the chunk handed to the worker, a new context begun
++    GpuWait,      ///< Waiting for a GPU tick (Scheduler::Wait)
+     Count,
+ };
+ 
+@@ -61,7 +63,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
+     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
+     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
+     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
+-    "fence skipped", "method", "split drain", "split wait",
++    "fence skipped", "method", "split drain", "split wait", "submit", "GPU wait",
+ };
+ 
+ inline bool Enabled() {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index a346245412..d806ea0082 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -74,6 +74,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
+     }
++    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Submit};
+     // Deferred work goes with this submission (DeferFlush).
+     last_flush = std::chrono::steady_clock::now();
+     flush_pending = false;
+@@ -132,7 +133,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
+     }
+     // When finishing, we need to wait for the submission to have executed on the device.
+     const u64 presubmit_tick = CurrentTick();
+-    SubmitExecution(signal_semaphore, wait_semaphore);
++    {
++        VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Submit};
++        SubmitExecution(signal_semaphore, wait_semaphore);
++    }
+     Wait(presubmit_tick);
+     AllocateNewContext();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index c4048a46a0..9c1735d79f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -21,6 +21,7 @@
+ #include "common/polyfill_thread.h"
+ #include "common/settings.h"
+ #include "video_core/gpu_split.h"
++#include "video_core/nx2_profile.h"
+ #include "video_core/readback_dependency_diagnostics.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -186,6 +187,7 @@ public:
+             if (tick >= master_semaphore->CurrentTick()) {
+                 Flush();
+             }
++            VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::GpuWait};
+             master_semaphore->Wait(tick);
+         }
+         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 2e4559391d..5fc6ac70ff 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -472,6 +472,12 @@ void TextureCache<P>::TickFrame() {
+             format.first += bytes;
+             ++format.second;
+         }
++        // EDEN_NX2_TC_OWN_BYTES skips the device figure above. Read it here for the log: on the
++        // PS5 that query is also what makes the driver print its split (RADV_PS5_MEMORY_REPORT=1).
++        if (own_bytes && runtime.CanReportMemoryUsage()) {
++            LOG_INFO(HW_GPU, "Texture cache: device figure {} MiB (the collector counts its own images)",
++                     runtime.GetDeviceMemoryUsage() >> 20);
++        }
+         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
+                  image_bytes >> 20);
