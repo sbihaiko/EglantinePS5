@@ -2451,9 +2451,23 @@ if(EDEN_PS5_OPENGL)
     # In-flight guest waits must also unwind before Stop can join the worker.
     foreach(unit dma_pusher engines/puller)
         file(READ "${PROJECT_SOURCE_DIR}/src/video_core/${unit}.cpp" command_source)
-        string(REPLACE "        sync_cv.wait(lk, [this]() { return synced; });"
-            "        while (!synced && !system.IsShuttingDown())\n            sync_cv.wait_for(lk, std::chrono::milliseconds(10));\n        if (system.IsShuttingDown()) return false;" command_source "${command_source}")
-        string(REPLACE "    while (word != value) {" "    while (word != value && !dma_pusher.system.IsShuttingDown()) {" command_source "${command_source}")
+        if(unit STREQUAL "dma_pusher")
+            set(sync_wait_old "        sync_cv.wait(lk, [this]() { return synced.load(); });")
+            string(FIND "${command_source}" "${sync_wait_old}" sync_wait_at)
+            if(sync_wait_at LESS 0)
+                message(FATAL_ERROR "Pinned DMA sync wait changed")
+            endif()
+            string(REPLACE "${sync_wait_old}"
+                "        while (!synced.load() && !system.IsShuttingDown())\n            sync_cv.wait_for(lk, std::chrono::milliseconds(10));\n        if (system.IsShuttingDown()) return false;" command_source "${command_source}")
+        else()
+            set(acquire_old "    while (word != value) {")
+            string(FIND "${command_source}" "${acquire_old}" acquire_at)
+            if(acquire_at LESS 0)
+                message(FATAL_ERROR "Pinned semaphore acquire wait changed")
+            endif()
+            string(REPLACE "${acquire_old}"
+                "    while (word != value && !dma_pusher.system.IsShuttingDown()) {" command_source "${command_source}")
+        endif()
         if(unit STREQUAL "dma_pusher")
             # Guest writes queued while a cache lock was held (performance.h cpu_write_defer) reach the
             # caches before the GPU thread runs work submitted after them (FlushCaching runs the queue).
@@ -2490,13 +2504,20 @@ if(EDEN_PS5_OPENGL)
         list(REMOVE_ITEM video_sources "${unit}.cpp")
         list(APPEND video_sources "${PORT_BUILD_DIR}/${unit_name}.cpp")
     endforeach()
-    # Once the worker has joined, queued callbacks can never execute. Drop them
-    # before waking waiters: some callbacks borrow their callers' stack storage.
-    string(REPLACE "        gpu_thread.Stop();\n    }"
-        "        gpu_thread.Stop();\n        {\n            std::lock_guard lock{sync_request_mutex};\n            sync_requests.clear();\n            sync_requests_stopped = true;\n        }\n        sync_request_cv.notify_all();\n    }" gpu_source "${gpu_source}")
-    string(REPLACE "    u64 pending_composite_fence{};" "    bool sync_requests_stopped{}; // Protected by sync_request_mutex.\n    u64 pending_composite_fence{};" gpu_source "${gpu_source}")
-    string(REPLACE "        const u64 fence = ++last_sync_fence;" "        if (sync_requests_stopped) return CurrentSyncRequestFence();\n        const u64 fence = ++last_sync_fence;" gpu_source "${gpu_source}")
-    string(REPLACE "return CurrentSyncRequestFence() >= fence;" "return sync_requests_stopped || CurrentSyncRequestFence() >= fence;" gpu_source "${gpu_source}")
+    # Once the worker has joined, queued callbacks can never execute: the core's NotifyShutdown
+    # drops them before waking the waiters (some borrow their callers' stack storage). A request
+    # made after it — guest threads still call OnCPURead until the kernel suspends them — would be
+    # kept forever, bound to a frame that is ending, so it is not enqueued; its fence is older
+    # than the drop and its waiter returns at once.
+    set(gpu_sync_request_old
+        "        std::unique_lock lck{sync_request_mutex};\n        const u64 fence = ++last_sync_fence;\n        sync_requests.emplace_back(std::forward<Func>(action));")
+    string(FIND "${gpu_source}" "${gpu_sync_request_old}" gpu_sync_request_at)
+    if(gpu_sync_request_at LESS 0)
+        message(FATAL_ERROR "Pinned GPU sync request changed")
+    endif()
+    string(REPLACE "${gpu_sync_request_old}"
+        "        std::unique_lock lck{sync_request_mutex};\n        const u64 fence = ++last_sync_fence;\n        if (!sync_requests_dropped) {\n            sync_requests.emplace_back(std::forward<Func>(action));\n        }"
+        gpu_source "${gpu_source}")
     string(REPLACE "GPU::~GPU() = default;" "GPU::~GPU() { impl->NotifyShutdown(); }" gpu_source "${gpu_source}")
     string(REPLACE "void GPU::PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {"
         "void GPU::PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {\n    static std::atomic<unsigned> submissions{};\n    const auto count = ++submissions;\n    if (count <= 3) LOG_INFO(Render_OpenGL, \"EDEN_GUEST_GPU_SUBMIT count={} channel={}\", count, channel);"

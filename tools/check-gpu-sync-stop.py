@@ -71,8 +71,10 @@ code=r'''
 #include <thread>
 using u32=unsigned;
 void DrainBack(){} // the GPU thread split's wait for its back thread (engines/puller.cpp)
+// Ends a fast draw chain (video_core/nx2_fast_draw.h); nothing to chain here.
+namespace VideoCommon::Nx2FastDraw {enum class Reason{Fence};inline void Break(Reason){}}
 struct System{std::atomic_bool stop{};bool IsShuttingDown(){return stop;}};
-struct DMA {System system;std::mutex sync_mutex;std::condition_variable sync_cv;bool synced{};
+struct DMA {System system;std::mutex sync_mutex;std::condition_variable sync_cv;std::atomic_bool synced{};
 bool Wait(){
 '''+wait+r'''
  return true;}
@@ -80,8 +82,9 @@ bool Wait(){
 struct Memory {std::atomic<u32> value{};template<class T>T Read(unsigned){return value.load();}};
 struct Raster {std::atomic_uint calls{};void ReleaseFences(){++calls;}};
 struct DmaPusher {System system;Memory memory_manager;Raster raster;Raster*rasterizer=&raster;};
-struct Puller {void BreakFastDrawAtAcquire(){} // ends a fast draw chain (video_core/nx2_fast_draw.h)
-struct Regs {struct Address{unsigned SemaphoreAddress(){return 0;}}semaphore_address;u32 semaphore_acquire=4,acquire_value{};bool acquire_active{},acquire_mode{},acquire_source{};}regs;
+void ReleaseFences(DmaPusher& p){p.raster.ReleaseFences();} // Puller's fence flush (engines/puller.cpp)
+struct Puller {
+struct Regs {struct Address{unsigned SemaphoreAddress(){return 0;}}semaphore_address;u32 semaphore_acquire=4,acquire_value{};std::atomic_bool acquire_active{},acquire_mode{},acquire_source{};}regs;
 void ProcessSemaphoreAcquire(DmaPusher&dma_pusher){
 '''+acquire+r'''
 }};
