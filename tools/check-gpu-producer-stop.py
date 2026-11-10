@@ -4,6 +4,11 @@ from pathlib import Path
 import subprocess, tempfile
 root=Path(__file__).resolve().parents[1]
 cache=Path((root/'.local/headless-cache').read_text().strip())
+# The fixture compiles against the port's own command queue (a core patch). A core that does not
+# ship common/host_command_queue.h has its own queue, and this check has nothing to exercise.
+if not (cache/'source/src/common/host_command_queue.h').exists():
+    print('GPU producer stop: skipped, the core has no common/host_command_queue.h')
+    raise SystemExit(0)
 worker=(cache/'native-local/headless/gpu_thread.cpp').read_text()
 start=worker.index('u64 ThreadManager::PushCommand(')
 body=worker[start:worker.index('\n} // namespace',start)]
