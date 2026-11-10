@@ -25,9 +25,8 @@ list(REMOVE_ITEM video_sources vulkan_common/vulkan_device.cpp renderer_vulkan/v
     vulkan_common/vulkan_memory_allocator.cpp renderer_vulkan/vk_staging_buffer_pool.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/vulkan_device.cpp" "${PORT_BUILD_DIR}/vulkan_scheduler.cpp"
     "${PORT_BUILD_DIR}/vulkan_memory_allocator.cpp" "${PORT_BUILD_DIR}/vulkan_staging_buffer_pool.cpp")
-# The software blitter gives back scratch buffers over 16 MiB after each blit (prepare-vulkan-port.py).
-list(REMOVE_ITEM video_sources engines/sw_blitter/blitter.cpp)
-list(APPEND video_sources "${PORT_BUILD_DIR}/sw_blitter.cpp")
+# The core's software blitter gives back scratch buffers over 16 MiB after each blit itself:
+# the adapted copy prepare-vulkan-port.py used to write is gone.
 # Split the dispatch timer into its three phases (prepare-vulkan-port.py).
 list(REMOVE_ITEM video_sources control/scheduler.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/control_scheduler.cpp")
