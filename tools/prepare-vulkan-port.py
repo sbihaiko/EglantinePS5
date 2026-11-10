@@ -1784,11 +1784,6 @@ probes = {
          '    Image& image, const StagingBufferRef& map,\n'
          '    std::span<const VideoCommon::SwizzleParameters> swizzles) {\n'
          '    ::Eden::Performance::Timer mkw_timer(::Eden::Performance::mkw_transcode);\n'),
-        # Decode images can otherwise survive a long loading burst until TickFrame. At this
-        # boundary every use of the input and output staging buffers has been recorded, so a
-        # wait is safe (unlike a wait inside an arbitrary staging-buffer allocation).
-        ('        .image = memory_allocator.CreateImage(VkImageCreateInfo{\n            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,',
-         '        .image = memory_allocator.CreateTemporaryImage(VkImageCreateInfo{\n            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,'),
         # An ASTC-to-BC transcode decodes into an RGBA copy (4 bytes a pixel, every level) that
         # lives until the GPU has used it. A course load makes hundreds in a frame, which held
         # 6.7 GB of the pool the console's GPU shares with the CPU (ProsperoEden). So the copies in
@@ -1796,9 +1791,21 @@ probes = {
         # waiting for the oldest copy only, and what is recorded is submitted every 32 MiB, so the
         # GPU works through the copies while more are recorded and the oldest is usually done
         # before the bound is reached. The tighter bound below still applies while memory is short.
-        ('    PendingTranscode pending{\n        .tick = 0,\n        .bytes = decode_bytes,\n',
+        # A full GPU wait per texture was 5% of the split's back thread at Mario Kart World's
+        # title (one streamed texture a frame, the pool always short): the decode images are now
+        # reclaimed once the ones in flight exceed EDEN_PS5_TRANSCODE_PENDING_MIB (64), waiting
+        # for the oldest only. EDEN_PS5_TRANSCODE_FINISH=1 restores the wait after each.
+        ('    pending_transcodes.push_back(std::move(pending));\n',
          '    {\n'
          '        using namespace Common::Literals;\n'
+         '        auto held = [](const PendingTranscode& entry) {\n'
+         '            u64 bytes{0};\n'
+         '            for (u32 level = 0; level < entry.levels; ++level) {\n'
+         '                bytes += u64{(std::max)(entry.width >> level, 1U)} *\n'
+         '                         (std::max)(entry.height >> level, 1U) * 4;\n'
+         '            }\n'
+         '            return bytes * entry.layers;\n'
+         '        };\n'
          '        static const u64 held_limit = [] {\n'
          '            const char* value = std::getenv("EDEN_PS5_TRANSCODE_PENDING_MIB");\n'
          '            return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : u64{256_MiB};\n'
@@ -1807,27 +1814,21 @@ probes = {
          '            pending_transcodes.pop_front();\n'
          '        }\n'
          '        u64 held_bytes = 0, recorded_bytes = 0;\n'
-         '        for (const PendingTranscode& held : pending_transcodes) {\n'
-         '            held_bytes += held.bytes;\n'
-         '            recorded_bytes += held.tick >= scheduler.CurrentTick() ? held.bytes : 0;\n'
+         '        for (const PendingTranscode& entry : pending_transcodes) {\n'
+         '            held_bytes += held(entry);\n'
+         '            recorded_bytes += entry.tick >= scheduler.CurrentTick() ? held(entry) : 0;\n'
          '        }\n'
          '        if (recorded_bytes >= 32_MiB) {\n'
          '            scheduler.Flush();\n'
          '        }\n'
-         '        while (!pending_transcodes.empty() && held_bytes + decode_bytes > held_limit) {\n'
+         '        while (!pending_transcodes.empty() && held_bytes + held(pending) > held_limit) {\n'
          '            scheduler.Wait(pending_transcodes.front().tick);\n'
          '            while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {\n'
-         '                held_bytes -= pending_transcodes.front().bytes;\n'
+         '                held_bytes -= held(pending_transcodes.front());\n'
          '                pending_transcodes.pop_front();\n'
          '            }\n'
          '        }\n'
          '    }\n'
-         '    PendingTranscode pending{\n        .tick = 0,\n        .bytes = decode_bytes,\n'),
-        # A full GPU wait per texture was 5% of the split's back thread at Mario Kart World's
-        # title (one streamed texture a frame, the pool always short): the decode images are now
-        # reclaimed once the ones in flight exceed EDEN_PS5_TRANSCODE_PENDING_MIB (64), waiting
-        # for the oldest only. EDEN_PS5_TRANSCODE_FINISH=1 restores the wait after each.
-        ('    pending_transcodes.push_back(std::move(pending));\n',
          '    pending_transcodes.push_back(std::move(pending));\n'
          '    const auto memory_short = ::Eden::Performance::graphics_memory_probe.load(std::memory_order_relaxed);\n'
          '    if (memory_short && memory_short()) {\n'
@@ -1847,15 +1848,25 @@ probes = {
          '            pending_transcodes.pop_front();\n'
          '        }\n'
          '        u64 pending_bytes = 0;\n'
-         '        for (const auto& entry : pending_transcodes) {\n'
-         '            pending_bytes += entry.bytes;\n'
+         '        for (const PendingTranscode& entry : pending_transcodes) {\n'
+         '            u64 entry_bytes{0};\n'
+         '            for (u32 level = 0; level < entry.levels; ++level) {\n'
+         '                entry_bytes += u64{(std::max)(entry.width >> level, 1U)} *\n'
+         '                               (std::max)(entry.height >> level, 1U) * 4;\n'
+         '            }\n'
+         '            pending_bytes += entry_bytes * entry.layers;\n'
          '        }\n'
          '        while (pending_bytes > pending_limit && pending_transcodes.size() > 1) {\n'
-         '            scheduler.Wait(pending_transcodes.front().tick);\n'
-         '            pending_bytes -= pending_transcodes.front().bytes;\n'
+         '            scheduler.Wait(pending_transcodes.front().tick);\n'         '            pending_bytes -= [](const PendingTranscode& entry) {\n'
+         '                u64 bytes{0};\n'
+         '                for (u32 level = 0; level < entry.levels; ++level) {\n'
+         '                    bytes += u64{(std::max)(entry.width >> level, 1U)} *\n'
+         '                             (std::max)(entry.height >> level, 1U) * 4;\n'
+         '                }\n'
+         '                return bytes * entry.layers;\n'
+         '            }(pending_transcodes.front());\n'
          '            pending_transcodes.pop_front();\n'
          '        }\n'
-         '        staging_buffer_pool.ReleaseCompleted();\n'
          '    }\n'),
         ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "diagnostics.h"\n#include "submission_origin.h"'),
         ('    has_custom_border_colors = samples_border && device.IsCustomBorderColorUsable();',
