@@ -30,6 +30,7 @@ public:
     std::vector<pe::ui::Game> games() override;
     std::string game_path(const std::string& file) override;
     bool game_exists(const std::string& file) override;
+    std::string launch_blocked(const std::string& file) override;
     bool take_update(pe::ui::UpdateOffer* offer) override;
     bool start_update() override;
     pe::ui::UpdateStatus update_status() override;

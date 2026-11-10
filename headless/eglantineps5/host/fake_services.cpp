@@ -206,10 +206,15 @@ ui::Home FakeServices::home()
 {
     ui::Home home;
     home.setup_ready = setup_ready;
+    home.keys_ready = setup_ready && keys_ready;
     if (!setup_ready)
-        home.status = fill(tr("Setup required: {0} Open Settings, Game files to choose the folder that "
-                              "holds your keys, firmware and roms folders (or add the files to {1}), "
-                              "then reopen EglantinePS5."),
+        home.status = fill(tr("EglantinePS5 could not get access to the console's storage, so it cannot read your settings, saves and games. Nothing was changed. Close EglantinePS5 and open it again. (Code {0})"),
+                           {"-1"});
+    else if (!keys_ready && !has_history)
+        home.status = fill(tr("Keys or firmware missing: {0} Unencrypted games (.nup files, extracted game "
+                              "folders) start without them. For .nsp and .xci games, open Settings, Game files "
+                              "to choose the folder that holds your keys, firmware and roms folders (or add the "
+                              "files to {1}), then reopen EglantinePS5."),
                            {fill(tr("Missing or empty keys/prod.keys in {0}."), {"/data/eglantineps5"}),
                             "/data/eglantineps5"});
     else if (!crash_report.empty())
@@ -260,7 +265,8 @@ ui::Home FakeServices::home()
         }
     }
     home.system_status = fill(tr("{0} games installed"), {std::to_string(games_.size())}) + "  /  " +
-                         (setup_ready ? tr("Firmware ready") : tr("Setup required"));
+                         (!setup_ready ? tr("Setup required") :
+                          keys_ready  ? tr("Firmware ready") : tr("Unencrypted games only"));
     return home;
 }
 
@@ -306,10 +312,11 @@ std::string FakeServices::language_region(int language)
 
 std::string FakeServices::setup_details()
 {
-    return setup_ready ?
+    return keys_ready ?
                tr("Keys and firmware: startup checks passed. Game-specific compatibility is checked at "
                   "launch.") :
-               fill(tr("Missing or empty keys/prod.keys in {0}."), {"/data/eglantineps5"});
+               fill(tr("Missing or empty keys/prod.keys in {0}."), {"/data/eglantineps5"}) + " " +
+                   tr("Unencrypted games (.nup files, extracted game folders) start without keys and firmware.");
 }
 
 bool FakeServices::folders(const std::string &directory, std::vector<std::string> *names)

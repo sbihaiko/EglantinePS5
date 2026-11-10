@@ -77,7 +77,7 @@ Local-wireless multiplayer through Eden rooms is new in v1.000.000 and experimen
 1. Download and extract the release ZIP.
 2. Copy the included `PPSA98515` folder to `/data/homebrew/PPSA98515` on the PS5 (or to another folder ShadowMountPlus scans, such as `/mnt/usb0/homebrew/PPSA98515`).
 3. Make sure your jailbreak environment's local ELF loader is listening on TCP port 9021 (most setups have it). [Updates from the menu](#updating) use it, and with a ShadowMountPlus older than 1.7beta4 EglantinePS5 sends its bundled Lapy helper through it.
-4. Put your own legally dumped keys, firmware, and games in a **game files folder** (layout below). It can be anywhere the PS5 can read: internal storage, an M.2 or external drive, or a USB device.
+4. Put your own legally dumped keys, firmware, and games in a **game files folder** (layout below). It can be anywhere the PS5 can read: internal storage, an M.2 or external drive, or a USB device. Keys and firmware are only needed for encrypted games (`.nsp`, `.xci`): unencrypted games (`.nup` files and extracted game folders) start without them.
 5. Launch **EglantinePS5**, open **Settings > Game files**, browse to that folder and select it. The default is `/data/eglantineps5`.
 6. Close and reopen EglantinePS5, then open **Library**. Setup is checked when the app opens, so reopen it after changing the folder or adding keys or firmware.
 
@@ -87,10 +87,10 @@ Only these subfolders matter; the folder itself can have any name and location.
 
 ```text
 <game files folder>/                    # e.g. /data/eglantineps5, /mnt/ext1/eden, /mnt/usb0/eden
-├── keys/
+├── keys/                               # only for .nsp and .xci games
 │   ├── prod.keys
 │   └── title.keys                      # optional
-├── firmware/
+├── firmware/                           # only for .nsp and .xci games
 │   └── *.nca                           # extracted firmware NCAs
 ├── roms/
 │   ├── Game.nsp
@@ -112,7 +112,7 @@ Only these subfolders matter; the folder itself can have any name and location.
 └── .remote-downloads/                  # downloads that are not finished yet (see Download sources)
 ```
 
-Extracted games can also be copied as `roms/<game>/exefs/main` with `romfs/` beside `exefs/`, or as `roms/<game>/base/exefs/main` with updates in `roms/<game>/updates/<decimal version>/`. A complete extracted dump kept entirely in `roms/<game>/updates/<decimal version>/` is supported too: when the base executable is absent, the Library finds the newest version containing `exefs/main`. Each game appears once in the Library. For the versioned layout, newer update files override older ones in both `exefs/` and `romfs/`; files missing from updates are read from the base. Keep the extracted folders together when copying the game. Use binary mode for FTP transfers to preserve executable and asset bytes.
+Extracted games can also be copied as `roms/<game>/exefs/main` with `romfs/` beside `exefs/`, or as `roms/<game>/base/exefs/main` with updates in `roms/<game>/updates/<decimal version>/`. A complete extracted dump kept entirely in `roms/<game>/updates/<decimal version>/` is supported too: when the base executable is absent, the Library finds the newest version containing `exefs/main`. Each game appears once in the Library, and none of these layouts needs keys or firmware. For the versioned layout, newer update files override older ones in both `exefs/` and `romfs/`; files missing from updates are read from the base. Keep the extracted folders together when copying the game. Use binary mode for FTP transfers to preserve executable and asset bytes.
 
 An extracted dump can also be one `.nup` file in `roms/` ([NUP](https://github.com/a55uka/nup), made with its `nup pack` from the folders above). It needs no keys. The Library shows its title and icon, and it starts like the extracted folder it was made from: the newest update in it overrides the base, file by file, and mods apply. Files compressed in it are read as the game asks for them; one larger than 8 MiB is unpacked once into `/data/eglantineps5/user/cache/nup/` (named after its SHA-256) and read from there afterwards. DLC packed into a `.nup` is not loaded yet.
 

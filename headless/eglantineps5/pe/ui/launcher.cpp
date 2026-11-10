@@ -166,6 +166,13 @@ void Launcher::launch(const std::string &file, const std::string &title, const s
         cue(Cue::error);
         return;
     }
+    // An encrypted game while the keys or firmware are missing: unencrypted ones still start.
+    if (const std::string blocked = services_.launch_blocked(file); !blocked.empty())
+    {
+        say(blocked, true);
+        cue(Cue::error);
+        return;
+    }
     // Its save data first, when the profile keeps it on a server.
     if (services_.save_sync_wanted(file))
     {
