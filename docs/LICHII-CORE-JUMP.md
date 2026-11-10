@@ -46,6 +46,45 @@ replaces most of them; the rest is either ported into the port itself or set asi
     launch environment, not `env.txt`.
   - 0070 (native storage buffer tracking, branch `fix/oot-native-storage`) is still WIP upstream;
     check it against this core when it lands.
+- **premohq/PlayTendoh 0022-0023**: CMake pin relaxations for Lichii's GPU fence wait, shutdown,
+  named macro callback and graphics pipeline build lock. Nothing to take: our branch already keys
+  the pipeline lock on `PipelineBuild` (`pipeline_wait.cmake`), leaves `macro_native.cmake` out, and
+  does not build the OpenGL path those pins guard.
+
+## Survey of sibling forks, 2026-11-10
+
+Forks of heydemoura/EglantinePS5 pushed since 2026-11-03 with commits of their own (10), and forks
+of zortos293/Eglantine pushed since 2026-11-08 that are ahead of `nx2` (76 of 458, 2,501 commits),
+filtered for Ocarina of Time, AMD and RADV work. Taken into this branch:
+
+- **ASTC edge blocks stay inside the image** (`headless/astc_bounds.cmake`; Nolar-Hack/Lichii
+  `eb518660ec`, after CheezerWheezer/Lichii `132cc46c9e`). The decoder wrote every texel of a block
+  that reaches past the image's right or bottom edge; on AMD those stores land in other images
+  (black blocks, a crosshatch in Ocarina, then a GPU fault). The decoder is compiled again from a
+  bounded copy. The unswizzle shaders the same commit bounds are OpenGL only here.
+- **A deleted buffer leaves every channel's bindings** (`prepare-vulkan-port.py`, buffer_cache.h;
+  g1i7ch/lichii-ocarina `c3442ea23e`). Ocarina uses several GPU channels, and only the current one
+  was cleared, so another could resolve the stale id to a buffer that reused the slot.
+
+Already here, by our core or our port: Lichii #273, #295, #337, #351, #410, #655, #692, #721,
+#820, #949, #1060-#1062 (all merged before `d2eaae4f3`); exploitizm's AMD white-flash fixes,
+sparse-unbacked images and core pinning; danueecitizen's T33-T36 except `FRONT_BATCH` (an opt-in
+test with no measured gain); laovnex's JIT cache shares; Sebaneg's fiber stack drop (our core no
+longer allocates it, so our REPLACE at `CMakeLists.txt` for `std::array<u8, DEFAULT_STACK_SIZE>`
+matches nothing).
+
+Worth measuring on the console before any code:
+
+- `EDEN_NX2_FLUSH_DRAWS=4096` and `EDEN_NX2_FENCE_FLUSH_US=5000` (mja00/Lichii `3985ac21c6`: about
+  960 submissions a second down to 22 in Kokiri Forest).
+- `robustness2=on` (mja00/Lichii `6571c04166`: out-of-bounds fog reads turned the sky white on AMD).
+- The guest memory scanner's `scan_ms` in the `EDEN_CRAM` lines: laovnex stops it for 176-401 ms
+  hitches every 20 s, but here `ScanPass` also runs `ColdPass`, so it cannot simply be turned off.
+- Lichii #909 (open): skips the once-a-frame 64 KiB native bank uploads for Ocarina, about 11 MB a
+  frame in Kokiri Forest.
+
+Candidates for later ports: Sebaneg's GPU thread stack in the freeze report (`31961efac0`) and
+service work kept off the full GPU queue (`6f8df7a2dd`, a Switch 2 intro deadlock).
 
 ## What the jump changed in the port
 
