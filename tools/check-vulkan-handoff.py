@@ -42,9 +42,24 @@ struct MkwWorkerTimer {};
 namespace VideoCommon {
 namespace LoadingProbe { struct Probe { void Mark(const char*) {} }; inline Probe gpu; }
 namespace GpuSplit { inline bool check_owner{}; inline void CheckOwner(const char*) {} }
+namespace Nx2Profile {
+inline bool Enabled() { return false; }
+inline unsigned long long Now() { return 0; }
+enum class Zone { WorkerIdle };
+struct Scope { explicit Scope(Zone) {} };
+inline void Report(const char*) {}
+}
+namespace StutterTrace {
+enum class Thread { Worker };
+struct ThreadScope { explicit ThreadScope(Thread) {} };
+}
 }
 namespace Common {
 enum class ThreadPriority { Critical };
+namespace DkbCpuTrace {
+enum class Role { VulkanWorker };
+struct Registration { explicit Registration(Role) {} };
+}
 void SetCurrentThreadName(const char*) {}
 void SetCurrentThreadPriority(ThreadPriority) {}
 void SetCurrentThreadToPerformanceCores() {}
