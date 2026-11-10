@@ -1083,7 +1083,7 @@ string(REPLACE "${unmap_old}" "            if (const auto mirror = page_table.en
 # The guest core a tracked write comes from, for the GPU caches' deferred writes (performance.h
 # cpu_write_defer): each core queues its own, and a replayed write to GPU-modified data goes to
 # that core's dirty ranges.
-set(tracked_old "        system.Host1x().MemoryManager().ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {\n            auto& current_area = rasterizer_write_areas[core];\n")
+set(tracked_old "        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {\n            auto& current_area = rasterizer_write_areas[core];\n")
 string(FIND "${arena_source}" "${tracked_old}" tracked_at)
 if(tracked_at LESS 0)
     message(FATAL_ERROR "Pinned HandleRasterizerWrite changed")
