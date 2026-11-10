@@ -903,39 +903,26 @@ string(FIND "${physical_core_source}" "${prefetch_old}" prefetch_at)
 if(prefetch_at LESS 0)
     message(FATAL_ERROR "Pinned prefetch-abort handling changed")
 endif()
-# Guest core idle: count each wait and how long it lasted, and spin on the
-# interrupt flag for a bounded time before sleeping on the condition variable, because waking a
-# sleeping host thread puts the host scheduler's latency on the guest's critical path.
-string(FIND "${physical_core_source}" "void PhysicalCore::Idle() {" idle_begin)
+# Guest core idle: only count each wait and how long it lasted. The core spins on the interrupt
+# flag before sleeping on the condition variable itself (EDEN_NX2_IDLE_SPIN_US), so the spin stays
+# where upstream keeps it and only the instrumentation is added here.
+set(idle_begin_old "void PhysicalCore::Idle(KernelCore& kernel) {")
+string(FIND "${physical_core_source}" "${idle_begin_old}" idle_begin)
 string(FIND "${physical_core_source}" "bool PhysicalCore::IsInterrupted() const {" idle_end)
 if(idle_begin LESS 0 OR idle_end LESS idle_begin)
     message(FATAL_ERROR "Pinned PhysicalCore::Idle changed")
 endif()
-math(EXPR idle_length "${idle_end} - ${idle_begin}")
-string(SUBSTRING "${physical_core_source}" ${idle_begin} ${idle_length} idle_old)
-string(REPLACE "${idle_old}" [=[void PhysicalCore::Idle() {
-    const long long start = ::Eden::Performance::NowNs();
-    const unsigned spins = ::Eden::Performance::idle_spin_iterations.load(std::memory_order_relaxed);
-    for (unsigned i = 0; i < spins && !m_is_interrupted.load(std::memory_order_acquire); ++i)
-        __builtin_ia32_pause();
-    bool slept;
-    {
-        std::unique_lock lk{m_guard};
-        slept = !m_is_interrupted;
-        m_interrupt_ns.store(0, std::memory_order_relaxed);
-        m_sleeping.store(true, std::memory_order_relaxed);
-        m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
-        m_sleeping.store(false, std::memory_order_relaxed);
-    }
-    if (const long long sent = m_interrupt_ns.load(std::memory_order_relaxed); slept && sent != 0) {
-        const long long woke = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch()).count();
-        ::Eden::Performance::CountWake(m_core_index, woke - sent);
-    }
-    ::Eden::Performance::CountIdle(m_core_index, ::Eden::Performance::NowNs() - start, slept);
-}
-
-]=] physical_core_source "${physical_core_source}")
+string(REPLACE "${idle_begin_old}"
+    "${idle_begin_old}\n    const long long idle_start = ::Eden::Performance::NowNs();"
+    physical_core_source "${physical_core_source}")
+set(idle_wait_old "    std::unique_lock lk{m_guard};\n    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });")
+string(FIND "${physical_core_source}" "${idle_wait_old}" idle_wait_at)
+if(idle_wait_at LESS 0)
+    message(FATAL_ERROR "Pinned PhysicalCore::Idle wait changed")
+endif()
+string(REPLACE "${idle_wait_old}"
+    "    std::unique_lock lk{m_guard};\n    const bool slept = !m_is_interrupted.load(std::memory_order_relaxed);\n    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });\n    ::Eden::Performance::CountIdle(m_core_index, ::Eden::Performance::NowNs() - idle_start, slept);"
+    physical_core_source "${physical_core_source}")
 string(REPLACE "${prefetch_old}"
     "            } else {\n                interface->LogBacktrace(process);\n                if (prefetch_abort)\n                    ::Eden::RecordGuestFault(\"guest thread \" + Core::GetThreadName(thread).value_or(\"?\") +\n                                             \" jumped to an unmapped address\");\n            }\n            thread->RequestSuspend(kernel, SuspendType::Debug);"
     physical_core_source "${physical_core_source}")
