@@ -1461,13 +1461,10 @@ eden_patch(ips_source "        } else if (patches.empty()) {\n            LOG_WA
     "        } else if (!IsPatchRecord(line)) {\n            // Credits, links, anything that is not a record.\n        } else if (patches.empty()) {\n            LOG_WARNING(Loader, \"Invalid line not in a patch {}\", line);")
 write_derived("${PORT_BUILD_DIR}/ips_layer.cpp" "${ips_source}")
 # The patch manager: a missing mod root must never enter its sorting and dereference loops, and an
-# .ips patch is named after the build ID in either case.
+# .ips patch is named after the build ID in either case. The core now guards both roots itself
+# (patch_manager.cpp: patch_dirs is built empty and each root is checked), so only the build ID
+# case and the per-module log are pinned here.
 file(READ "${PROJECT_SOURCE_DIR}/src/core/file_sys/patch_manager.cpp" patch_source)
-eden_patch(patch_source "std::vector<VirtualDir> patch_dirs = {sdmc_load_dir};"
-    "std::vector<VirtualDir> patch_dirs;\n    if (sdmc_load_dir) patch_dirs.push_back(sdmc_load_dir);")
-eden_patch(patch_source
-    "    std::vector<VirtualDir> patch_dirs = load_dir->GetSubdirectories();\n    if (std::find(disabled.cbegin(), disabled.cend(), \"SDMC\") == disabled.cend()) {"
-    "    std::vector<VirtualDir> patch_dirs;\n    if (load_dir != nullptr) patch_dirs = load_dir->GetSubdirectories();\n    if (sdmc_load_dir != nullptr && std::find(disabled.cbegin(), disabled.cend(), \"SDMC\") == disabled.cend()) {")
 eden_patch(patch_source
     "const auto this_build_id = fmt::format(\"{:0<64}\", name.substr(0, name.find('.')));"
     "const auto this_build_id = fmt::format(\"{:0<64}\", Common::ToUpper(name.substr(0, name.find('.'))));")
