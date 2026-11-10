@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Included once by performance.cpp. All file I/O runs outside the measured window.
 #include "ordered_read_trace.h"
+// The store reads the core's readback dependency records (core patch 0004). A core without them
+// keeps the trace off: Frame counts, and nothing is recorded or exported.
+#if __has_include("video_core/readback_dependency_diagnostics.h")
 #include "ordered_read_trace_store.h"
+
 #include <inttypes.h>
 #include <memory>
 #include <unistd.h>
@@ -311,3 +315,8 @@ extern "C" void eden_mapped_readback_reject(unsigned reason) {
 extern "C" bool eden_vulkan_handoff_enabled() {
     return Eden::OrderedReadTrace::vulkan_handoff_enabled.load(std::memory_order_acquire);
 }
+#else
+namespace Eden::OrderedReadTrace {
+void Frame(std::uint64_t, std::uint64_t) {}
+} // namespace Eden::OrderedReadTrace
+#endif

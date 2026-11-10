@@ -42,3 +42,5 @@ add_custom_command(TARGET eden-nir-backend POST_BUILD
     COMMAND "${CMAKE_OBJCOPY}" "--redefine-syms=${radv_symbols}" "$<TARGET_FILE:eden-nir-backend>"
     VERBATIM)
 target_link_libraries(eden-headless PRIVATE eden-nir-backend)
+# main.cpp registers the backend only when this build has one.
+target_compile_definitions(eden-headless PRIVATE EDEN_PS5_NIR_BACKEND=1)

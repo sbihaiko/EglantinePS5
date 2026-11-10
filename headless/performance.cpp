@@ -34,7 +34,10 @@
 #ifdef PS5_NATIVE
 #include <sys/param.h>
 #include "common/fs/file.h"
+// The guest's memory statistics are a core patch (0004); a core without them reports nothing here.
+#if __has_include("core/hle/kernel/svc/svc_memory_stats.h")
 #include "core/hle/kernel/svc/svc_memory_stats.h"
+#endif
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -599,7 +602,9 @@ static void RefreshFreeMemory(bool report) {
                      guest_held >> 20, guest_span >> 20);
         ReportHeap("every 20 s");
         ReportFileHandles();
+#if __has_include("core/hle/kernel/svc/svc_memory_stats.h")
         ::Kernel::Svc::MemoryStats::Report(stderr);
+#endif
         if (const auto pools = guest_pool_report.load(std::memory_order_relaxed)) pools();
     }
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).

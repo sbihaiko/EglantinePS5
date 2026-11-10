@@ -42,7 +42,7 @@
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
-#include "core/file_sys/nup.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
@@ -51,6 +51,7 @@
 #include "core/hle/service/ns/language.h"
 #include "core/hle/service/set/settings_types.h"
 #include "core/loader/loader.h"
+#include "core/loader/nup.h"
 
 namespace {
 constexpr std::array<const char*, 18> language_names{
@@ -77,30 +78,24 @@ FileSys::VirtualDir OpenControlRomFs(const FileSys::VirtualFile& file, bool xci)
     return romfs ? FileSys::ExtractRomFS(romfs) : FileSys::VirtualDir{};
 }
 
-// A NUP container (core/file_sys/nup.h) has no control NCA: its meta block holds the control data
-// and the icon. They are given as a control RomFS would hold them (control.nacp,
-// icon_AmericanEnglish.dat), and its title record in *title. nullptr when the file is no NUP.
+// A NUP container has no control NCA: the core's NUP loader builds the NACP from the container's
+// title records and hands back the icon as stored. They are given as a control RomFS would hold
+// them (control.nacp, an icon file), and its title record in *title. nullptr when not a NUP.
 FileSys::VirtualDir OpenNupControl(const FileSys::VirtualFile& file, std::string* title = nullptr) {
-    if (!FileSys::Nup::Archive::HasMagic(file)) return {};
-    std::string error;
-    const auto archive = FileSys::Nup::Archive::OpenMetadata(file, &error);
-    if (!archive) {
-        std::fprintf(stderr, "[EglantinePS5] library: %s is not a usable NUP: %s\n", file->GetName().c_str(),
-                     error.c_str());
-        return {};
-    }
-    const auto& package = *archive->MetadataPackage();
-    auto meta = archive->Meta(package);
+    if (!FileSys::NupContainer::IsNupFile(file)) return {};
+    Loader::AppLoader_NUP nup{file};
     std::vector<FileSys::VirtualFile> files;
-    using Type = FileSys::Nup::MetaType;
-    if (auto nacp = meta.find(static_cast<u16>(Type::Nacp)); nacp != meta.end())
-        files.push_back(std::make_shared<FileSys::VectorVfsFile>(std::move(nacp->second), "control.nacp"));
-    if (auto icon = meta.find(static_cast<u16>(Type::Icon)); icon != meta.end())
-        files.push_back(std::make_shared<FileSys::VectorVfsFile>(std::move(icon->second), "icon_AmericanEnglish.dat"));
-    if (title) {
-        const auto name = meta.find(static_cast<u16>(Type::TitleName));
-        *title = name != meta.end() ? std::string(name->second.begin(), name->second.end()) : std::string{};
+    FileSys::NACP nacp{};
+    if (nup.ReadControlData(nacp) == Loader::ResultStatus::Success) {
+        const auto* begin = reinterpret_cast<const u8*>(&nacp.raw);
+        files.push_back(std::make_shared<FileSys::VectorVfsFile>(
+            std::vector<u8>(begin, begin + sizeof(nacp.raw)), "control.nacp"));
     }
+    std::vector<u8> icon;
+    if (nup.ReadIcon(icon) == Loader::ResultStatus::Success && !icon.empty()) {
+        files.push_back(std::make_shared<FileSys::VectorVfsFile>(std::move(icon), "icon.png"));
+    }
+    if (title) nup.ReadTitle(*title);
     return std::make_shared<FileSys::VectorVfsDirectory>(std::move(files));
 }
 
@@ -240,8 +235,9 @@ uint64_t eden_game_title_id(const char* rom_path) {
         return package.GetStatus() == Loader::ResultStatus::Success ? package.GetProgramTitleID() : 0;
     }
     if (path.ends_with(".nup")) {
-        const auto archive = FileSys::Nup::Archive::OpenMetadata(file);
-        return archive ? archive->ProgramTitleID() : 0;
+        Loader::AppLoader_NUP nup{file};
+        u64 title_id = 0;
+        return nup.ReadProgramId(title_id) == Loader::ResultStatus::Success ? title_id : 0;
     }
     return 0;
 }

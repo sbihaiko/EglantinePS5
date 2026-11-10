@@ -72,7 +72,9 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "video_core/dma_pusher.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#ifdef EDEN_MKW_DIAGNOSTICS
 #include "video_core/nx2_loading_probe.h"
+#endif
 #include "stall_watchdog.h"
 #include "dev_vulkan.h"
 #include "../src/fastmem.h"
@@ -263,13 +265,13 @@ static void UpdateGrips(Core::System& system, Eden::Pad& pad) {
     }
 }
 
-#ifdef EDEN_PS5_RADV
+#if defined(EDEN_PS5_RADV) && defined(EDEN_PS5_NIR_BACKEND)
 void EdenRegisterNirBackend(); // nir_backend.cpp
 #endif
 
 int main(int argc, char** argv) {
     try {
-#ifdef EDEN_PS5_RADV
+#if defined(EDEN_PS5_RADV) && defined(EDEN_PS5_NIR_BACKEND)
         // Compute shaders reach RADV as NIR where translatable (nir_handoff.h; EDEN_NX2_NIR=0: SPIR-V).
         EdenRegisterNirBackend();
 #endif
