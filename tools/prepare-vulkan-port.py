@@ -1031,140 +1031,11 @@ adapt('src/video_core/vulkan_common/vulkan_wrapper.cpp', 'vulkan_wrapper.cpp', [
     ('auto const result = dld->vkCreateGraphicsPipelines(', 'auto timer = Eden::Performance::VulkanTimer(0);\n    auto const result = dld->vkCreateGraphicsPipelines('),
     ('Check(dld->vkCreateComputePipelines(', 'auto timer = Eden::Performance::VulkanTimer(1);\n    Check(dld->vkCreateComputePipelines('),
 ])
-download_source = (source / 'src/video_core/texture_cache/texture_cache.h').read_text()
-download_begin = download_source.index('void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size)')
-download_loop = download_source.index('    for (const ImageId image_id : images) {', download_begin)
-download_prefix = download_source[download_begin:download_loop]
-# Reuse DeleteImage's exact accounting to stop lookahead when its existing
-# pressure policy changes. Fail on source drift rather than inventing a budget.
-delete_begin = download_source.index('    if (image.HasScaled()) {', download_source.index('void TextureCache<P>::DeleteImage('))
-delete_end = download_source.index('    const GPUVAddr gpu_addr', delete_begin)
-reclaimed_bytes = (download_source[delete_begin:delete_end]
-                   .replace('total_used_memory -=', 'bytes +=')
-                   .replace('slot_images[image_id]', 'image'))
-assert 'image_id' not in reclaimed_bytes, 'DeleteImage accounting needs adapting to an image reference'
-# Lichii's collector takes whether an allocation just failed (out_of_memory); the older core's
-# took nothing, so the pin accepts either signature.
-gc_begin = next(download_source.index(head) for head in (
-    'void TextureCache<P>::RunGarbageCollector() {', 'void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {')
-    if head in download_source)
-gc_end = download_source.index('\ntemplate <class P>', gc_begin)
-gc_original = download_source[gc_begin:gc_end]
-gc = gc_original
-gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
-        u64 bytes = 0;
-''' + reclaimed_bytes + '''        return bytes;
-    };
-''' + (port / 'vulkan_gc_downloads.inc').read_text()
-cleanup_begin = gc.index('    const auto Cleanup = [')
-cleanup_end = gc.index('](ImageId image_id)', cleanup_begin) + 1
-cleanup_capture = gc[cleanup_begin:cleanup_end]
-# Eglantine's own block-order walk (tools/eglantine-patches/0012, Collect) gives way to
-# ForEachCandidate (vulkan_gc_downloads.inc): the same order, but over up to 1,024 candidates
-# instead of 8 per eviction allowed, then on oldest first, and the download lookahead walks it too.
-collect_begin = gc.index('    const auto Collect = [&] {')
-collect_begin = gc.rindex('    };\n', 0, collect_begin) + len('    };\n')  # with 0012's comment
-collect_end = gc.index('    Configure(false);', collect_begin)
-collect_original = gc[collect_begin:collect_end]
-for old, new in [
-    (cleanup_capture,
-     gc_setup + '\n    const auto Cleanup = [&, this]'),
-    (collect_original,
-     '    const auto Collect = [&] { ForEachCandidate(frame_tick - ticks_to_destroy, Cleanup); };\n'),
-    ('        if (must_download) {',
-     '        if (must_download && KeepLargeDirty(image)) {\n            return false;\n        }\n'
-     '        if (must_download && !TakePrefetched(image_id, image)) {'),
-    # Time the per-image drain Cleanup still takes for an image the prefetch could not batch.
-    # One GPU pipeline wait per eviction, against one wait for a whole batch in the batched path:
-    # this is the stall the prefetch exists to remove, so keep it visible.
-    ('            image.DownloadMemory(map, copies);\n            runtime.Finish();\n'
-     '            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);',
-     '            image.DownloadMemory(map, copies);\n'
-     '            {\n'
-     '                const ::Eden::Performance::Timer drain_timer(\n'
-     '                    ::Eden::Performance::gc_unbatched_drain, 1);\n'
-     '                runtime.Finish();\n'
-     '            }\n'
-     '            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);'),
-    ('(!high_priority_mode && must_download)) {', '(!DirtyEvictions() && must_download)) {'),
-    ('    Configure(false);', '    Configure(false);\n    PrefetchDownloads();'),
-    ('        Configure(true);', '        Configure(true);\n        PrefetchDownloads();'),
-    # The eviction budget counts visits, not evictions: skipped images (decoding,
-    # costly, or dirty images kept below the critical mark) burn it and stop the
-    # scan, so kept images shield everything behind them. Count evictions; bound
-    # the scan separately. gc_scan=upstream restores visit counting.
-    ('    size_t num_iterations = 0;',
-     '    size_t num_iterations = 0;\n    size_t num_scanned = 0;\n    constexpr size_t max_scanned = 8192;'),
-    ('        if (num_iterations == 0) {\n            return true;\n        }\n        --num_iterations;',
-     '        if (num_iterations == 0 || num_scanned >= max_scanned) {\n            return true;\n        }\n        ++num_scanned;\n'
-     '        if (::Eden::Performance::gc_count_visits.load(std::memory_order_relaxed)) {\n            --num_iterations;\n        }'),
-    # A costly image (ASTC kept as BC3, converted on the CPU) goes only past Eden's own critical
-    # mark, not when the console's pool alone is critical: rebuilding it decodes it again on the
-    # CPU, in memory the pool did not have (Mario Kart World: 1,561 evicted in one window, 3.4 GB
-    # of conversions and uploads in the next, and the decoder's allocation ended the session).
-    # (Lichii keeps its own pass for old costly images: evict_old_costly, its line split in two.)
-    ('        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||\n'
-     '            (!DirtyEvictions() && must_download)) {\n            return false;\n        }\n',
-     '        const bool costly_kept = !(aggressive_mode && total_used_memory >= critical_memory) && !evict_old_costly &&\n'
-     '                                 !::Eden::Performance::gc_old_costly && True(image.flags & ImageFlagBits::CostlyLoad);\n'
-     '        if (costly_kept || (!DirtyEvictions() && must_download)) {\n            return false;\n        }\n'
-     '        if (!::Eden::Performance::gc_count_visits.load(std::memory_order_relaxed)) {\n            --num_iterations;\n        }\n'),
-    # The aggressive pass gets its own scan allowance: Configure resets the
-    # eviction budget per pass, and the scan counter must reset with it, or a
-    # first pass spent on skips would stillborn the second one. Runs after the
-    # Configure(true) pair above, whose first line this matches.
-    ('        Configure(true);',
-     '        Configure(true);\n        num_scanned = 0;'),
-    # While the console's pool is short (performance.h, GraphicsMemoryIsShort) the collector
-    # works as if past its first mark, past both once the pool is critical (GraphicsMemoryIsCritical),
-    # and stays so for the whole run instead of easing off after one eviction under a mark the
-    # pool never reaches.
-    ('    u64 ticks_to_destroy = 0;\n',
-     '    u64 ticks_to_destroy = 0;\n    const bool memory_short = ::Eden::Performance::GraphicsMemoryIsShort();\n'),
-    ('        num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);\n',
-     '        if (memory_short) {\n'
-     '            // Short but not critical, only what 600 frames left unused goes (EDEN_NX2_TC_SHORT_AGE):\n'
-     '            // at 60, and 10 whenever use passed the texture cache\'s own critical mark, a race\n'
-     '            // evicted and rebuilt 1,000-2,400 textures every 600 frames, many still in use, while\n'
-     '            // the pool stayed short throughout (an image freed inside a graphics block does not\n'
-     '            // give the pool a larger free block). On the console the pool decides: critical\n'
-     '            // (GraphicsMemoryIsCritical) collects as before.\n'
-     '            static const u64 short_age = [] {\n'
-     '                const char* value = std::getenv("EDEN_NX2_TC_SHORT_AGE");\n'
-     '                return value != nullptr ? std::strtoull(value, nullptr, 10) : 600ULL;\n'
-     '            }();\n'
-     '            high_priority_mode = true;\n'
-     '            aggressive_mode = allow_aggressive && ::Eden::Performance::GraphicsMemoryIsCritical();\n'
-     '            ticks_to_destroy = (std::max)(aggressive_mode ? u64{10} : short_age, min_age);\n'
-     '        }\n'
-     '        num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);\n'),
-    ('        if (aggressive_mode && total_used_memory < critical_memory) {',
-     '        if (aggressive_mode && !memory_short && total_used_memory < critical_memory) {'),
-    ('        } else if (high_priority_mode && total_used_memory < expected_memory) {',
-     '        } else if (high_priority_mode && !memory_short && total_used_memory < expected_memory) {'),
-    ('    if (out_of_memory || total_used_memory >= critical_memory) {\n        Configure(true);',
-     '    if (out_of_memory || total_used_memory >= critical_memory || memory_short) {\n        Configure(true);'),
-    # While the pool is short, costly images 300 frames unused (a course left behind) go too, in a
-    # pass of their own: kept whenever only the pool was short, Mario Kart World's next course took
-    # 1.2 GB of graphics memory within five seconds with nothing the collector could give back, and
-    # waiting until the pool was critical left a course load too little room (pro27: 1.37 GB usable,
-    # then out of memory within one window). On a light frame (a loading screen: astc_policy.h)
-    # the course left behind is unused after 10 frames already, and the next one is about to load.
-    ('        num_scanned = 0;\n        PrefetchDownloads();\n        Collect();\n    }\n',
-     '        num_scanned = 0;\n        PrefetchDownloads();\n        Collect();\n    }\n'
-     '    const u64 old_age = ::Eden::AstcPolicy::InBackground() ? 300 : 10;\n'
-     '    if (memory_short && frame_tick > old_age) {\n'
-     '        Configure(true);\n'
-     '        num_scanned = 0;\n'
-     '        ::Eden::Performance::gc_old_costly = true;\n'
-     '        PrefetchDownloads();\n'
-     '        ForEachCandidate(frame_tick - old_age, Cleanup);\n'
-     '        ::Eden::Performance::gc_old_costly = false;\n'
-     '    }\n'),
-]:
-    if gc.count(old) != 1:
-        raise RuntimeError(f'Pinned GC anchor changed: {old}')
-    gc = gc.replace(old, new)
+# The core's own collector and download path: ours rewrote them for the pinned core's
+# partial-download tracking (vulkan_gc_downloads.inc, vulkan_download_batch.inc), and
+# Lichii's collector has since taken its own shape. Those two includes stay on disk for
+# the port that returns to them; nothing here applies them.
+
 texture_costs = []
 for signature, index in (
     ('RunGarbageCollector(bool out_of_memory)', 13), ('DownloadMemory(DAddr cpu_addr, size_t size)', 14),
@@ -1387,8 +1258,6 @@ adapt('src/video_core/texture_cache/texture_cache.h',
     ('            auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);',
      '            ::Eden::ImagePages::Mark(cpu_addr, size);\n'
      '            auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);'),
-    (download_prefix, download_prefix + (port / 'vulkan_download_batch.inc').read_text() + '\n'),
-    (gc_original, gc),
     # RADV reports all Vulkan allocations, not just cached textures. A game's
     # measured ~1.9 GiB working set triggered dirty eviction at the old 1.6 GiB
     # threshold despite a 4 GiB budget. Retain 40% headroom; keep the original
