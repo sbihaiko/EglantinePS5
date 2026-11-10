@@ -11,6 +11,7 @@
 // set. A shared condition can have waiters of several pipelines, so a signal wakes all of them;
 // each checks its own pipeline's flag and waits again if it is not yet built.
 #pragma once
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +68,11 @@ public:
     template <typename Lock, typename Predicate>
     void wait(Lock& lock, Predicate predicate) {
         StripedWait::ConditionFor(this).wait(lock, std::move(predicate));
+    }
+    // A draw waits a bounded time for a pipeline (PipelineBuild::WaitFor), so the pair needs it too.
+    template <typename Lock, typename Rep, typename Period, typename Predicate>
+    bool wait_for(Lock& lock, std::chrono::duration<Rep, Period> timeout, Predicate predicate) {
+        return StripedWait::ConditionFor(this).wait_for(lock, timeout, std::move(predicate));
     }
     // Other pipelines' waiters can share this condition: waking only one could wake the wrong one.
     void notify_one() noexcept { StripedWait::ConditionFor(this).notify_all(); }
