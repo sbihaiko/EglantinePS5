@@ -48,6 +48,11 @@ def adapt(relative, destination, replacements, optional=False):
 
 adapt('src/core/frontend/emu_window.h', 'include/core/frontend/emu_window.h',
       [('    Xcb,', '    Xcb,\n    PS5,')])
+# The PS5 SDK's nanoseconds::rep is not the same integer type as Common::s64, and the core compares
+# the two in a std::max over a header every service includes. Cast, so the template deduces one type.
+adapt('src/core/hle/service/nx2_gsv.h', 'include/core/hle/service/nx2_gsv.h',
+      [('(std::max)(vsync_state->trace_max_late, late.count())',
+        '(std::max)(vsync_state->trace_max_late, static_cast<s64>(late.count()))')])
 adapt('src/video_core/renderer_vulkan/vk_rasterizer.cpp', 'vulkan_rasterizer.cpp', [
     # Compute synchronization (dev_vulkan.h compute_barriers): indirect
     # dispatches returned before the pre-dispatch barrier, and no barrier made a dispatch's
