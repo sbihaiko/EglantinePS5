@@ -6,6 +6,10 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'Eglantine/src/video_core/fence_manager.h').read_text()
+# The diagnostic masks are a core patch (0004); a core without them has nothing to check here.
+if not (root / 'Eglantine/src/video_core/readback_diagnostics.h').exists():
+    print('Fence requirements: skipped, the core has no readback_diagnostics.h')
+    raise SystemExit(0)
 diagnostic = (root / 'Eglantine/src/video_core/readback_diagnostics.h').read_text()
 
 
