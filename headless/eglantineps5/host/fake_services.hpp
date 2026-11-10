@@ -24,6 +24,7 @@ class FakeServices final : public ui::Services
 
     // What the preview varies between pictures.
     bool setup_ready = true;
+    bool keys_ready = true; // without keys and firmware only unencrypted games start
     std::string launch_error;
     std::string crash_report; // the previous run's crash report, when it left one
     bool has_history = true;
@@ -204,6 +205,13 @@ class FakeServices final : public ui::Services
     bool game_exists(const std::string &file) override
     {
         return std::find(removed.begin(), removed.end(), file) == removed.end();
+    }
+    std::string launch_blocked(const std::string &file) override
+    {
+        if (keys_ready || file.ends_with(".nup") || file.ends_with(".dir"))
+            return {};
+        return fill(tr("This game is encrypted and needs keys and firmware: {0}"),
+                        {fill(tr("Missing or empty keys/prod.keys in {0}."), {"/data/eglantineps5"})});
     }
     std::vector<ui::Game> games() override
     {

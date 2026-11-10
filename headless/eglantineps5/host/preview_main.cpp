@@ -663,11 +663,16 @@ void pictures(Stage &s)
     s.shoot("23-about");
 
     // What the home screen says when something is wrong, and before any game was played.
-    s.services.setup_ready = false;
+    s.services.keys_ready = false;
+    s.services.has_history = false;
     s.restart();
     s.wait(2.0f);
     s.shoot("24-home-setup-required");
-    s.services.setup_ready = true;
+    s.services.has_history = true;
+    s.restart();
+    s.wait(2.0f);
+    s.shoot("24b-home-unencrypted-only");
+    s.services.keys_ready = true;
     s.services.launch_error = "The game's keys are missing from prod.keys.";
     s.restart();
     s.wait(2.0f);

@@ -1,0 +1,542 @@
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index d0f7074892..b61483f2ca 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -31,6 +31,9 @@ struct LoweredProgram {
+     u32 required_surface_buffer = ~0U;
+     u32 error_offset{};
+     std::string_view error;
++    /// A rejected program that would lower with this many mirrors for UR28 and up (see
++    /// LowerToMaxwell, which lowers it again).
++    u32 high_uniform_registers{};
+ 
+     explicit operator bool() const { return error.empty(); }
+ };
+@@ -38,9 +41,12 @@ struct LoweredProgram {
+ // Lower only operations whose semantics are representable by the existing
+ // Maxwell frontend. These are new instructions, not reinterpretations of the
+ // native bytes. Scheduling/control words are added by the environment adapter.
+-inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geometry_stage = false,
+-                                     bool support_cooperative_matrix = false) {
++// high_uniforms: how many registers just below R216 mirror UR28 and up (UR28 at
++// R(216 - high_uniforms)); the guest's own registers from there up are shadowed.
++inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 high_uniforms,
++                                         bool geometry_stage, bool support_cooperative_matrix) {
+     LoweredProgram result;
++    const u32 high_uniform_base = 216 - high_uniforms;
+     struct Relocation { u32 output_index; s64 target; u32 output_target = ~0U; };
+     std::vector<Relocation> relocations;
+     std::vector<u32> barrier_tokens;
+@@ -51,7 +57,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
+     bool uses_uniform_bank = false;
+     for (const auto& instruction : code) {
+         const u32 op = instruction.Bits(0, 12);
+-        uses_uniform_bank |= op == 0xd08 || op == 0x4a4 || op == 0x499;
++        uses_uniform_bank |= op == 0xd08 || op == 0x4a4 || op == 0x499 || op == 0xc07;
+         uses_uniform_bank |= op == 0x3c4 || op == 0x2bd || op == 0x896 || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xe23 || op == 0xc02 ||
+                              op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x092 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc11 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || (op == 0x988 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0x8a5 || op == 0x299 || op == 0xc09 || op == 0xf60 || (op == 0x81c && instruction.Bits(67, 1));
+     }
+@@ -84,8 +90,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
+         if (!*geometry_exit)
+             return fail(geometry_exit->error_offset / sizeof(Instruction), geometry_exit->error);
+     }
+-    // Control-flow facts for the per-tap gather proof (upstream Eglantine): which instructions a
+-    // branch or call can enter, and how many registers an instruction writes.
++    // Control-flow facts for the per-tap gather proof (upstream Eglantine). Only bounded_control,
++    // control_entries and write_count are used here.
+     std::vector<bool> control_entries(code.size()), dead_instructions(code.size()), checked_returns(code.size());
+     std::vector<u32> bounded_links(code.size(), ~0U), direct_targets(code.size(), ~0U);
+     std::vector<std::pair<u32, u32>> control_edges;
+@@ -124,7 +130,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
+         for (const u32 bit : {16U, 24U, 32U, 64U}) {
+             if (bit == 32 && instruction.Bits(9, 3) != 1) continue;
+             const u32 reg = instruction.Bits(bit, 8);
+-            if (reg >= (uses_uniform_bank ? 216U : 246U) && reg != 255) return false;
++            if (reg >= (uses_uniform_bank ? high_uniform_base : 246U) && reg != 255) return false;
+         }
+         return true;
+     };
+@@ -284,12 +290,18 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
+                 opcode != 0x988 && opcode != 0x986 && opcode != 0x987 && opcode != 0x927 && opcode != 0x9a8 &&
+                 opcode != 0x98e && opcode != 0x59f) continue;
+             const u32 reg = insn.Bits(bit, 8);
+-            if (reg >= (uses_uniform_bank ? 216U : 246U) && reg < 255) requires_shadow = true;
++            if (reg >= (uses_uniform_bank ? high_uniform_base : 246U) && reg < 255) requires_shadow = true;
+         }
+         if (requires_shadow) {
+             // Without the uniform bank R246-R254 would need a second scheme: rejected.
+             if (!uses_uniform_bank) return fail(index, "native program uses lowering scratch registers");
+-            pressure = PrepareRegisterPressure(insn, 216);
++            if (high_uniform_base & 3) {
++                // Shadowing works in aligned groups of four: lower again with the base rounded down.
++                result.high_uniform_registers =
++                    (std::max)(result.high_uniform_registers, (high_uniforms + 3) & ~3U);
++                return fail(index, "native program uses lowering scratch registers");
++            }
++            pressure = PrepareRegisterPressure(insn, high_uniform_base);
+             if (!pressure.valid) return fail(index, "native program uses lowering scratch registers");
+             insn = pressure.instruction;
+             result.instructions.insert(result.instructions.end(), pressure.prefix.begin(), pressure.prefix.end());
+@@ -303,6 +315,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
+             if (reg < 22) return 216 + reg;
+             if (reg < 28) return 218 + reg;
+             if (reg == 63) return 255;
++            // UR28-UR62: mirrored below R216 once the program is known to use them (upstream).
++            if (reg < 63 && reg - 28 < high_uniforms) return high_uniform_base + (reg - 28);
++            if (reg < 63) result.high_uniform_registers = (std::max)(result.high_uniform_registers, (reg - 26) & ~1U);
+             return ~0U;
+         };
+         bool rewritten_uniform = false;
+@@ -1045,17 +1060,20 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+             }
+             break;
+         }
+-        case 0x882: { // UMOV immediate.
+-            if (dest >= 16 || insn.words[2]) return fail(index, "native uniform immediate move mode");
+-            mov_imm(static_cast<u32>(dest) + 216, insn.words[1]);
++        case 0x882: { // UMOV immediate, into any uniform register (Hyrule Warriors: @!UP0 UMOV UR59, 0x20).
++            const u32 target = uniform_register(static_cast<u32>(dest));
++            if (target == ~0U || insn.words[2]) return fail(index, "native uniform immediate move mode");
++            if (target != 255) mov_imm(target, insn.words[1]);
+             break;
+         }
+         case 0xc82: { // UMOV UR, UR (or URZ), including uniform execution predicates.
++            // Any uniform destination (Hyrule Warriors: @UP0 UMOV UR59, UR58).
+             const u32 source = insn.words[1] < 64 ? uniform_register(insn.words[1]) : ~0U;
+-            if (dest >= 16 || source == ~0U || insn.words[2] != 0x08000000)
++            const u32 target = uniform_register(static_cast<u32>(dest));
++            if (target == ~0U || source == ~0U || insn.words[2] != 0x08000000)
+                 return fail(index, "native uniform move mode");
+-            emit(0x5c98000000000000ULL | predicate | (dest + 216) |
+-                 (u64{source} << 20) | (u64{15} << 39));
++            if (target != 255)
++                emit(0x5c98000000000000ULL | predicate | target | (u64{source} << 20) | (u64{15} << 39));
+             break;
+         }
+         case 0xab9: case 0xabb: { // ULDC U32/U64, direct or indexed.
+@@ -1224,23 +1242,35 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+                  (u64{static_cast<u32>(offset) & 0xfffff} << 28) | (u64{insn.Bits(72, 1)} << 48));
+             break;
+         }
+-        case 0x2bd: // UFLO.U32, the highest set-bit index (.SH, bit 74: its shift amount).
+-            if (dest >= 16 || insn.words[1] >= 16 || (insn.words[2] & ~0x400U) != 0x080e0000 || native_predicate != 7)
++        case 0x2bd: { // UFLO.U32, the highest set-bit index (.SH, bit 74: its shift amount).
++            const u32 target = uniform_register(static_cast<u32>(dest));
++            const u32 source = uniform_register(insn.Bits(32, 8));
++            if (dest == 63 || target == ~0U || source == ~0U || (insn.words[1] & ~0xffU) ||
++                (insn.words[2] & ~0x400U) != 0x080e0000 || native_predicate != 7)
+                 return fail(index, "native uniform leading bit mode");
+-            emit(0x5c30000000000000ULL | predicate | (dest + 216) | (u64{insn.words[1] + 216} << 20) |
++            emit(0x5c30000000000000ULL | predicate | target | (u64{source} << 20) |
+                  (u64{insn.Bits(74, 1)} << 41));
+             break;
+-        case 0x2be: // UBREV, as a bit-reversing zero shift like BREV.
+-            if (dest >= 16 || insn.words[1] >= 16 || insn.words[2] != 0x08000000 || native_predicate != 7)
++        }
++        case 0x2be: { // UBREV, as a bit-reversing zero shift like BREV.
++            const u32 target = uniform_register(static_cast<u32>(dest));
++            const u32 source = uniform_register(insn.Bits(32, 8));
++            if (dest == 63 || target == ~0U || source == ~0U || (insn.words[1] & ~0xffU) ||
++                insn.words[2] != 0x08000000 || native_predicate != 7)
+                 return fail(index, "native uniform bit reverse mode");
+-            emit(0x3828000000000000ULL | predicate | (dest + 216) | (u64{insn.words[1] + 216} << 8) |
++            emit(0x3828000000000000ULL | predicate | target | (u64{source} << 8) |
+                  (u64{1} << 39) | (u64{1} << 40));
+             break;
+-        case 0x2bf: // UPOPC, as POPC of the uniform's register.
+-            if (dest >= 16 || insn.words[1] >= 16 || insn.words[2] != 0x08000000 || native_predicate != 7)
++        }
++        case 0x2bf: { // UPOPC, as POPC of the uniform's register.
++            const u32 target = uniform_register(static_cast<u32>(dest));
++            const u32 source = uniform_register(insn.Bits(32, 8));
++            if (dest == 63 || target == ~0U || source == ~0U || (insn.words[1] & ~0xffU) ||
++                insn.words[2] != 0x08000000 || native_predicate != 7)
+                 return fail(index, "native uniform population count mode");
+-            emit(0x5c08000000000000ULL | predicate | (dest + 216) | (u64{insn.words[1] + 216} << 20));
++            emit(0x5c08000000000000ULL | predicate | target | (u64{source} << 20));
+             break;
++        }
+         case 0x3a1: { // MATCH.ALL with only the all-equal predicate retained.
+             const u32 source = insn.Bits(24, 8), target = insn.Bits(81, 3);
+             const u32 words = insn.Bits(73, 1) ? 2U : 1U;
+@@ -1743,24 +1773,30 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+             emit(0xf0c8000000000000ULL | predicate | target | (u64{special} << 20));
+             break;
+         }
+-        case 0x28c: case 0x88c: { // UISETP, signed (bit 73) or unsigned, combined (bits 74-75) with UPn.
++        case 0x28c: case 0x88c: { // UISETP, signed (bit 73) or unsigned, combined (bits 74-75) with UPn; a UPn guard is swapped in beside it (upstream).
+             const u32 output = insn.Bits(81, 3);
+             const u32 a = uniform_register(insn.Bits(24, 8)), b = opcode == 0x88c ? 252U : uniform_register(insn.Bits(32, 8));
+             const u32 combine = insn.Bits(87, 3), combine_op = insn.Bits(74, 2);
+             if (output > 6 || insn.Bits(84, 3) != 7 || insn.Bits(72, 1) || combine_op == 3 ||
+-                insn.Bits(12, 4) != 7 || a == ~0U || b == ~0U)
++                a == ~0U || b == ~0U)
+                 return fail(index, "native uniform comparison mode");
+-            // The combined UPn is swapped in from R239 bit 6-n, as Maxwell ISETP's Pc (UPT stays PT).
+             const u32 temporary = 6 - output, combine_slot = combine == 7 ? 7U : 6 - combine;
+             const u32 combine_mask = combine == 7 ? 0U : 1U << combine_slot;
+-            const u32 mask = (1U << temporary) | combine_mask;
+-            if (opcode == 0x88c) mov_imm(252, insn.words[1]);
++            const bool guarded = native_predicate != 7;
++            const u32 temporary_mask = 1U << temporary;
++            const u32 load_mask = combine_mask | (guarded ? temporary_mask | 1U << guard_slot : 0U);
++            const u32 mask = temporary_mask | load_mask;
++            if (opcode == 0x88c)
++                emit(0x0100000000000000ULL | (u64{7} << 16) | 252 | (u64{15} << 12) |
++                     (u64{insn.words[1]} << 20));
+             emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20));
+-            if (combine_mask) emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{combine_mask} << 20));
+-            emit(0x5b60000000070000ULL | 7 | (u64{temporary} << 3) |
+-                (u64{a} << 8) | (u64{b} << 20) | (u64{combine_slot} << 39) | (u64{insn.Bits(90, 1)} << 42) |
+-                (u64{combine_op} << 45) | (u64{insn.Bits(73, 1)} << 48) | (u64{insn.Bits(76, 3)} << 49));
+-            emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{1U << temporary} << 20));
++            if (load_mask) emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{load_mask} << 20));
++            emit(0x5b60000000000000ULL |
++                (u64{guarded ? (native_predicate & 8) | guard_slot : 7U} << 16) | 7 | (u64{temporary} << 3) |
++                (u64{a} << 8) | (u64{b} << 20) | (u64{combine_slot} << 39) |
++                (u64{insn.Bits(90, 1)} << 42) | (u64{combine_op} << 45) | (u64{insn.Bits(73, 1)} << 48) |
++                (u64{insn.Bits(76, 3)} << 49));
++            emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{temporary_mask} << 20));
+             emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{mask} << 20));
+             break;
+         }
+@@ -3094,7 +3130,7 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+                  (u64{insn.Bits(78, 2)} << 39));
+             break;
+         }
+-        case 0x207: case 0x807: case 0xa07: { // Bitwise SEL
++        case 0x207: case 0x807: case 0xa07: case 0xc07: { // Bitwise SEL (0xc07: a uniform register B)
+             const u32 a = operand(0, false), b = operand(1, false);
+             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
+                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
+@@ -3833,4 +3869,18 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
+     return fail(static_cast<u32>(code.size()), main_exited ? "native program lacks captured library return" : "native program has no unconditional EXIT");
+ }
+ 
++inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geometry_stage = false,
++                                     bool support_cooperative_matrix = false) {
++    // Programs using uniform registers above UR27 are lowered again with mirrors for them.
++    u32 high_uniforms = 0;
++    for (;;) {
++        LoweredProgram lowered = LowerToMaxwellWith(code, high_uniforms, geometry_stage,
++                                                    support_cooperative_matrix);
++        if (lowered || lowered.high_uniform_registers <= high_uniforms ||
++            lowered.high_uniform_registers > 36)
++            return lowered;
++        high_uniforms = lowered.high_uniform_registers;
++    }
++}
++
+ } // namespace Shader::Ampere
+diff --git a/src/tests/video_core/ampere_f2i.cpp b/src/tests/video_core/ampere_f2i.cpp
+index 8152e46967..81eafbb89d 100644
+--- a/src/tests/video_core/ampere_f2i.cpp
++++ b/src/tests/video_core/ampere_f2i.cpp
+@@ -5,6 +5,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "tests/video_core/ampere_high_uniforms.h"
+ 
+ namespace {
+ using Shader::Ampere::Instruction;
+@@ -87,11 +88,16 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
+         invalid[0].words[1] = source;
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+     }
+-    for (const u32 source : {28U, 62U, 64U, 216U}) {
++    for (const u32 source : {64U, 216U}) {
+         auto invalid = code;
+         invalid[0].words = {0x00157d05, source, 0x0821e100, 0x0001e400};
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+     }
++    for (const u32 source : {28U, 62U}) { // once unmapped: mirrored below R216
++        auto mirrored = code;
++        mirrored[0].words = {0x00157d05, source, 0x0821e100, 0x0001e400};
++        RequireHighUniformMirror(mirrored, source);
++    }
+     for (const u32 source : {0x00400440U, 0x04800400U, 0x40400400U, 0x80400400U}) {
+         auto invalid = code;
+         invalid[0].words = {0x00157b05, source, 0x0021e100, 0x0001e400};
+@@ -279,11 +285,16 @@ TEST_CASE("Ampere uniform votes reject unmapped registers and unsupported fields
+         {{0x00107886, 0, 0x038e0100, 0x000fe400}},
+         {{0x0000794d, 0, 0x03800000, 0}},
+     }};
+-    for (const u32 target : {28U, 62U, 64U}) {
++    {
+         auto invalid = code;
+-        invalid[0].words[0] = 0x00007886U | (target << 16);
++        invalid[0].words[0] = 0x00007886U | (64U << 16);
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+     }
++    for (const u32 target : {28U, 62U}) { // once unmapped: mirrored below R216
++        auto mirrored = code;
++        mirrored[0].words[0] = 0x00007886U | (target << 16);
++        RequireHighUniformMirror(mirrored, target);
++    }
+     for (const u32 bit : {12U, 24U, 32U, 64U, 73U, 74U, 80U, 84U, 91U}) {
+         auto invalid = code;
+         invalid[0].words[bit / 32] ^= 1U << (bit % 32);
+diff --git a/src/tests/video_core/ampere_high_uniforms.h b/src/tests/video_core/ampere_high_uniforms.h
+new file mode 100644
+index 0000000000..c205aaecf1
+--- /dev/null
++++ b/src/tests/video_core/ampere_high_uniforms.h
+@@ -0,0 +1,31 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <algorithm>
++#include <span>
++#include <catch2/catch_test_macros.hpp>
++
++#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++
++// Uniform registers UR28-UR62 used to be unmapped, and a program naming one was rejected. They are
++// mirrored just below R216 now: the lowering first reports how many mirror registers the program
++// needs (UR28 is the first, in pairs), then lowers it again with UR28 at R(216 - needed). Checks
++// both steps for a program whose highest uniform register is `uniform`, and that the lowered code
++// names its mirror (unless the instruction's lowering never reads that operand).
++inline void RequireHighUniformMirror(std::span<const Shader::Ampere::Instruction> code, u32 uniform,
++                                     bool named = true) {
++    const u32 needed = (uniform - 26) & ~1U;
++    const auto without = Shader::Ampere::LowerToMaxwellWith(code, 0, false, false);
++    REQUIRE_FALSE(static_cast<bool>(without));
++    REQUIRE(without.high_uniform_registers == needed);
++    const auto lowered = Shader::Ampere::LowerToMaxwell(code);
++    INFO(lowered.error);
++    REQUIRE(static_cast<bool>(lowered));
++    if (!named) return;
++    const u32 mirror = 216 - needed + (uniform - 28);
++    REQUIRE(std::any_of(lowered.instructions.begin(), lowered.instructions.end(), [&](u64 word) {
++        return (word & 0xff) == mirror || ((word >> 8) & 0xff) == mirror ||
++               ((word >> 20) & 0xff) == mirror || ((word >> 39) & 0xff) == mirror;
++    }));
++}
+diff --git a/src/tests/video_core/ampere_kirby.cpp b/src/tests/video_core/ampere_kirby.cpp
+index 6c81a0dc66..2cc01633fb 100644
+--- a/src/tests/video_core/ampere_kirby.cpp
++++ b/src/tests/video_core/ampere_kirby.cpp
+@@ -5,6 +5,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "tests/video_core/ampere_high_uniforms.h"
+ 
+ namespace {
+ using Shader::Ampere::Instruction;
+@@ -29,11 +30,16 @@ TEST_CASE("Ampere reciprocal accepts the captured uniform source form", "[video_
+     const auto predicated = LowerToMaxwell(code);
+     REQUIRE(static_cast<bool>(predicated));
+     REQUIRE(((predicated.instructions.front() >> 16) & 15) == 1);
+-    for (const u32 source : {28U, 62U, 64U, 0x00400008U, 0x20000008U}) {
++    for (const u32 source : {64U, 0x00400008U, 0x20000008U}) {
+         auto invalid = code;
+         invalid[0].words[1] = source;
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+     }
++    for (const u32 source : {28U, 62U}) { // once unmapped: mirrored below R216
++        auto mirrored = code;
++        mirrored[0].words[1] = source;
++        RequireHighUniformMirror(mirrored, source);
++    }
+     // A negated source (bit 63) was rejected as unproved. Uniform ALU sources carry .ABS and .NEG
+     // in bits 62 and 63 like register sources (see operand() in the lowering), and five of Ocarina
+     // of Time's gameplay shaders take MUFU.RCP of -UR8: the modifier is applied to a scratch copy
+@@ -117,8 +123,11 @@ TEST_CASE("Ampere floating comparisons accept uniform sources without losing FTZ
+     REQUIRE(lowered.instructions.front() ==
+             (0x5bb0000000070000ULL | 7ULL | (255ULL << 8) | (220ULL << 20) | (7ULL << 39) |
+              (1ULL << 47) | (12ULL << 48)));
++    auto mirrored = code; // UR28, once unmapped: mirrored below R216
++    mirrored[0].words[1] = 28;
++    RequireHighUniformMirror(mirrored, 28);
+     auto invalid = code;
+-    invalid[0].words[1] = 28;
++    invalid[0].words[1] = 64;
+     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+     auto alias = code;
+     alias[0].words[0] = 0xdc007c0b;
+@@ -209,13 +218,21 @@ TEST_CASE("Ampere warp reductions reject unsupported modes and uniform destinati
+         }};
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+     }
+-    for (const u32 destination : {28U, 63U}) {
++    {
+         const std::array<Instruction, 2> code{{
+-            {{0x030073c4U | (destination << 16), 0, 0x4000, 0x000ea200}},
++            {{0x030073c4U | (63U << 16), 0, 0x4000, 0x000ea200}},
+             {{0x0000794d, 0, 0x03800000, 0}},
+         }};
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+     }
++    {
++        // UR28 as the destination, once unmapped: mirrored below R216.
++        const std::array<Instruction, 2> code{{
++            {{0x030073c4U | (28U << 16), 0, 0x4000, 0x000ea200}},
++            {{0x0000794d, 0, 0x03800000, 0}},
++        }};
++        RequireHighUniformMirror(code, 28);
++    }
+ }
+ 
+ TEST_CASE("Ampere warp match supports 32-bit and 64-bit sources", "[video_core][ampere]") {
+diff --git a/src/tests/video_core/ampere_mesh.cpp b/src/tests/video_core/ampere_mesh.cpp
+index 8a02f4e0f7..554fd88e76 100644
+--- a/src/tests/video_core/ampere_mesh.cpp
++++ b/src/tests/video_core/ampere_mesh.cpp
+@@ -64,11 +64,22 @@ TEST_CASE("Ampere uniform population count uses uniform registers and rejects un
+     INFO(lowered.error);
+     REQUIRE(lowered);
+     REQUIRE(lowered.instructions[0] == (0x5c08000000070000ULL | 218 | (u64{219} << 20)));
++    // UR16 and up as the destination or the source were rejected (the handler knew UR0-UR15
++    // only); every mirrored uniform register is taken now. UR16 lives in R232.
++    const auto high_destination =
++        LowerToMaxwell(std::array{Instruction{{0x001072bf, 3, 0x08000000, 0}}, Exit});
++    REQUIRE(high_destination);
++    REQUIRE(high_destination.instructions[0] == (0x5c08000000070000ULL | 232 | (u64{219} << 20)));
++    const auto high_source =
++        LowerToMaxwell(std::array{Instruction{{0x000272bf, 16, 0x08000000, 0}}, Exit});
++    REQUIRE(high_source);
++    REQUIRE(high_source.instructions[0] == (0x5c08000000070000ULL | 218 | (u64{232} << 20)));
+     for (const Instruction invalid : std::array{
+-             Instruction{{0x001072bf, 3, 0x08000000, 0}},
+-             Instruction{{0x000272bf, 16, 0x08000000, 0}},
+              Instruction{{0x000262bf, 3, 0x08000000, 0}},
+-             Instruction{{0x000272bf, 3, 0, 0}}}) {
++             Instruction{{0x000272bf, 3, 0, 0}},
++             Instruction{{0x000272bf, 0x80000003, 0x08000000, 0}},
++             Instruction{{0x003f72bf, 3, 0x08000000, 0}},
++             Instruction{{0x000272bf, 64, 0x08000000, 0}}}) {
+         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+     }
+ }
+diff --git a/src/tests/video_core/ampere_ocarina_gameplay.cpp b/src/tests/video_core/ampere_ocarina_gameplay.cpp
+index 421ec00ce9..f4ce7a2bde 100644
+--- a/src/tests/video_core/ampere_ocarina_gameplay.cpp
++++ b/src/tests/video_core/ampere_ocarina_gameplay.cpp
+@@ -9,6 +9,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "tests/video_core/ampere_high_uniforms.h"
+ 
+ namespace {
+ using Shader::Ampere::Instruction;
+@@ -163,9 +164,20 @@ TEST_CASE("Ampere half per-tap gathers prove offsets across an unrelated LEA.HI"
+ }
+ 
+ TEST_CASE("Ampere Ocarina forms left rejected", "[video_core][ampere][ocarina]") {
+-    // Uniform registers above UR27 have no mirror (R2UR UR29): two gameplay shaders still wait.
+-    REQUIRE_FALSE(Lowers({{0x071d73c2, 0x00000000, 0x000e0000, 0x020ee200}}));
+     // F2I keeps rejecting the absolute modifier, and a texel offset with .F16 results.
+     REQUIRE_FALSE(Lowers({{0x00037305, 0x40000013, 0x0021f100, 0x000fe200}}));
+     REQUIRE_FALSE(Lowers({{0x04047b66, 0x30000c02, 0x049e98ff, 0x000f4200}}));
+ }
++
++TEST_CASE("Ampere Ocarina gameplay programs use uniform registers above UR27",
++          "[video_core][ampere][ocarina]") {
++    // R2UR UR29, R7 (071d73c2) and R2UR UR28, R7: six gameplay graphics programs.
++    RequireHighUniformMirror(std::array{Instruction{{0x071d73c2, 0, 0x000e0000, 0x020ee200}}, Exit}, 29);
++    RequireHighUniformMirror(std::array{Instruction{{0x071c73c2, 0, 0x000e0000, 0x020ee200}}, Exit}, 28);
++    // The same programs take UBREV and UFLO of UR16 and up, and a guarded UISETP.
++    REQUIRE(Lowers({{0x000472be, 0x00000014, 0x08000000, 0x000fc800}}));
++    REQUIRE(Lowers({{0x001572bd, 0x00000015, 0x080e0400, 0x000fe400}}));
++    REQUIRE(Lowers({{0x00147882, 0x00000020, 0x00000000, 0x000fe200}}));
++    REQUIRE(Lowers({{0x1500488c, 0x0000001f, 0x0bf04070, 0x000fe200}}));
++    REQUIRE(Lowers({{0x04037c07, 0x00000007, 0x08000000, 0x000fe400}}));
++}
+diff --git a/src/tests/video_core/ampere_pokopia_compute.cpp b/src/tests/video_core/ampere_pokopia_compute.cpp
+index 364b5638d9..9373d4796c 100644
+--- a/src/tests/video_core/ampere_pokopia_compute.cpp
++++ b/src/tests/video_core/ampere_pokopia_compute.cpp
+@@ -6,6 +6,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "tests/video_core/ampere_high_uniforms.h"
+ 
+ namespace {
+ using Shader::Ampere::Instruction;
+@@ -106,9 +107,14 @@ TEST_CASE("Ampere UPRMT lowers as PRMT on the GPRs of its uniform registers",
+     INFO(reference.error);
+     REQUIRE(static_cast<bool>(reference));
+     REQUIRE(lowered.instructions == reference.instructions);
+-    // An unmapped uniform third source is rejected.
++    // A uniform third source above UR27 (UR48), once unmapped and rejected: mirrored below R216.
++    auto high = uprmt;
++    high.words[2] = 0x08000030;
++    // (This selector, 0x9910, never reads the third source: the mirror is not named.)
++    RequireHighUniformMirror(std::array{high, Exit}, 48, false);
++    // No such register: rejected.
+     auto unmapped = uprmt;
+-    unmapped.words[2] = 0x08000030; // UR48
++    unmapped.words[2] = 0x08000040;
+     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(std::array{unmapped, Exit})));
+ }
+ 
+diff --git a/src/tests/video_core/ampere_release_f2i.cpp b/src/tests/video_core/ampere_release_f2i.cpp
+index ea8e967a03..af06762726 100644
+--- a/src/tests/video_core/ampere_release_f2i.cpp
++++ b/src/tests/video_core/ampere_release_f2i.cpp
+@@ -6,6 +6,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "tests/video_core/ampere_high_uniforms.h"
+ 
+ namespace {
+ using Shader::Ampere::Instruction;
+@@ -116,10 +117,13 @@ TEST_CASE("Ampere unflushed truncating F2I rejects reserved fields and modes",
+     invalid = RegisterTruncation;
+     invalid[0].words = {0x00027d05, 5, 0x0020f000, 0x000e3000};
+     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+-    for (const u32 source : {28U, 62U, 64U}) {
+-        invalid = RegisterTruncation;
+-        invalid[0].words = {0x00027d05, source, 0x0820f000, 0x000e3000};
+-        REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
++    invalid = RegisterTruncation;
++    invalid[0].words = {0x00027d05, 64, 0x0820f000, 0x000e3000};
++    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
++    for (const u32 source : {28U, 62U}) { // once unmapped: mirrored below R216
++        auto mirrored = RegisterTruncation;
++        mirrored[0].words = {0x00027d05, source, 0x0820f000, 0x000e3000};
++        RequireHighUniformMirror(mirrored, source);
+     }
+ }
+ 
+diff --git a/src/tests/video_core/ampere_uniform_lea.cpp b/src/tests/video_core/ampere_uniform_lea.cpp
+index 58c917e22a..54c5dd6d8c 100644
+--- a/src/tests/video_core/ampere_uniform_lea.cpp
++++ b/src/tests/video_core/ampere_uniform_lea.cpp
+@@ -5,6 +5,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "tests/video_core/ampere_high_uniforms.h"
+ 
+ namespace {
+ using Shader::Ampere::Instruction;
+@@ -89,13 +90,21 @@ TEST_CASE("Ampere effective addresses accept a uniform addend", "[video_core][am
+                      (u64{reg} << 20) | (u64{shift} << 39)));
+         }
+     }
+-    for (const u32 source : {28U, 255U, 0x104U}) {
++    for (const u32 source : {255U, 0x104U}) {
+         const std::array<Instruction, 2> code{{
+             {{0x04067c11, source, 0x0f8e30ff, 0x020fc800}},
+             {{0x0000794d, 0, 0x03800000, 0}},
+         }};
+         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+     }
++    {
++        // UR28, once unmapped: mirrored below R216.
++        const std::array<Instruction, 2> code{{
++            {{0x04067c11, 28, 0x0f8e30ff, 0x020fc800}},
++            {{0x0000794d, 0, 0x03800000, 0}},
++        }};
++        RequireHighUniformMirror(code, 28);
++    }
+     const std::array<Instruction, 2> carry{{
+         {{0x04067c11, 4, 0x0f8030ff, 0x020fc800}},
+         {{0x0000794d, 0, 0x03800000, 0}},

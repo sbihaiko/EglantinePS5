@@ -237,7 +237,10 @@ struct Recent
 // The home screen's content.
 struct Home
 {
-    bool setup_ready = false;
+    bool setup_ready = false; // the game files folder can be read: games are listed and can start
+    // Keys and firmware passed their startup checks. Without them only unencrypted games start
+    // (NUP containers, extracted game folders); .nsp and .xci need them (Services::launch_blocked).
+    bool keys_ready = false;
     std::string status;    // a setup or launch problem; empty when there is none
     bool launch_failed = false; // the status is about the game that just failed to start
     std::string last_file; // the last game played; empty before the first one
@@ -438,6 +441,12 @@ class Services
     virtual bool game_exists(const std::string &)
     {
         return true;
+    }
+    // Why a game cannot start with this setup (an encrypted one while keys or firmware are
+    // missing), in the player's language; empty when it can.
+    virtual std::string launch_blocked(const std::string &)
+    {
+        return {};
     }
     virtual bool docked(std::uint64_t title_id) = 0;
     virtual bool set_docked(std::uint64_t title_id, bool docked) = 0;
