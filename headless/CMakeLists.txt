@@ -2363,37 +2363,8 @@ if(EDEN_PS5_OPENGL)
                 "if (completion && !completion->Wait(stop_source.get_token())) return 0;"
                 gpu_worker "${gpu_worker}")
         else()
-        # Ordered CPU reads must wake on completion, not pay a polling sleep for every read.
-        # A dedicated mutex makes publication and the wait predicate atomic with respect to
-        # parking. The stop-aware wait also wakes when shutdown cancels outstanding work.
-        set(fence_wait_old [=[        u64 signaled = state.signaled_fence.load(std::memory_order_acquire);
-        while (signaled < fence) {
-            state.signaled_fence.wait(signaled, std::memory_order_acquire);
-            signaled = state.signaled_fence.load(std::memory_order_acquire);
-        }]=])
-        string(FIND "${gpu_worker}" "${fence_wait_old}" fence_wait_at)
-        if(fence_wait_at LESS 0)
-            message(FATAL_ERROR "Pinned GPU completion wait changed")
-        endif()
-        string(REPLACE "${fence_wait_old}" [=[        std::unique_lock fence_lock{state.fence_mutex};
-        state.fence_cv.wait(fence_lock, stop_source.get_token(), [&] {
-            return state.signaled_fence.load(std::memory_order_acquire) >= fence;
-        });]=] gpu_worker "${gpu_worker}")
-        set(fence_signal_old [=[    state.signaled_fence.store(fence, std::memory_order_release);
-    if (block) {
-        state.signaled_fence.notify_all();
-    }]=])
-        string(FIND "${gpu_worker}" "${fence_signal_old}" fence_signal_at)
-        if(fence_signal_at LESS 0)
-            message(FATAL_ERROR "Pinned GPU completion signal changed")
-        endif()
-        string(REPLACE "${fence_signal_old}" [=[    {
-        std::lock_guard fence_lock{state.fence_mutex};
-        state.signaled_fence.store(fence, std::memory_order_release);
-    }
-    if (block) {
-        state.fence_cv.notify_all();
-    }]=] gpu_worker "${gpu_worker}")
+        # The core waits for its fence on a condition variable with the stop token (state.cv), so
+        # the polling wait this block used to replace, and the signal it added, are the core's now.
         endif()
         string(REPLACE "    state.queue.EmplaceWait(std::move(command_data), fence, block);"
             "    while (!stop_source.stop_requested() &&\n           !state.queue.TryEmplace(std::move(command_data), fence, block))\n        std::this_thread::sleep_for(std::chrono::microseconds(100));\n    if (stop_source.stop_requested())\n        return state.signaled_fence.load(std::memory_order_relaxed);"
@@ -2500,51 +2471,10 @@ if(EDEN_PS5_OPENGL)
             # methods, increase-once writes and engines missing from the subchannel stay per word.
             # Not with Eglantine's split: the sink belongs to its back thread and the words go through
             # its ring (and the front's register copy, which its macros read) like any other.
-            set(dma_word [=[        } else if (dma_state.method_count) {
-            auto const command_header = commands[index]; //can copy
-]=])
-            string(FIND "${command_source}" "${dma_word}" dma_word_at)
-            if(dma_word_at LESS 0)
-                message(FATAL_ERROR "Pinned DmaPusher::ProcessCommands changed")
-            endif()
-            if(EDEN_DEV_PROFILE)
-                set(dma_count_run [=[
-                    ::Eden::Performance::dma_batch_runs.store(::Eden::Performance::dma_batch_runs.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-                    ::Eden::Performance::dma_batch_words.store(::Eden::Performance::dma_batch_words.load(std::memory_order_relaxed) + run, std::memory_order_relaxed);]=])
-                set(dma_count_word [=[
-            ::Eden::Performance::dma_single_words.store(::Eden::Performance::dma_single_words.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);]=])
-            else()
-                set(dma_count_run "")
-                set(dma_count_word "")
-            endif()
-            string(REPLACE "${dma_word}" "        } else if (dma_state.method_count) {
-            if (!dma_increment_once && dma_state.method >= non_puller_methods &&
-                ::Eden::Performance::dma_batch.load(std::memory_order_relaxed) &&
-                !VideoCommon::GpuSplit::Get().Active()) {
-                auto* const engine = subchannels[dma_state.subchannel];
-                if (engine) {
-                    const auto& mask = engine->execution_mask;
-                    const u32 available = u32(std::min<std::size_t>(dma_state.method_count, commands.size() - index));
-                    const u32 limit = dma_state.method < mask.size()
-                        ? u32(std::min<std::size_t>(available, mask.size() - dma_state.method)) : 0;
-                    u32 run = 0;
-                    while (run < limit && !mask[dma_state.method + run])
-                        ++run;
-                    if (run != 0) {
-                        auto& sink = engine->method_sink;
-                        for (u32 i = 0; i < run; ++i)
-                            sink.emplace_back(dma_state.method + i, commands[index + i].argument);
-                        dma_state.method += run;
-                        dma_state.method_count -= run;
-                        index += run;
-${dma_count_run}
-                        continue;
-                    }
-                }
-            }
-${dma_count_word}
-            auto const command_header = commands[index]; //can copy
-" command_source "${command_source}")
+            # The core batches consecutive store-only methods itself ("Fast-path batching for
+            # consecutive non-execution methods in increasing mode"), so the port's dma_batch
+            # sink is not pinned here any more.
+
             string(PREPEND command_source "#include <atomic>\n#include \"${EDEN_PORT_DIR}/performance.h\"\n")
         endif()
         string(PREPEND command_source "#include <chrono>\n")
@@ -2690,7 +2620,9 @@ list(REMOVE_ITEM video_sources texture_cache/util.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/texture_cache_util.cpp")
 list(REMOVE_ITEM video_sources shader_environment.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/shader_environment.cpp")
-include("${EDEN_PORT_DIR}/macro_native.cmake")
+# The core runs Maxwell macros on its own JIT now (engine.native_jit, TuringMacroJit): the front
+# dispatch the port used to hook through MacroNative::TryRun has no native_front_matches to hook,
+# so macro_native.cmake is not included. macro_recovery.cmake still applies.
 set_property(TARGET video_core PROPERTY SOURCES "${video_sources}")
 
 if(PS5_NATIVE)
