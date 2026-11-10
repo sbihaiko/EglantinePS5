@@ -22,6 +22,7 @@
 #include "loading_scene_glsl.h"
 #include "preferences.h"
 #include "diagnostics.h"
+#include "hang_watchdog.h"
 #include "display_refresh.h"
 #include "graphics.h"
 #include "common/scope_exit.h"
@@ -742,6 +743,8 @@ void GraphicsWindow::OnFrameDisplayed() {
                             hud_size.load(std::memory_order_relaxed), hud_corner.load(std::memory_order_relaxed));
 #endif
         ++frame_total;
+        // A present arrived, so the process is not hung (hang_watchdog.h).
+        Eden::HangWatch::NotePresent(now, frame_total);
         Eden::OrderedReadTrace::Frame(frame_total,
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());

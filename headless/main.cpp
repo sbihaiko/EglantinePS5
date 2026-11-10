@@ -66,6 +66,7 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "guest_clock.h"
 #include "performance.h"
 #include "crash_site.h"
+#include "hang_watchdog.h"
 #include "core/memory.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/host1x/host1x.h"
@@ -1723,6 +1724,16 @@ int main(int argc, char** argv) {
                 }
                 Eden::TakeGuestFault(); // Nothing from an earlier session belongs to this one.
                 Eden::Loading::Set(Eden::Loading::Step::starting);
+                // A silent freeze leaves no crash file, so the watchdog dumps every guest thread
+                // when presents stop (hang_watchdog.h, EDEN_HANG_WATCHDOG_SECS).
+                static Core::System* hang_system = nullptr;
+                hang_system = &system;
+                Eden::HangWatch::Start([](const char* reason) {
+                    auto* const running = hang_system;
+                    if (!running || !running->IsPoweredOn()) return;
+                    if (auto* process = running->ApplicationProcess())
+                        Eden::CrashSite::DumpThreads(reason, *process);
+                });
                 // The memory report's kernel-side figure (performance.cpp), for this game.
                 static Core::System* reporting_system = nullptr;
                 reporting_system = &system;
