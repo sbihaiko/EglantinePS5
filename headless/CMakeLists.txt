@@ -1251,23 +1251,38 @@ if(PS5_NATIVE)
         nso_source "${nso_source}")
     # A segment is decoded where it belongs (read there directly when it is not compressed), and
     # a segment that does not decode ends the load instead of the app.
-    set(old_nso_segment [=[            if (nso_header.IsSegmentCompressed(i)) {
+    # The segment decodes straight into the image the codeset already owns, so a segment is
+    # never decompressed through a buffer the PS5 heap would have to hold.
+    set(old_nso_segment [==[            if (nso_header.IsSegmentCompressed(i)) {
+                const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
+                        std::span<u8>{decompressed_size}.first(segment_size),
                         std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
                     );
-                    ASSERT(r > 0);
+                    // A failed segment would leave the previous segment's bytes in the buffer and
+                    // boot a corrupt image that hangs without presenting; refuse to load instead.
+                    if (r <= 0) {
+                        LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
+                                  nso_file.GetName(), i);
+                        return std::nullopt;
+                    }
+                    if (static_cast<u32>(r) != segment_size) {
+                        LOG_WARNING(Loader, "{}: segment {} decompressed to {:#x} of {:#x} bytes",
+                                    nso_file.GetName(), i, r, segment_size);
+                        std::fill(decompressed_size.begin() + r,
+                                  decompressed_size.begin() + segment_size, u8{0});
+                    }
                 } else {
                     // LZ4 compression
                     int r = Common::Compression::DecompressDataLZ4(
                         decompressed_size.data(),
-                        nso_header.segments[i].size,
+                        segment_size,
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    ASSERT(r == int(nso_header.segments[i].size));
+                    ASSERT(r == int(segment_size));
                 }
 
                 std::memcpy(
@@ -1283,24 +1298,41 @@ if(PS5_NATIVE)
                     nso_header.segments[i].size
                 );
             }
-]=])
+]==])
     string(FIND "${nso_source}" "${old_nso_segment}" nso_segment_at)
     if(nso_segment_at LESS 0)
         message(FATAL_ERROR "Pinned NSO segment decoding changed")
     endif()
-    string(REPLACE "${old_nso_segment}" [=[            if (nso_header.IsSegmentCompressed(i)) {
+    string(REPLACE "${old_nso_segment}" [==[            if (nso_header.IsSegmentCompressed(i)) {
+                const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
+                    // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{destination, nso_header.segments[i].size},
-                        std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i]));
-                    if (r <= 0) return std::nullopt;
+                        std::span<u8>{destination, segment_size},
+                        std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
+                    );
+                    // A failed segment would leave the previous segment's bytes in place and boot a
+                    // corrupt image that hangs without presenting; refuse to load instead.
+                    if (r <= 0) {
+                        LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
+                                  nso_file.GetName(), i);
+                        return std::nullopt;
+                    }
+                    if (static_cast<u32>(r) != segment_size) {
+                        std::fill(destination + r, destination + segment_size, u8{0});
+                    }
                 } else {
-                    const int r = Common::Compression::DecompressDataLZ4(destination, nso_header.segments[i].size,
-                        compressed_data.data(), nso_header.segments_compressed_size[i]);
-                    if (r != int(nso_header.segments[i].size)) return std::nullopt;
+                    // LZ4 compression
+                    const int r = Common::Compression::DecompressDataLZ4(
+                        destination,
+                        segment_size,
+                        compressed_data.data(),
+                        nso_header.segments_compressed_size[i]
+                    );
+                    if (r != int(segment_size)) return std::nullopt;
                 }
             }
-]=] nso_source "${nso_source}")
+]==] nso_source "${nso_source}")
     endif()
     # Cheats address the game's main module. Eden registers a cheat list for every module that
     # has one, and the last registration wins: a cheat file without a build ID in its name
