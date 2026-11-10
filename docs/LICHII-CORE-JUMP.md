@@ -23,6 +23,17 @@ replaces most of them; the rest is either ported into the port itself or set asi
     `lower_to_maxwell.h` lowers `UIMAD.WIDE.U32` with an immediate, uniform IMAD with a
     constant-buffer operand and the UIADD3 carries, and HMMA is expanded in software (0x23c).
     Ocarina's title screen needs no patch on this core.
+  - **0068 (Ocarina of Time gameplay) needs no port either**, measured 2026-11-10 rather than assumed:
+    the parent's `ampere_ocarina_gameplay` cases were compiled against this core's
+    `lower_to_maxwell.h` and all 26 gameplay forms lower (ISETP.EX with an input predicate, FRND from
+    a constant buffer, TXQ masks, RED.F32, S2R 132, ATOMS.POPC.INC, SHF/USHF 64-bit, F2I of `-Rb`,
+    TLD.LZ with a texel offset, TLD4 arrays and depth compares, TEX with a uniform handle, TXD with
+    fewer than four channels, REDUX.MIN.S32, USEL under a `UP0` guard, a mirrored UR move, guest
+    R247, LEA.HI `-Rb`, SURED non-ADD, MUFU of a negated uniform), and the per-tap gather proof
+    accepts the 1080p upscaler's `TLD4...PTP` and rejects nonconstant offsets. Its second half is
+    superseded: `BypassOotNetwork` skips only the prepass and network keys, so other tensor programs
+    — the gameplay upscaler among them — run. Do not cherry-pick `eb1efeeb`: it only adds the patch
+    file, and this branch has no patch series to apply it to.
 
 ## What the jump changed in the port
 
