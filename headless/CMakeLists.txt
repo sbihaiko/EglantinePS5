@@ -38,6 +38,16 @@ function(write_derived path content)
     configure_file("${path}.in" "${path}" COPYONLY)
 endfunction()
 include("${EDEN_PORT_DIR}/pipeline_wait.cmake")
+# The PS5 SDK defines PAGE_SIZE in a header the CPU side pulls in; StalePages' own constant of that
+# name then parses as a number. Rename the constant in a copy the target sees first.
+file(READ "${PROJECT_SOURCE_DIR}/src/video_core/texture_cache/stale_pages.h" stale_pages_header)
+string(FIND "${stale_pages_header}" "static constexpr u64 PAGE_SIZE" stale_pages_at)
+if(NOT stale_pages_at LESS 0)
+    string(REPLACE "PAGE_SIZE" "STALE_PAGE_SIZE" stale_pages_header "${stale_pages_header}")
+    write_derived("${PORT_BUILD_DIR}/stale-pages/video_core/texture_cache/stale_pages.h"
+        "${stale_pages_header}")
+    target_include_directories(video_core BEFORE PRIVATE "${PORT_BUILD_DIR}/stale-pages")
+endif()
 set(MULTIPLAYER_SOURCE "${PROJECT_SOURCE_DIR}")
 set(MULTIPLAYER_OUTPUT "${PORT_BUILD_DIR}/multiplayer")
 include("${EDEN_PORT_DIR}/multiplayer_packets.cmake")
