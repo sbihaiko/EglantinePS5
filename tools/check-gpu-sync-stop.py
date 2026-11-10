@@ -17,12 +17,12 @@ code=r'''
 using u64=unsigned long long;
 // TickWork ends a fast draw chain (video_core/nx2_fast_draw.h); nothing to chain here.
 namespace VideoCommon::Nx2FastDraw {enum class Reason{TickWork};inline void Break(Reason){}}
-struct Worker {std::thread t;std::atomic_bool stopping{};void Stop(){stopping=true;if(t.joinable())t.join();}void TickGPU(bool){}void InvalidateReadbackCache(){}};
+struct Worker {std::thread t;std::atomic_bool stopping{};void Stop(){stopping=true;if(t.joinable())t.join();}void NotifyShutdown(){Stop();}void TickGPU(bool){}void InvalidateReadbackCache(){}};
 struct GPU {
  std::mutex sync_request_mutex,sync_mutex;
  std::condition_variable sync_request_cv,sync_cv;
  std::list<std::function<void()>> sync_requests;
- bool sync_requests_stopped{},is_async=true;
+ bool sync_requests_stopped{},sync_requests_dropped{},is_async=true;
  std::atomic_bool shutting_down{};
  std::atomic<u64> current_sync_fence{};u64 last_sync_fence{};
  Worker gpu_thread;
