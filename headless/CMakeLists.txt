@@ -2569,21 +2569,10 @@ if(EDEN_DEV_PROFILE)
     list(REMOVE_ITEM video_sources engines/maxwell_3d.cpp)
     list(APPEND video_sources "${PORT_BUILD_DIR}/maxwell_3d.cpp")
 endif()
-# The shader cache file's reader checks what it reads and keeps the whole entries of a damaged
-# file (shader_cache_reader.inc; shader_cache_check.cpp checks it on the host).
-file(READ "${PROJECT_SOURCE_DIR}/src/video_core/shader_environment.cpp" shader_environment_source)
-string(FIND "${shader_environment_source}" "void LoadPipelines(" shader_reader_begin)
-string(FIND "${shader_environment_source}" "} // namespace VideoCommon" shader_reader_end REVERSE)
-if(shader_reader_begin LESS 0 OR shader_reader_end LESS shader_reader_begin)
-    message(FATAL_ERROR "Pinned shader cache reader changed")
-endif()
-string(SUBSTRING "${shader_environment_source}" 0 ${shader_reader_begin} shader_environment_head)
-string(SUBSTRING "${shader_environment_source}" ${shader_reader_end} -1 shader_environment_tail)
-string(PREPEND shader_environment_head "#include <cstdio>\n#include <new>\n#include <stdexcept>\n#include <system_error>\n")
-write_derived("${PORT_BUILD_DIR}/shader_environment.cpp"
-    "${shader_environment_head}#include \"${EDEN_PORT_DIR}/shader_cache_reader.inc\"\n\n${shader_environment_tail}")
-set_property(SOURCE "${PORT_BUILD_DIR}/shader_environment.cpp" APPEND PROPERTY OBJECT_DEPENDS
-    "${EDEN_PORT_DIR}/shader_cache_reader.inc")
+# The core's shader cache reader (shader_environment.cpp) checks what it reads and keeps whole
+# entries of a damaged file itself now: its pipeline payloads stream through ReadPipelinePayload,
+# ReadPipelinesUnchanged and ReplacePipelineCode, which the port no longer replaces. The port's own
+# reader (headless/shader_cache_reader.inc) stays on disk for the port that brings it back.
 # Eden recompresses an ASTC texture to BC1 or BC3 a mip level at a time: every layer of the level
 # is decoded into one buffer, four bytes a pixel, and then compressed. For a texture array of 121
 # layers that buffer is 484 MiB, asked of the pool the CPU shares with the GPU at the moment a game
@@ -2625,8 +2614,6 @@ string(REPLACE "${recompress_old}" [=[            // A layer at a time (headless
 write_derived("${PORT_BUILD_DIR}/texture_cache_util.cpp" "${texture_util_source}")
 list(REMOVE_ITEM video_sources texture_cache/util.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/texture_cache_util.cpp")
-list(REMOVE_ITEM video_sources shader_environment.cpp)
-list(APPEND video_sources "${PORT_BUILD_DIR}/shader_environment.cpp")
 # The core runs Maxwell macros on its own JIT now (engine.native_jit, TuringMacroJit): the front
 # dispatch the port used to hook through MacroNative::TryRun has no native_front_matches to hook,
 # so macro_native.cmake is not included. macro_recovery.cmake still applies.

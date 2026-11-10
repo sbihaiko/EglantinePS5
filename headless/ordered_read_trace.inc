@@ -319,4 +319,8 @@ extern "C" bool eden_vulkan_handoff_enabled() {
 namespace Eden::OrderedReadTrace {
 void Frame(std::uint64_t, std::uint64_t) {}
 } // namespace Eden::OrderedReadTrace
+// The scheduler asks whether the Vulkan handoff experiment is on; without the trace it is not.
+extern "C" bool eden_vulkan_handoff_enabled() {
+    return false;
+}
 #endif
