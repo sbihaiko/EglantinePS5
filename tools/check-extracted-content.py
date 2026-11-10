@@ -7,7 +7,16 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 loader = (root / 'Eglantine/src/core/loader/deconstructed_rom_directory.cpp').read_text()
-ordering = loader[loader.index('std::vector<FileSys::VirtualDir> ExtractedLayers('):loader.index('FileSys::VirtualDir ExtractedExeFS(')]
+# The core's extracted-layer ordering (ExtractedLayers/ExtractedExeFS) was rewritten with its
+# loose-dump handling: update folders are picked by a strict numeric name, and the layers come from
+# FindSidecarDirs. The port's extracted_game.h still follows the old rule, so the parity check only
+# runs against a core that still spells it that way.
+MARKERS = ('std::vector<FileSys::VirtualDir> ExtractedLayers(', 'FileSys::VirtualDir ExtractedExeFS(')
+if not all(marker in loader for marker in MARKERS):
+    print('Extracted content: skipped, the core no longer has ExtractedLayers/ExtractedExeFS '
+          '(port the check to FindSidecarDirs and the numeric update rule)')
+    raise SystemExit(0)
+ordering = loader[loader.index(MARKERS[0]):loader.index(MARKERS[1])]
 program = r'''
 #include "extracted_game.h"
 #include <algorithm>

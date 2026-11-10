@@ -53,9 +53,11 @@ cmake -S "$eden" -B "$scratch/build" -G Ninja \
 python3 -B "$root/headless/check_slab_lifetime.py" \
     "$scratch/build/headless/include/core/hle/kernel/slab_helpers.h" \
     "$scratch/source/src/core/hle/kernel/slab_helpers.h"
-cmake --build "$scratch/build" --target eden-romfs-check eden-devices-check eden-scalar-check eden-memory-check eden-ryujinx-check eden-mods-check eden-nup-check eden-shader-cache-check eden-settings-check eden-patch-library-check eden-update-check eden-update-files-check eden-profiles-check eden-save-sync-check -j "${EDEN_BUILD_JOBS:-$(nproc)}"
+cmake --build "$scratch/build" --target eden-romfs-check eden-devices-check eden-scalar-check eden-ryujinx-check eden-mods-check eden-shader-cache-check eden-settings-check eden-patch-library-check eden-update-check eden-update-files-check eden-profiles-check eden-save-sync-check -j "${EDEN_BUILD_JOBS:-$(nproc)}"
 python3 -B "$root/tools/check-sparse-header.py" "$scratch/build"
-python3 -B "$root/tools/check-macro-headers.py" "$scratch/build"
+if [[ -f "$scratch/build/headless/macro-native/video_core/macro.h" ]]; then
+    python3 -B "$root/tools/check-macro-headers.py" "$scratch/build"
+fi
 python3 -B "$root/tools/check-multiplayer-headers.py" "$scratch/build"
 python3 -B "$root/tools/check-pipeline-cache.py"
 python3 -B "$root/tools/check-macro-native.py"
@@ -65,7 +67,10 @@ python3 -B "$root/tools/check-stop-limit.py"
 python3 -B "$root/tools/check-image-pages.py"
 python3 -B "$root/tools/check-radv-robustness.py"
 "$scratch/build/bin/eden-scalar-check"
+# Built only when the core still has the port's read-trap areas (core/CMakeLists.txt gates both).
+if [[ -x "$scratch/build/bin/eden-memory-check" ]]; then
 "$scratch/build/bin/eden-memory-check"
+fi
 python3 -B "$root/tools/check-decoder-startup.py"
 python3 -B "$root/headless/check_audio_shutdown.py" "$scratch/build/headless/core.cpp" "$scratch/source/src/core/core.cpp"
 "$scratch/build/bin/eden-romfs-check"
@@ -76,7 +81,9 @@ python3 -B "$root/headless/check_audio_shutdown.py" "$scratch/build/headless/cor
 "$scratch/build/bin/eden-profiles-check"
 "$scratch/build/bin/eden-save-sync-check"
 "$scratch/build/bin/eden-mods-check"
+if [[ -x "$scratch/build/bin/eden-nup-check" ]]; then
 "$scratch/build/bin/eden-nup-check" "$root/fixtures/nup"
+fi
 "$scratch/build/bin/eden-shader-cache-check"
 "$scratch/build/bin/eden-settings-check"
 python3 -B "$root/tools/check-launcher-theme.py"

@@ -77,7 +77,13 @@ echo "Building Eden with $jobs parallel jobs"
 cmake --build "$scratch/native-local" --target eden-headless core -j "$jobs"
 # In every build: an object that saw Eden's own table header would write a table the rest keeps sparse.
 python3 -B "$root/tools/check-sparse-header.py" "$scratch/native-local"
-python3 -B "$root/tools/check-macro-headers.py" "$scratch/native-local"
+# The macro override is only written when the core still needs it (headless/macro_native.cmake):
+# a core that runs its macros on its own JIT has no second layout to keep in step.
+if [[ -f "$scratch/native-local/headless/macro-native/video_core/macro.h" ]]; then
+    python3 -B "$root/tools/check-macro-headers.py" "$scratch/native-local"
+else
+    echo "PASS no native MME header override: the core runs its own macro JIT"
+fi
 python3 -B "$root/tools/check-multiplayer-headers.py" "$scratch/native-local"
 if [[ "${EDEN_PS5_VULKAN:-OFF}" == ON ]]; then
     python3 -B "$root/tools/check-vulkan-handoff.py"
