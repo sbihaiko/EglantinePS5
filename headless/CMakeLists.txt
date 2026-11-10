@@ -1106,14 +1106,9 @@ endif()
 # The 64-bit window (src/host_memory.cpp, Window64) leaves most of a Switch 2 title's accesses on
 # the page-table path (sites demoted off the window): their reads of GPU-tracked pages keep the
 # no-arena rule that a page the GPU never wrote has nothing to flush, instead of all going through
-# the GPU thread. The A32 window's checked fastmem keeps upstream's rule.
-set(unwritten_old "if (unwritten_reads_direct && nx2 && !current_page_table->fastmem_arena) {")
-string(FIND "${arena_source}" "${unwritten_old}" unwritten_at)
-if(unwritten_at LESS 0)
-    message(FATAL_ERROR "Pinned unwritten-read rule changed (fastmem window)")
-endif()
-string(REPLACE "${unwritten_old}" "if (unwritten_reads_direct && nx2 && (!current_page_table->fastmem_arena || ::Eden::Fastmem::Window64Base() != 0)) {"
-    arena_source "${arena_source}")
+# the GPU thread. The core now carries that rule itself as read traps (EDEN_NX2_READ_TRAPS,
+# RasterizerArmReadTraps): a GPU write arms the pages, and a read of an armed page takes the flush.
+# Nothing is pinned here any more.
 string(PREPEND arena_source "#include \"${PORT_ROOT}/src/fastmem.h\"\n")
 write_derived("${PORT_BUILD_DIR}/memory.cpp" "${arena_source}")
 list(REMOVE_ITEM core_sources "memory.cpp")
