@@ -2434,13 +2434,10 @@ if(EDEN_PS5_OPENGL)
     # through GPU::TickWork. NotifyShutdown also protects service-owned state.
     # Eden joins its worker first; here the waiters are woken first, so that a guest thread waiting
     # on the worker cannot keep it from ending.
-    set(old_gpu_shutdown "    void NotifyShutdown() {\n        gpu_thread.NotifyShutdown();\n        std::unique_lock lk{sync_mutex};\n        shutting_down.store(true, std::memory_order::relaxed);\n        sync_cv.notify_all();\n    }")
-    string(FIND "${gpu_source}" "${old_gpu_shutdown}" gpu_shutdown_offset)
-    if(gpu_shutdown_offset LESS 0)
-        message(FATAL_ERROR "Pinned GPU shutdown changed")
-    endif()
-    string(REPLACE "${old_gpu_shutdown}"
-        "    void NotifyShutdown() {\n        {\n            std::unique_lock lk{sync_mutex};\n            shutting_down.store(true, std::memory_order::relaxed);\n            sync_cv.notify_all();\n        }\n        gpu_thread.Stop();\n    }" gpu_source "${gpu_source}")
+    # The core's NotifyShutdown joins the worker and then drops the pending sync requests and
+    # releases their waiters (sync_request_mutex, sync_requests_dropped), which is the rule this
+    # pin added in the other order. Take the core's.
+
     # In-flight guest waits must also unwind before Stop can join the worker.
     foreach(unit dma_pusher engines/puller)
         file(READ "${PROJECT_SOURCE_DIR}/src/video_core/${unit}.cpp" command_source)
