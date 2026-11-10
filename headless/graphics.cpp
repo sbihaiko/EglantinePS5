@@ -596,7 +596,7 @@ bool LoadingTick(VideoCore::RendererBase& renderer, bool idle) {
             // screen's layers (a descriptor set allocation failed, then a null layer crashed).
             // Send the present through the ring so it runs in order with the guest's work.
             if (auto& split = VideoCommon::GpuSplit::Get();
-                split.Active() && !VideoCommon::GpuSplit::IsBackThread()) {
+                split.Active() && !VideoCommon::GpuSplit::OnBackThread()) {
                 split.DeferFunction([&renderer] {
                     if (vulkan_loading.load(std::memory_order_relaxed)) PresentVulkanLoading(renderer);
                 });

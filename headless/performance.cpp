@@ -536,7 +536,7 @@ extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemo
 
 #ifdef PS5_NATIVE
 // Open file descriptors by type, against the process limit, and the IOFiles Eden holds by folder
-// (Common::FS::ReportOpenFiles): a handle leak shows as one count growing every 20 s.
+// (the core used to add its own ReportOpenFiles here): a handle leak shows as one count growing.
 extern "C" void eden_fd_paths_report(FILE* out);
 static void ReportFileHandles() {
     struct rlimit limit {};
@@ -555,7 +555,6 @@ static void ReportFileHandles() {
     std::fprintf(stderr, "EDEN_FD open=%d regular=%d sockets=%d pipes=%d other=%d highest=%d limit=%lld\n",
                  regular + sockets + pipes + other, regular, sockets, pipes, other, highest,
                  static_cast<long long>(limit.rlim_cur));
-    ::Common::FS::ReportOpenFiles(stderr);
     eden_fd_paths_report(stderr);
 }
 
