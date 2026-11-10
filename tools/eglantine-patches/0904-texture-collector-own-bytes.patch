@@ -1,0 +1,22 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b8423f1f9b..2e4559391d 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -444,7 +444,16 @@ void TextureCache<P>::TickFrame() {
+         }
+     }
+     // If we can obtain the memory info, use it instead of the estimate.
+-    if (runtime.CanReportMemoryUsage()) {
++    // EDEN_NX2_TC_OWN_BYTES=1 keeps the estimate (the bytes of the cache's own images): on the PS5
++    // the device figure is the whole shared pool, guest memory included, so in Ocarina of Time it
++    // read 4.1-6.1 GiB against 1.0-1.6 GiB of images and the collector ran in aggressive mode all
++    // through gameplay (up to 7,500 images created and 1,800 downloaded per 600 frames). Set the
++    // thresholds with EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB to match.
++    static const bool own_bytes = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_OWN_BYTES");
++        return value != nullptr && value[0] != '0';
++    }();
++    if (!own_bytes && runtime.CanReportMemoryUsage()) {
+         total_used_memory = runtime.GetDeviceMemoryUsage();
+     }
+     // Every 600 frames: device memory in use against the collector's thresholds, and what the

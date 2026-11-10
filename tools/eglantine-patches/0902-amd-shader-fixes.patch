@@ -1,0 +1,219 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+index d921913b4a..e3f23102c6 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+@@ -17,7 +17,13 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
+     return op;
+ }
+ 
++// EDEN_NX2_AMD_SHADER_FIXES=1 (mja00/Lichii 913ba475da): Maxwell's FMNMX and .SAT return the
++// non-NaN operand (NaN saturates to 0). FMin, FMax and FClamp leave NaN undefined and AMD's
++// compiler passes it through, so the NaN-defined N forms are used instead.
+ Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
++    if (AmdShaderFixes()) {
++        return ctx.OpNMin(type, ctx.OpNMax(type, value, zero), one);
++    }
+     if (ctx.profile.has_broken_spirv_clamp) {
+         return ctx.OpFMin(type, ctx.OpFMax(type, value, zero), one);
+     } else {
+@@ -85,19 +91,19 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
+ }
+ 
+ Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
+-    return ctx.OpFMax(ctx.F32[1], a, b);
++    return AmdShaderFixes() ? ctx.OpNMax(ctx.F32[1], a, b) : ctx.OpFMax(ctx.F32[1], a, b);
+ }
+ 
+ Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
+-    return ctx.OpFMax(ctx.F64[1], a, b);
++    return AmdShaderFixes() ? ctx.OpNMax(ctx.F64[1], a, b) : ctx.OpFMax(ctx.F64[1], a, b);
+ }
+ 
+ Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
+-    return ctx.OpFMin(ctx.F32[1], a, b);
++    return AmdShaderFixes() ? ctx.OpNMin(ctx.F32[1], a, b) : ctx.OpFMin(ctx.F32[1], a, b);
+ }
+ 
+ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
+-    return ctx.OpFMin(ctx.F64[1], a, b);
++    return AmdShaderFixes() ? ctx.OpNMin(ctx.F64[1], a, b) : ctx.OpFMin(ctx.F64[1], a, b);
+ }
+ 
+ Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_memory.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
+index f9136e1582..2583b4297e 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
+@@ -210,8 +210,25 @@ Id EmitLoadStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Value
+     return LoadStorage32(ctx, binding, offset);
+ }
+ 
++// EDEN_NX2_AMD_SHADER_FIXES=1 (mja00/Lichii 5e8d409f81): offsets are relative to a binding base
++// aligned only to the device's storage buffer alignment (4 bytes on RADV), so the vector view
++// (offset >> 3 or 4) is right only for offsets known to be multiples of the access size; otherwise
++// it reads the vector before (Ocarina's lighting). Off, the view is taken as before.
++static bool VectorViewIsExact(EmitContext& ctx, const IR::Value& offset, u32 size) {
++    if (!ctx.profile.support_descriptor_aliasing) {
++        return false;
++    }
++    if (!AmdShaderFixes()) {
++        return true;
++    }
++    if (offset.IsImmediate()) {
++        return offset.U32() % size == 0;
++    }
++    return ctx.profile.min_ssbo_alignment >= size;
++}
++
+ Id EmitLoadStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[2]))) {
+         return LoadStorage(ctx, binding, offset, ctx.U32[2], ctx.storage_types.U32x2,
+                            sizeof(u32[2]), &StorageDefinitions::U32x2);
+     } else {
+@@ -221,7 +238,7 @@ Id EmitLoadStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value
+ }
+ 
+ Id EmitLoadStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[4]))) {
+         return LoadStorage(ctx, binding, offset, ctx.U32[4], ctx.storage_types.U32x4,
+                            sizeof(u32[4]), &StorageDefinitions::U32x4);
+     } else {
+@@ -283,7 +300,7 @@ void EmitWriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Va
+ 
+ void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                         Id value) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[2]))) {
+         WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32x2, sizeof(u32[2]),
+                      &StorageDefinitions::U32x2);
+     } else {
+@@ -296,7 +313,7 @@ void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Va
+ 
+ void EmitWriteStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                          Id value) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[4]))) {
+         WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32x4, sizeof(u32[4]),
+                      &StorageDefinitions::U32x4);
+     } else {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index c2fdd7e4f3..a7317c797e 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -8,6 +8,8 @@
+ #include <array>
+ #include <bit>
+ #include <climits>
++#include <cstdlib>
++#include <span>
+ 
+ #include <boost/container/static_vector.hpp>
+ 
+@@ -19,6 +21,15 @@
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+ 
+ namespace Shader::Backend::SPIRV {
++
++bool AmdShaderFixes() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_AMD_SHADER_FIXES");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
+ namespace {
+ enum class Operation {
+     Increment,
+@@ -1059,16 +1070,43 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+             const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
+-            callback(ssbo_pointer);
++            callback(ssbo_pointer, ssbo_id, ssbo_index);
+             AddLabel(else_label);
+         }
+     }};
++    // EDEN_NX2_AMD_SHADER_FIXES=1 (mja00/Lichii c418e4f477): buffers are bound at the device's
++    // storage buffer alignment, 4 bytes on RADV, so an aligned 8 or 16-byte guest access can sit
++    // at any word of its binding; indexing the vector view (offset >> shift) then reads the vector
++    // before it and shifts every component by one or more words (Ocarina's light colours lost
++    // their red: green lighting, cyan sky). Those accesses find their buffer once and read it word
++    // by word through the U32 view.
++    const auto split_words{[&](u32 shift) {
++        return AmdShaderFixes() && shift > 2 && profile.min_ssbo_alignment < (u64{1} << shift);
++    }};
+     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+         const Id function_type{TypeFunction(type, U64)};
+         const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
+         const Id addr{OpFunctionParameter(U64)};
++        if (split_words(shift)) {
++            const u32 count = 1U << (shift - 2);
++            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                        [&](Id, Id ssbo_id, Id word_index) {
++                            std::array<Id, 4> words{};
++                            for (u32 i = 0; i < count; ++i) {
++                                const Id index{i == 0 ? word_index
++                                                      : OpIAdd(U32[1], word_index, Const(i))};
++                                words[i] = OpLoad(U32[1], OpAccessChain(storage_types.U32.element,
++                                                                        ssbo_id, zero, index));
++                            }
++                            OpReturnValue(OpCompositeConstruct(
++                                type, std::span<const Id>{words}.first(count)));
++                        });
++            OpReturnValue(ConstantNull(type));
++            OpFunctionEnd();
++            return func_id;
++        }
+         define_body(ssbo_member, addr, element_pointer, shift,
+-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
++                    [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
+         OpReturnValue(ConstantNull(type));
+         OpFunctionEnd();
+         return func_id;
+@@ -1078,7 +1116,25 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
+         const Id addr{OpFunctionParameter(U64)};
+         const Id data{OpFunctionParameter(type)};
+-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
++        if (split_words(shift)) {
++            // As the loads: a vector store at a word that is not a multiple of its size.
++            const u32 count = 1U << (shift - 2);
++            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                        [&](Id, Id ssbo_id, Id word_index) {
++                            for (u32 i = 0; i < count; ++i) {
++                                const Id index{i == 0 ? word_index
++                                                      : OpIAdd(U32[1], word_index, Const(i))};
++                                OpStore(OpAccessChain(storage_types.U32.element, ssbo_id, zero,
++                                                      index),
++                                        OpCompositeExtract(U32[1], data, i));
++                            }
++                            OpReturn();
++                        });
++            OpReturn();
++            OpFunctionEnd();
++            return func_id;
++        }
++        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
+             OpStore(ssbo_pointer, data);
+             OpReturn();
+         });
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index e35e7e1df1..e1a27376ca 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -21,6 +21,12 @@
+ 
+ namespace Shader::Backend::SPIRV {
+ 
++/// EDEN_NX2_AMD_SHADER_FIXES=1: the shader fixes of mja00/Lichii for AMD (c418e4f477, 5e8d409f81,
++/// 913ba475da): 8 and 16-byte storage accesses go word by word where the binding alignment (4 on
++/// RADV) makes the vector view inexact, and min, max and clamp take the NaN-defined forms. Read
++/// once; shaders are translated at every boot, so env.txt is enough.
++[[nodiscard]] bool AmdShaderFixes();
++
+ static std::bitset<8> clip_distance_written;
+ 
+ using Sirit::Id;
