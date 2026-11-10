@@ -34,6 +34,18 @@ replaces most of them; the rest is either ported into the port itself or set asi
     superseded: `BypassOotNetwork` skips only the prepass and network keys, so other tensor programs
     — the gameplay upscaler among them — run. Do not cherry-pick `eb1efeeb`: it only adds the patch
     file, and this branch has no patch series to apply it to.
+  - **0069 (UR28-UR62 mirrors, branch `fix/oot-high-uniforms`) is in the new core** as Lichii #241:
+    `LowerToMaxwellWith`, `LoweredProgram::high_uniform_registers` and the retry with an aligned
+    base. Measured 2026-11-10: MUFU.RCP, F2I and VOTEU naming UR28 or UR62 lower; UR64 is rejected.
+  - **0065-0067 (branch `perf/lichii-949`) are in the new core** as Lichii #949 (`a4f6287327`):
+    uniform buffer keeps (`uniform_keep`, about +5% at Bananza's gate on the parent's console),
+    descriptor replay, and the drain-free semaphore acquires the parent could not port. 0067's rule
+    holds here: `main` applies `env.txt` after static initializers run, so a switch read at
+    namespace scope never sees it. The only such switch in this core is
+    `EDEN_NX2_DELTA_DESCRIPTORS_VERIFY` (diagnostic; `vk_graphics_pipeline.cpp`); set it in the
+    launch environment, not `env.txt`.
+  - 0070 (native storage buffer tracking, branch `fix/oot-native-storage`) is still WIP upstream;
+    check it against this core when it lands.
 
 ## What the jump changed in the port
 
