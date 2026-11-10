@@ -20,7 +20,11 @@ patches=("$root"/tools/eglantine-patches/*.patch)
 if [[ $mode != --revert ]]; then
     index=$(mktemp)
     trap 'rm -f "$index"' EXIT
-    mapfile -t touched < <(for patch in "${patches[@]}"; do git -C Eglantine apply --numstat "$patch"; done | cut -f3 | sort -u)
+    # A read loop, not mapfile: macOS ships bash 3.2, and this script is run there too.
+    touched=()
+    while IFS= read -r entry; do
+        touched+=("$entry")
+    done < <(for patch in "${patches[@]}"; do git -C Eglantine apply --numstat "$patch"; done | cut -f3 | sort -u)
     applied=-1
     GIT_INDEX_FILE=$index git -C Eglantine read-tree HEAD
     for ((k = 0; k <= ${#patches[@]}; k++)); do
@@ -46,7 +50,13 @@ fi
 
 # The working tree is not the commit plus some of the patches in order (local changes, or a
 # revert): patch by patch.
-[[ $mode == --revert ]] && mapfile -t patches < <(printf '%s\n' "${patches[@]}" | sort -r)
+if [[ $mode == --revert ]]; then
+    reversed=()
+    while IFS= read -r entry; do
+        reversed+=("$entry")
+    done < <(printf '%s\n' "${patches[@]}" | sort -r)
+    patches=("${reversed[@]}")
+fi
 for patch in "${patches[@]}"; do
     name=$(basename "$patch")
     if git -C Eglantine apply --reverse --check "$patch" >/dev/null 2>&1; then
