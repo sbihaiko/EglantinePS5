@@ -69,13 +69,13 @@ is the agent's way to see the console and its safe way back from a freeze.
 
 ## Status against the goal
 
-As of 2026-11-11, build `0f537b0` for the sessions below, and build 3 (`30d1655`) played once as b3-A. Build 4 (`9e519f5`) is installed and untested. FPS is in 5 s windows, frame generation off.
+As of 2026-11-11, build `0f537b0` for the sessions below, build 3 (`30d1655`) played once as b3-A, build 4 (`9e519f5`) twice as b4-A and b4-A2, and build 5 (`06873bf`) once as b5-A. FPS is in 5 s windows, frame generation off.
 
 | criterion | target | status |
 |---|---|---|
 | Bloom | normal, as the player judges it | **met** (b2-A and b2-B) |
 | Flashes | none, as the player judges it | not met: still present, much weaker |
-| Stability | no crash in 2 sessions of 20+ min | not met: GPU page fault at about 10 min (b2-B) and 9 min (b2-D); a freeze with the GPU stuck at about 10 min (b2-D2); stalls of 7.5 s and 17.6 s with the memory pool exhausted (b2-D3); without `skip` the GPU hangs (b2-C). b3-A had no page fault at all, but only reached about 17 min before the memory pressure made it unplayable |
+| Stability | no crash in 2 sessions of 20+ min | not met: GPU page fault at about 10 min (b2-B), 9 min (b2-D) and 8 min (b5-A); a freeze with the GPU stuck at about 10 min (b2-D2); stalls of 7.5 s and 17.6 s with the memory pool exhausted (b2-D3); without `skip` the GPU hangs (b2-C); b4-A and b4-A2 ended with the app gone after `EDEN_HANG` of 10-20 s; b3-A had no fault in 17 min but went unplayable |
 | FPS in Link's house | 30 or more | **met**: 30-34 |
 | FPS after the house | 30 or more | not met: 22-31 |
 | FPS in Kokiri Forest | 38 or more | not met: 13-37 |
@@ -372,6 +372,9 @@ house.
 | b2-D2 | `0f537b0` | same (the app restarted itself) | n/a | 29-33 | n/a | freeze with the GPU stuck at about 10 min |
 | b2-D3 | `0f537b0` | same | 31-34 | n/a | 16-36 | stalls of 7.5 s and 17.6 s, pool exhausted; closed by hand |
 | b3-A | `30d1655` | b2-D without the quarantine; plus `RADV_PS5_RETIRE=1`, `EDEN_PS5_HEAP_NO_GIVEBACK=1`, `EDEN_NX2_STALL_REPORT=400`, `RADV_PS5_FREE_LOG=1` | 26-34 | 21-32 | 15-38 | no page fault in 17 min; six `EDEN_HANG` of 10.4-20.6 s; after about 10 min mostly 0-2 FPS; pool at 2 MiB; closed by hand |
+| b4-A | `9e519f5` | b3-A without `NO_GIVEBACK`, plus the six 0920-0925 switches | 29-31 | 16-31 | n/a | app gone after `EDEN_HANG` of 10.6 and 20.6 s at frame 19387; no page fault; pool at 2-8 MiB |
+| b4-A2 | `9e519f5` | same | n/a | 0.1-27 | n/a | 21 stalls, the worst 9.1 s, all pure `split_wait`; 114 `EDEN_HANG`; unplayable after about 8 min |
+| b5-A | `06873bf` | same env | 28-35 | 20-27 | n/a | **no `EDEN_HANG`**; 2 stalls, worst 1.6 s; median 41.1 FPS; GPU page fault at `0x4060629000` about 8 min in, on a 64 MiB block freed 97 ms earlier |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
@@ -420,6 +423,56 @@ new.
 `EDEN_NX2_PENDING_POLL_US=50`, `EDEN_NX2_SKIP_LOOP_WRITES=1`, `EDEN_NX2_DMA_READ_REPORTED=1`,
 `EDEN_NX2_UPLOAD_BATCH=1` and `EDEN_NX2_DISPATCH_BARRIER_INLINE=1`. Six switches at once, so a gain
 is theirs and not one switch's; the next session splits them.
+
+**What build 4 settled.** Two sessions (b4-A, b4-A2, both at the same `env.txt`) went the way of
+build 3: the pool's largest free block fell to 1-8 MiB, `short=1` came up constantly, and the stalls
+were again pure `split_wait` (2.1, 2.1, 3.8, 2.3, 2.3 and 9.1 s) with no back-side category. The
+first session ended with the app gone at frame 19387 after `EDEN_HANG` of 10.6 and 20.6 s, with no
+page fault, no `VK_ERROR_DEVICE_LOST` and no new crash index entry. The second ended the same way at
+frame 21834. The four stalls the report caught were short (0.7-1.2 s) and dominated by `fence_wait`
+(1111 of 1176 ms), which is not what build 3 showed. Whatever the six switches give, they do not
+give memory back.
+
+**What build 5 settled.** Build 5 (`06873bf`) added `0926`, which times the driver's memory
+allocation into `dev_alloc_ms`, and mihawk's `0f86253f`, which cuts the mesh shaders' scratch ring
+from 320 MiB to 128 MiB.
+
+| | build 4 (b4-A2) | build 5 (b5-A) |
+|---|---|---|
+| `EDEN_HANG` | 114 | **0** |
+| stalls | 21, up to 9.1 s | 2, up to 1.6 s |
+| median FPS | 21.0 | **41.1** |
+| largest free block at the end | 1-8 MiB | 36-59 MiB |
+| ending | app gone, no fault | **GPU page fault** |
+
+The ring is the biggest single win so far on smoothness: no hangs at all, and the pool lasted
+further. It does not stop the drain, and it does not stop the page fault.
+
+`0926` answered its question in the negative, which is worth as much: the stall at t=534 s is
+`split_wait=1523 ms` with `dev_alloc_ms=0.0` and `dev_alloc_n=0`. The driver was not allocating
+during it, so the split's back half waits somewhere else.
+
+**The page fault has a smoking gun now.** The fault address `0x4060629000` sits inside a 64 MiB
+block, `0x4060600000`-`0x4064600000`, that the free log shows being **allocated and freed 97 ms
+before the fault**, on the memory-recovery path (`priority=14`), with `submitted=669657` equal to
+`completed=669657`:
+
+```
+t=20364749 alloc 0x4060600000-0x4064600000 (64 MiB) submitted=669656 completed=669656
+t=20364846 free  0x4060600000-0x4064600000 (64 MiB) priority=14 submitted=669657 completed=669657
+```
+
+The faulting client is `TCP` (a shader read), so the driver believed the GPU was done with the
+block and the GPU was still reading it: a use-after-free in the driver's own accounting, not the
+pieced allocation the earlier hypothesis blamed. That same address was allocated and freed three
+times in the 30 s before (16 MiB, 48 MiB, 64 MiB), which is what a hot address under pressure looks
+like. `RADV_PS5_RETIRE=1` does not cover this path: it holds buffers freed the ordinary way, not the
+granules the recovery path hands back.
+
+**Build 6**, next: make the recovery path wait for the GPU before it releases a granule. Record, on
+release, the submission that last used the block and the device's real completion value, and hold
+the block until the device passes it. That is the fix the fault now points at, and it is the one the
+goal has been circling since b2-B.
 
 ## Links
 
