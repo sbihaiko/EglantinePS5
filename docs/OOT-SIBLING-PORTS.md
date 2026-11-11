@@ -207,6 +207,36 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
     `AREA_EVICT=40`): not on our pin; they need porting.
   - Lichii #1314 (texture cache) and #1334 (pipeline rebuild): open upstream, not yet read.
 
+- **The pool runs out, and the largest block goes first (build 6, 2026-11-11).** Two sessions
+  after `RADV_PS5_RETIRE_SLACK=1` had zero page faults and zero crashes — b5-A's unmapped read did
+  not return, and both 150 MiB merge precursors happened again without one. What ends those
+  sessions is memory, not a fault: the largest contiguous free block falls from 10,060 to 728 to
+  140 to 3-18 MiB within about 90 s, and FPS follows it down (60 -> 10 -> 0.4, stalls of 2-8 s,
+  every one of them `split_wait`, sometimes with `tc_upload`+`staging_create`). Five things the
+  numbers say:
+  1. **Placement, not total.** Guest (4.4-5.3 GiB) + driver plateau (2.7 GiB) + app heap
+     (1.6-1.8 GiB) is the whole 9.7 GiB pool, and the driver's live set plateaus by t=90 s while
+     the guest gives ~800 MiB back at times. Nothing grows without bound; the free *run* collapses
+     early and stays collapsed.
+  2. **The texture cache is not the consumer.** `EDEN_NX2_TC_EXPECTED_MIB`/`TC_CRITICAL_MIB` cut to
+     1536/2304 (log confirms the override) changed nothing: the same 92 buffers of 16 MiB in VRAM
+     (2.7 GiB) and the same collapse in ~3 min.
+  3. **The stall is not in the app's `Commit`.** `dev_alloc_n=0` in every long stall, so no
+     `vk::Buffer::Commit` ran; a 2 MiB-piece fallback there would have shown as a large
+     `dev_alloc_ms`.
+  4. **Correlation has to be built at the source.** `EDEN_STALL` and the driver's free-log use
+     different clocks and cannot be aligned afterwards, so the instruments are on the code paths:
+     `EDEN_NX2_BACK_PROFILE` (0928: `back_phase=` and its age) and `mem_release_ms`/
+     `mem_pageout_ms` (0929).
+  5. **Not a PS5-only symptom.** Lichii #1299 (4 GB desktop GPU) and #871 (AMD device loss at the
+     movie-to-3D handover) describe the same class, which points at how large paths behave under
+     pressure rather than at the console.
+  Build 7 (`b7-memory`, run 43101496075) carries two candidate fixes, both off by default:
+  `EDEN_NX2_OOT_TEXTURE_POOL_X2` (0927, Lichii #1313: the game's own graphics pool starts twice as
+  large) and `EDEN_PS5_RESERVE_OVER` (parent PR #95: a mapping becomes reserved address space in
+  one call, no window for another mapping). Judged by time-to-pool-exhaustion (baseline ~3 min) and
+  the first stall over 1 s (baseline 2.7 s).
+
 ## Looked at, not ported
 
 - **Null image on a memo hit** (Lichii `c2e293ec8`, #910). This pin already gates
