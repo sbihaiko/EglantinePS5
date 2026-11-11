@@ -20,6 +20,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0911-nan-guard-and-invariant-position` | `EDEN_NX2_NAN_GUARD=1`, `EDEN_NX2_POSITION_INVARIANT=1` | off | notquiteog/Dragoon `395547c` (Shakoquo/Hookshot `f04461bc9`) |
 | `0913-destroy-unmap-all` | `EDEN_NX2_DESTROY_UNMAP_ALL=1` (the log line is always on) | off | Lichii #1199 (`bcb37c49f7`) |
 | `0914-refresh-reused-device-ranges` | `EDEN_NX2_REFRESH_REUSED=1` (the log line is always on) | off | Lichii #1236, PantACRO4life `46e7920081` |
+| `0915-tc-past-critical` | `EDEN_NX2_TC_PAST_CRITICAL=1` | off | Lichii #1306 |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
@@ -97,6 +98,11 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   either path happens at all: look for `nx2:gpu 102 destroy of memory` and `pages point at old
   memory` in `stderr.log`. The release half of #1236 is already how this registry works: sub 102
   releases the device range once no mapping uses it.
+- **Collect faster past the critical memory (0915).** Past `EDEN_NX2_TC_CRITICAL_MIB` the
+  collector deletes one more image per 2 MiB over it (up to 1024 more a frame), and at 1 GiB over
+  it deletes images 3 frames after their last use instead of 10. Lichii saw the cache grow 4 GiB
+  in two seconds and the driver crash while pots broke in Hyrule Castle. With 2560/3328 the
+  cache peaked at 2135 MB on our route, so this guards later areas, not the route.
 - **Empty flush submits** (Lichii #1329, Fritchii EXP61): already in the port.
   `tools/prepare-vulkan-port.py` makes `FlushCommands` return when a submission has taken every
   draw since the last one (`recorded_tick`).
