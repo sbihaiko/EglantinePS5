@@ -249,9 +249,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
     buffer_cache_runtime.ProbeMappedReadback(descriptor_pool, compute_pass_descriptor_queue);
+    VideoCommon::GpuSplit::Get().SetIdleHook(
+        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
+        &scheduler);
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
 }

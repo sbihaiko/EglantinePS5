@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -51,6 +52,21 @@ public:
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+
+    /// On the split GPU thread, a fence or the end of a command list submits only if the last
+    /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
+    /// once); otherwise it goes with the next one. The back submits deferred work before it
+    /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
+    bool DeferFlush();
+    /// Submits deferred work (the split's back, from its idle hook).
+    void FlushDeferred();
+    /// Threads other than the split's back: waits until tick is submitted, asking the back to
+    /// submit deferred work. False if that took over 2 s.
+    bool WaitSubmitted(u64 tick);
+    /// Whether everything up to tick has been handed to the worker for submission.
+    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
+        return tick < master_semaphore->CurrentTick();
+    }
 
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
@@ -207,6 +223,9 @@ public:
     std::mutex submit_mutex;
 
 private:
+    std::chrono::steady_clock::time_point last_flush{};
+    bool flush_pending{};
+
     class Command {
     public:
         virtual ~Command() = default;
