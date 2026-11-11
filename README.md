@@ -374,7 +374,7 @@ house.
 | b3-A | `30d1655` | b2-D without the quarantine; plus `RADV_PS5_RETIRE=1`, `EDEN_PS5_HEAP_NO_GIVEBACK=1`, `EDEN_NX2_STALL_REPORT=400`, `RADV_PS5_FREE_LOG=1` | 26-34 | 21-32 | 15-38 | no page fault in 17 min; six `EDEN_HANG` of 10.4-20.6 s; after about 10 min mostly 0-2 FPS; pool at 2 MiB; closed by hand |
 | b4-A | `9e519f5` | b3-A without `NO_GIVEBACK`, plus the six 0920-0925 switches | 29-31 | 16-31 | n/a | app gone after `EDEN_HANG` of 10.6 and 20.6 s at frame 19387; no page fault; pool at 2-8 MiB |
 | b4-A2 | `9e519f5` | same | n/a | 0.1-27 | n/a | 21 stalls, the worst 9.1 s, all pure `split_wait`; 114 `EDEN_HANG`; unplayable after about 8 min |
-| b5-A | `06873bf` | same env | 28-35 | 20-27 | n/a | **no `EDEN_HANG`**; 2 stalls, worst 1.6 s; median 41.1 FPS; GPU page fault at `0x4060629000` about 8 min in, on a 64 MiB block freed 97 ms earlier |
+| b5-A | `06873bf` | same env | 28-35 | 20-27 | n/a | **no `EDEN_HANG`**; 2 stalls, worst 1.6 s; median 41.1 FPS; GPU page fault at `0x4060629000` about 8 min in, on a 64 MiB block freed 97 ms earlier; the app restarted itself |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
