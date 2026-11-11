@@ -88,9 +88,12 @@ bool Scheduler::DeferFlush() {
     // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
     // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
+    // Off unless EDEN_NX2_FENCE_FLUSH_US is set: on the PS5, Ocarina of Time gained nothing
+    // (submit costs ~2 ms a second here) and crashed in BufferCacheRuntime::CopyBuffer on the
+    // front thread after 158 s with it on.
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
-        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
+        return value == nullptr ? s64{0} : static_cast<s64>(std::atoll(value));
     }();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::IsBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
