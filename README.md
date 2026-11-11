@@ -69,16 +69,16 @@ is the agent's way to see the console and its safe way back from a freeze.
 
 ## Status against the goal
 
-As of 2026-11-11, build `0f537b0`, session b2-B. FPS is in 5 s windows, frame generation off.
+As of 2026-11-11, build `0f537b0`, sessions b2-B to b2-D3. Build 3 (`30d1655`) is installed and untested. FPS is in 5 s windows, frame generation off.
 
 | criterion | target | status |
 |---|---|---|
 | Bloom | normal, as the player judges it | **met** (b2-A and b2-B) |
 | Flashes | none, as the player judges it | not met: still present, much weaker |
-| Stability | no crash in 2 sessions of 20+ min | not met: b2-B crashed at about 10 min (GPU page fault); without `skip` the GPU hangs (b2-C) |
+| Stability | no crash in 2 sessions of 20+ min | not met: GPU page fault at about 10 min (b2-B) and 9 min (b2-D); a freeze with the GPU stuck at about 10 min (b2-D2); stalls of 7.5 s and 17.6 s with the memory pool exhausted (b2-D3); without `skip` the GPU hangs (b2-C) |
 | FPS in Link's house | 30 or more | **met**: 30-34 |
-| FPS after the house | 30 or more | not met: 22-29 |
-| FPS in Kokiri Forest | 38 or more | not met: 13-34 |
+| FPS after the house | 30 or more | not met: 22-31 |
+| FPS in Kokiri Forest | 38 or more | not met: 13-37 |
 | Merge | the work on the fork's `main`, with docs | not yet: it lives on `pr99-test` |
 
 ## What we learned
@@ -158,7 +158,20 @@ here is open.
 - RADV holds trimmed memory for 2000 ms (`RADV_PS5_TRIM_QUARANTINE_MS`), because giving it back at
   once caused this same fault on Mario Kart World. Suspect (unconfirmed): a command list recorded
   earlier still reads memory that was trimmed or freed. b2-C ran with 10000 ms but hung before it
-  could test it; session D tests it again.
+  could test it. Session D ran with 10000 ms and still faulted at about 9 min (address
+  `0x000000403cc1b000`), so the quarantine is ruled out.
+- b2-B and b2-D both faulted right after the same 150 MiB buffer (guest `7fc50000`-`891f0000`) was
+  created a second time. In b2-D the driver had just built a 288 MiB allocation from 144 pieces of
+  2 MiB (`no run that long in the pool`).
+- b2-D2 froze with no page fault and no RADV timeout. The kernel could not suspend the app when it
+  was closed (`GPU_FAULT_SUSPENDPOINT_TIMEOUT_IN_SUSPEND_ASYNC`), so the GPU had work it could not
+  stop. About 10 s earlier the heap gave memory back for the first time in the session (`gave back
+  32 MiB: the pool is short`).
+- b2-D3 marked the memory pool short 26 times. Its two longest stalls (7.5 s and 17.6 s) came with
+  the largest free block at 2 MiB and the guest memory compressor packing memory to make room.
+- Reading (unconfirmed): every long session dies within seconds of a memory release or re-creation,
+  under memory pressure. Build 3 tests this with `RADV_PS5_RETIRE` (keep freed memory until the GPU
+  has run past it), `EDEN_PS5_HEAP_NO_GIVEBACK`, and `RADV_PS5_FREE_LOG`.
 
 ### FPS and the texture cache
 
@@ -293,6 +306,10 @@ except 0901, 0903, and 0909, which are on.
 | 0916 padded square depth | `EDEN_NX2_TC_PADDED_SQUARE=1` | off | looks up a GOB-padded depth target (800x793) as its square | Lichii #1314, 1 of 3 |
 | 0917 superseded images | `EDEN_NX2_TC_SUPERSEDED=1` | off | deletes images whose memory went wholly to newer images | Lichii #1314, 2 of 3 |
 | 0918 square depth unscaled | `EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1` | off | leaves square depth-only passes (shadow maps) unscaled | Lichii #1314, 3 of 3 |
+| 0919 stall report | `EDEN_NX2_STALL_REPORT=400` | off | prints `EDEN_STALL` for each frame over the given ms, with where its time went, and `EDEN_AUDIO_GAP` for each audio cut over 50 ms; changes nothing else | ours, diagnostic |
+| driver retire | `RADV_PS5_RETIRE=1` | off | keeps a freed buffer's memory until the GPU has finished the work submitted before the free; a failed allocation waits for the GPU and retries (`tools/patch-radv-retire.py`) | Mihawk PS5_Mesa `f5610fe270`, plus a fix for our trim |
+| heap no give-back | `EDEN_PS5_HEAP_NO_GIVEBACK=1` | off | the app heap gives nothing back when the pool is short; blocks of 32 MiB or more are still returned when freed | ours |
+| driver free log | `RADV_PS5_FREE_LOG=1` | off | logs frees and allocations of 16 MiB or more, pieced allocations, sparse binds, regrown scratch and descriptor buffers, and trimmed granules, each with a time and submission numbers (`tools/patch-radv-free-log.py`) | ours, diagnostic |
 | driver submit thread | `RADV_PS5_SUBMIT_THREAD=1` | off | submits on a `RadvSubmit` thread (`tools/patch-radv-submit-thread.py`) | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 0913-0918 are on `pr99-test` only. Switches from the parent that matter here:
@@ -351,6 +368,9 @@ house.
 | b2-A | `0f537b0` | `EDEN_OOT_MESH_DRAWS=skip` | 22-29 | 4-19 | 13-36 | bloom gone; ended at about 236 s, no crash file |
 | b2-B | `0f537b0` | b2-A plus 0913-0918 switches | 30-34 | 22-29 | 13-34 | stutters of 1-4 s; GPU page fault at about 10 min |
 | b2-C | `0f537b0` | b2-B without `skip`, quarantine 10000 ms | n/a | n/a | n/a | GPU hang at 289 s, first scene load |
+| b2-D | `0f537b0` | b2-B plus quarantine 10000 ms | 31-34 | 25-31 | 15-37 | GPU page fault at about 9 min |
+| b2-D2 | `0f537b0` | same (the app restarted itself) | n/a | 29-33 | n/a | freeze with the GPU stuck at about 10 min |
+| b2-D3 | `0f537b0` | same | 31-34 | n/a | 16-36 | stalls of 7.5 s and 17.6 s, pool exhausted; closed by hand |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
@@ -367,9 +387,10 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
    `docs/OOT-SIBLING-PORTS.md`: Lichii #1329 and #1056, viejunerd's texture switches, and Lichii
    #1334.
 
-**Session D**, next: the b2-B lines (with `skip`) plus `RADV_PS5_TRIM_QUARANTINE_MS=10000`, to test
-whether a longer trim quarantine stops the async GPU page fault. If it does not,
-`GPU_FAULT_PAGE_FAULT_ASYNC` shows up in the kernel log again.
+**Build 3 session**, next: the b2-B lines plus `EDEN_NX2_STALL_REPORT=400`, `RADV_PS5_RETIRE=1`,
+`EDEN_PS5_HEAP_NO_GIVEBACK=1`, and `RADV_PS5_FREE_LOG=1`, played past 10 min. It tests whether
+holding freed memory stops the page fault and the freeze, and the stall report says where each long
+frame and audio cut goes.
 
 ## Links
 
