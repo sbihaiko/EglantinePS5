@@ -83,6 +83,10 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV: giving back device memory no resource uses changed"
         bash tools/build-radv-dependencies.sh
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+    elif ! python3 -B tools/patch-radv-retire.py --check "$radv_release/EDEN_RETIRE_SHA256"; then
+        step "RADV: keeping freed buffers until the GPU has run past them changed"
+        bash tools/build-radv-dependencies.sh
+        rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     elif ! python3 -B tools/patch-radv-pieces.py --check "$radv_release/EDEN_MEMORY_PIECES_SHA256"; then
         step "RADV: driver memory from 2 MiB pieces changed"
         bash tools/build-radv-dependencies.sh
