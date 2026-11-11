@@ -256,7 +256,8 @@ void Cleanup(bool success, const char* operation) noexcept {
 // EDEN_STALL line with what the ledger's sites spent while it lasted. They run on several threads
 // (cram_*: the faulting thread, the scanner, or the one that ran out; buf_*, staging_*, pipe_*,
 // tc_*: the GPU thread, its back half when split; gpuw_wait, split_wait: the split's front;
-// fence_wait: any thread; audio_*: the audio output thread), so other_ms, the frame less the sum
+// fence_wait: any thread; dev_alloc: whichever thread asked the driver for memory; audio_*: the
+// audio output thread), so other_ms, the frame less the sum
 // of the _ms fields not nested in another (cram_recover holds packs, staging_create sits in the
 // uploads), can be negative. The difference of two readings, not a clear the other threads race.
 // Called by the present path for every presented frame, with the interval since the one before;
@@ -285,20 +286,24 @@ void Cleanup(bool success, const char* operation) noexcept {
         for (const Category category :
              {Category::CramUnpack, Category::CramPack, Category::CramWait, Category::BufferCreate,
               Category::BufferUpload, Category::PipelineBuild, Category::PipelineWait, Category::ListWait,
-              Category::SplitWait, Category::TextureGc, Category::TextureUpload, Category::FenceWait})
+              Category::SplitWait, Category::TextureGc, Category::TextureUpload, Category::FenceWait,
+              Category::DeviceAlloc})
             accounted += ms(category);
         std::printf("EDEN_STALL t=%.3f frame_ms=%.1f cram_unpack_ms=%.1f cram_unpack_mib=%.1f cram_pack_ms=%.1f "
                     "cram_wait_ms=%.1f cram_recover_ms=%.1f buf_create_ms=%.1f buf_upload_ms=%.1f buf_upload_mib=%.1f "
                     "staging_create_ms=%.1f staging_create_mib=%.1f pipe_n=%llu pipe_ms=%.1f pipe_wait_ms=%.1f "
                     "gpuw_wait_ms=%.1f split_wait_ms=%.1f tc_gc_ms=%.1f tc_upload_ms=%.1f tc_upload_mib=%.1f "
-                    "fence_wait_ms=%.1f audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f other_ms=%.1f\n",
+                    "fence_wait_ms=%.1f dev_alloc_n=%llu dev_alloc_ms=%.1f dev_alloc_mib=%.1f "
+                    "audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f other_ms=%.1f\n",
                     Ledger::SecondsSinceStart(), frame_ms, ms(Category::CramUnpack), mib(Category::CramUnpack),
                     ms(Category::CramPack), ms(Category::CramWait), ms(Category::CramRecover),
                     ms(Category::BufferCreate), ms(Category::BufferUpload), mib(Category::BufferUpload),
                     ms(Category::StagingCreate), mib(Category::StagingCreate), count(Category::PipelineBuild),
                     ms(Category::PipelineBuild), ms(Category::PipelineWait), ms(Category::ListWait),
                     ms(Category::SplitWait), ms(Category::TextureGc), ms(Category::TextureUpload),
-                    mib(Category::TextureUpload), ms(Category::FenceWait), count(Category::AudioLate),
+                    mib(Category::TextureUpload), ms(Category::FenceWait),
+                    count(Category::DeviceAlloc), ms(Category::DeviceAlloc), mib(Category::DeviceAlloc),
+                    count(Category::AudioLate),
                     count(Category::AudioDry), static_cast<double>(std::max(late_max, dry_max)) / 1e6,
                     frame_ms - accounted);
     }
