@@ -1,0 +1,116 @@
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 4fd7dc6c71..5d03535872 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -6,8 +6,10 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
+ #include <cstddef>
+ #include <cstring>
++#include <string_view>
+ 
+ #include "common/assert.h"
+ #include "common/hex_util.h"
+@@ -401,6 +403,82 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
+     return out;
+ }
+ 
++namespace {
++
++// EDEN_NX2_OOT_TEXTURE_POOL_X2=1 (Lichii #1313, RsMan-Dev): Ocarina of Time starts its graphics
++// allocator with a pool too small for the guard house once the resolution grows, and dereferences
++// a null allocation. The store that sizes the pool (stp x8, x9, [sp, #0x10]) becomes a call to a
++// routine placed in the executable padding after the text segment, which doubles x8 first.
++constexpr u64 OOT_TEXTURE_POOL_TITLE_ID = 0x0400486024DEC000;
++constexpr std::string_view OOT_TEXTURE_POOL_BUILD_ID = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348";
++
++struct OotTexturePoolRecord {
++    std::size_t offset;
++    std::array<u8, 12> bytes;
++    std::size_t size;
++    std::array<u8, 12> original;
++    std::size_t original_size;
++    bool executable_padding;
++};
++
++constexpr std::array<OotTexturePoolRecord, 2> OOT_TEXTURE_POOL_RECORDS{{
++    {0xC2A36C, {0xD5, 0x6F, 0xC0, 0x94}, 4, {0xE8, 0x27, 0x01, 0xA9}, 4, false},
++    {0x3C462C0, {0x08, 0xF9, 0x7F, 0xD3, 0xE8, 0x27, 0x01, 0xA9, 0xC0, 0x03, 0x5F, 0xD6}, 12, {}, 0,
++     true},
++}};
++
++bool ApplyOotTexturePool(std::vector<u8>& out, const std::vector<u8>& nso,
++                         const Loader::NSOHeader& header, std::string_view name, u64 title_id) {
++    static const bool enabled = std::getenv("EDEN_NX2_OOT_TEXTURE_POOL_X2") != nullptr;
++    if (!enabled || name != "main" || title_id != OOT_TEXTURE_POOL_TITLE_ID) return false;
++    const auto build_id_raw = Common::HexToString(header.build_id);
++    const auto build_id = build_id_raw.substr(0, build_id_raw.find_last_not_of('0') + 1);
++    if (build_id != OOT_TEXTURE_POOL_BUILD_ID) {
++        LOG_INFO(Loader, "EDEN_NX2_OOT_TEXTURE_POOL_X2: build id {} is not the patched one", build_id);
++        return false;
++    }
++    const auto fits = [](const std::vector<u8>& data, std::size_t offset, std::size_t size) {
++        return data.size() >= sizeof(Loader::NSOHeader) &&
++               offset <= data.size() - sizeof(Loader::NSOHeader) &&
++               size <= data.size() - sizeof(Loader::NSOHeader) - offset;
++    };
++    for (const auto& record : OOT_TEXTURE_POOL_RECORDS) {
++        if (!fits(nso, record.offset, record.size) || !fits(out, record.offset, record.size) ||
++            !fits(nso, record.offset, record.original_size)) {
++            LOG_WARNING(Loader, "EDEN_NX2_OOT_TEXTURE_POOL_X2: {}+{:#x} is past the module's end",
++                        name, record.offset);
++            return false;
++        }
++        const std::size_t offset = sizeof(Loader::NSOHeader) + record.offset;
++        if (record.executable_padding) {
++            const auto& text = header.segments[0];
++            const u64 text_end = u64{text.location} + text.size;
++            const u64 executable_end = (text_end + 0xFFF) & ~u64{0xFFF};
++            if (record.offset < text_end || record.offset + record.size > executable_end ||
++                record.offset + record.size > header.segments[1].location ||
++                !std::all_of(nso.begin() + offset, nso.begin() + offset + record.size,
++                             [](u8 byte) { return byte == 0; })) {
++                LOG_WARNING(Loader, "EDEN_NX2_OOT_TEXTURE_POOL_X2: code cave is not executable padding");
++                return false;
++            }
++        }
++        if (!std::equal(record.original.begin(), record.original.begin() + record.original_size,
++                        nso.begin() + offset)) {
++            LOG_WARNING(Loader, "EDEN_NX2_OOT_TEXTURE_POOL_X2: unexpected original bytes at {}+{:#x}",
++                        name, record.offset);
++            return false;
++        }
++    }
++    for (const auto& record : OOT_TEXTURE_POOL_RECORDS) {
++        std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.offset, record.bytes.data(),
++                    record.size);
++    }
++    LOG_INFO(Loader, "EDEN_NX2_OOT_TEXTURE_POOL_X2: the graphics allocator's initial pool is doubled");
++    return true;
++}
++
++} // namespace
++
+ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+     if (nso.size() < sizeof(Loader::NSOHeader)) {
+         return nso;
+@@ -431,6 +509,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
+ 
+     LOG_INFO(Loader, "Patching NSO for name={}, build_id={}", name, build_id);
+ 
++    std::vector<u8> out = nso;
++    ApplyOotTexturePool(out, nso, header, name, title_id);
++
+     const auto load_dir = GetModificationLoadRoot();
+     if (load_dir == nullptr) {
+         LOG_ERROR(Loader, "Cannot load mods for invalid title_id={:016X}", title_id);
+@@ -442,7 +523,6 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
+               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
+     const auto patches = CollectPatches(patch_dirs, build_id);
+ 
+-    auto out = nso;
+     for (const auto& patch_file : patches) {
+         if (patch_file->GetExtension() == "ips") {
+             LOG_INFO(Loader, "    - Applying IPS patch from mod \"{}\"",
