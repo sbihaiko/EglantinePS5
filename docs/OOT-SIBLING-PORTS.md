@@ -24,6 +24,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0916-tc-padded-square-depth` | `EDEN_NX2_TC_PADDED_SQUARE=1` | off | Lichii #1314, commit 1 |
 | `0917-tc-superseded-images` | `EDEN_NX2_TC_SUPERSEDED=1` | off | Lichii #1314, commit 2 |
 | `0918-tc-square-depth-unscaled` | `EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1` | off | Lichii #1314, commit 3 |
+| `0920-flash-fixes` | `EDEN_NX2_FLASH_FIXES=1` | off | exploitizm/Eglantine `e0ce856` (Lichii #679 items 2 and 3, sharkiix `858c115541`, `45d3b1b84b`) |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 | driver: `tools/patch-radv-retire.py` | `RADV_PS5_RETIRE=1` | off | mihawk-99/PS5_Mesa `f5610fe270` |
 | driver: `tools/patch-radv-free-log.py` | `RADV_PS5_FREE_LOG=1` (`RADV_PS5_FREE_LOG_LINES`, default 200 lines per kind per 10 s): `radv/ps5 free-log` lines for frees and allocations of 16 MiB or more, pieces, sparse binds, replaced queue buffers and trimmed granules; lifts the trim and pieces line caps | off | ours |
