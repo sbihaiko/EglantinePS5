@@ -26,6 +26,7 @@
 #include "display_refresh.h"
 #include "graphics.h"
 #include "common/scope_exit.h"
+#include "common/stall_ledger.h"
 #include "core/core.h"
 #include "core/frontend/graphics_context.h"
 #include "core/perf_stats.h"
@@ -250,6 +251,61 @@ void Cleanup(bool success, const char* operation) noexcept {
         std::fprintf(stderr, "EGL cleanup failed: %s (0x%x)\n", operation, eglGetError());
         std::_Exit(1);
     }
+}
+// EDEN_NX2_STALL_REPORT=<ms> (common/stall_ledger.h): a presented frame longer than <ms> gets one
+// EDEN_STALL line with what the ledger's sites spent while it lasted. They run on several threads
+// (cram_*: the faulting thread, the scanner, or the one that ran out; buf_*, staging_*, pipe_*,
+// tc_*: the GPU thread, its back half when split; gpuw_wait, split_wait: the split's front;
+// fence_wait: any thread; audio_*: the audio output thread), so other_ms, the frame less the sum
+// of the _ms fields not nested in another (cram_recover holds packs, staging_create sits in the
+// uploads), can be negative. The difference of two readings, not a clear the other threads race.
+// Called by the present path for every presented frame, with the interval since the one before;
+// it prints the audio gap the output thread left too (EDEN_AUDIO_GAP).
+[[maybe_unused]] void ReportStall(double interval) {
+    namespace Ledger = Common::StallLedger;
+    using Category = Ledger::Category;
+    if (!Ledger::Enabled()) return;
+    static Ledger::Totals previous = Ledger::Read();
+    const Ledger::Totals now = Ledger::Read();
+    const u64 late_max = Ledger::TakeMax(Category::AudioLate);
+    const u64 dry_max = Ledger::TakeMax(Category::AudioDry);
+    const double frame_ms = interval * 1000.0;
+    if (frame_ms > static_cast<double>(Ledger::ThresholdMs())) {
+        const auto index = [](Category category) { return static_cast<std::size_t>(category); };
+        const auto ms = [&](Category category) {
+            return static_cast<double>(now.ns[index(category)] - previous.ns[index(category)]) / 1e6;
+        };
+        const auto mib = [&](Category category) {
+            return static_cast<double>(now.bytes[index(category)] - previous.bytes[index(category)]) / 1048576.0;
+        };
+        const auto count = [&](Category category) {
+            return static_cast<unsigned long long>(now.count[index(category)] - previous.count[index(category)]);
+        };
+        double accounted = 0;
+        for (const Category category :
+             {Category::CramUnpack, Category::CramPack, Category::CramWait, Category::BufferCreate,
+              Category::BufferUpload, Category::PipelineBuild, Category::PipelineWait, Category::ListWait,
+              Category::SplitWait, Category::TextureGc, Category::TextureUpload, Category::FenceWait})
+            accounted += ms(category);
+        std::printf("EDEN_STALL t=%.3f frame_ms=%.1f cram_unpack_ms=%.1f cram_unpack_mib=%.1f cram_pack_ms=%.1f "
+                    "cram_wait_ms=%.1f cram_recover_ms=%.1f buf_create_ms=%.1f buf_upload_ms=%.1f buf_upload_mib=%.1f "
+                    "staging_create_ms=%.1f staging_create_mib=%.1f pipe_n=%llu pipe_ms=%.1f pipe_wait_ms=%.1f "
+                    "gpuw_wait_ms=%.1f split_wait_ms=%.1f tc_gc_ms=%.1f tc_upload_ms=%.1f tc_upload_mib=%.1f "
+                    "fence_wait_ms=%.1f audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f other_ms=%.1f\n",
+                    Ledger::SecondsSinceStart(), frame_ms, ms(Category::CramUnpack), mib(Category::CramUnpack),
+                    ms(Category::CramPack), ms(Category::CramWait), ms(Category::CramRecover),
+                    ms(Category::BufferCreate), ms(Category::BufferUpload), mib(Category::BufferUpload),
+                    ms(Category::StagingCreate), mib(Category::StagingCreate), count(Category::PipelineBuild),
+                    ms(Category::PipelineBuild), ms(Category::PipelineWait), ms(Category::ListWait),
+                    ms(Category::SplitWait), ms(Category::TextureGc), ms(Category::TextureUpload),
+                    mib(Category::TextureUpload), ms(Category::FenceWait), count(Category::AudioLate),
+                    count(Category::AudioDry), static_cast<double>(std::max(late_max, dry_max)) / 1e6,
+                    frame_ms - accounted);
+    }
+    previous = now;
+    if (Ledger::AudioGap gap; Ledger::TakeAudioGap(gap))
+        std::printf("EDEN_AUDIO_GAP t=%.3f gap_ms=%llu kind=%s\n", gap.seconds,
+                    static_cast<unsigned long long>(gap.gap_ms), gap.dry ? "dry" : "late");
 }
 class Context;
 thread_local Context* current_window_context{};
@@ -756,6 +812,7 @@ void GraphicsWindow::OnFrameDisplayed() {
         } else {
             ++frame_sample_count;
             frame_sample_worst = std::max(frame_sample_worst, now - frame_sample_last);
+            ReportStall(now - frame_sample_last);
 #ifdef EDEN_DEV_PROFILE
             // Present intervals by vsync multiple: a 60 FPS title that misses by a little
             // shows up in the 2-vsync bucket, a slow one across all of them. "half" counts the
@@ -768,12 +825,16 @@ void GraphicsWindow::OnFrameDisplayed() {
             frame_sample_last = now;
             if (now - frame_sample_start >= 5.0) {
                 // The game's frames; the ones a slower display did not show are counted apart.
+                // EDEN_NX2_STALL_REPORT: the line ends with t= too, the time the stall lines carry.
+                char stall_time[32] = "";
+                if (Common::StallLedger::Enabled())
+                    std::snprintf(stall_time, sizeof(stall_time), " t=%.3f", Common::StallLedger::SecondsSinceStart());
                 std::printf("EDEN_VULKAN_FRAME frames=%u seconds=%.6f fps=%.3f worst_ms=%.3f total=%u "
-                            "not_shown=%u clock_hz=%.1f\n",
+                            "not_shown=%u clock_hz=%.1f%s\n",
                     frame_sample_count, now - frame_sample_start,
                     frame_sample_count / (now - frame_sample_start),
                     frame_sample_worst * 1000.0, frame_total, Display::skipped_frames.load(),
-                    Display::game_millihertz.load() / 1000.0);
+                    Display::game_millihertz.load() / 1000.0, stall_time);
 #ifdef EDEN_DEV_PROFILE
                 std::printf("EDEN_VULKAN_INTERVALS v1=%u v2=%u v3=%u v4plus=%u half=%u\n", interval_hist[0],
                             interval_hist[1], interval_hist[2], interval_hist[3], interval_hist[4]);

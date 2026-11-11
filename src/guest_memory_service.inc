@@ -22,6 +22,21 @@
 //
 // 64-bit games only: a 32-bit game's fastmem window aliases the backing, which takes it whole.
 
+// EDEN_NX2_STALL_REPORT (the core's common/stall_ledger.h, tools/eglantine-patches/0919): unpacks,
+// packs, waits for a block and recovers are timed into the ledger the frame report reads. The host
+// checks that build this file alone have no core headers: there the timers are empty.
+#if __has_include("common/stall_ledger.h")
+#include "common/stall_ledger.h"
+#else
+namespace Common::StallLedger {
+enum class Category { CramUnpack, CramPack, CramRecover, CramWait };
+struct Scope {
+    explicit Scope(Category, std::uint64_t = 0) noexcept {}
+    void SetBytes(std::uint64_t) noexcept {}
+};
+} // namespace Common::StallLedger
+#endif
+
 namespace {
 enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotPacked = 4, SlotLock = 0x80, SlotMask = 0x7f };
 constexpr std::size_t FinePage = 16384, FinePages = SparseSlot / FinePage;
@@ -529,6 +544,7 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
 // Packed -> Own: a block of its own, read-write, with the slot's data unpacked into it.
 bool UnpackSlot(SparseRange& range, std::size_t slot) noexcept {
 #ifdef PS5_NATIVE
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::CramUnpack, SparseSlot};
     PackedSlot* const table = packed_slots.load(std::memory_order_acquire);
     if (table == nullptr || table[slot].data == nullptr) std::abort();
     const std::uintptr_t at = SlotAddress(range, slot);
@@ -794,6 +810,7 @@ std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 // again every 20 ms for up to 2 s while the caches give memory back. Only then is it refused.
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::CramWait};
     memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
     for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
@@ -1246,6 +1263,7 @@ bool PackSlot(SparseRange& range, std::size_t slot) noexcept {
         UnlockSlot(range, slot, SlotState(range, slot));
         return false;
     }
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::CramPack, SparseSlot};
     const std::uintptr_t at = SlotAddress(range, slot);
     Fence(at);
     const int size = LZ4_compress_default(reinterpret_cast<const char*>(at), pack_scratch.data(),
@@ -1944,6 +1962,7 @@ std::size_t GiveBackIdleBlocks(std::size_t bytes) noexcept {
 #endif
 std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
 #ifdef PS5_NATIVE
+    Common::StallLedger::Scope stall{Common::StallLedger::Category::CramRecover};
     SparseRange* const range = service_range.load(std::memory_order_acquire);
     // Device memory no resource uses goes back first: it costs nothing later (packing makes the
     // guest fault its data back).
@@ -1986,6 +2005,7 @@ std::size_t RecoverMemory(std::size_t bytes, bool wait) noexcept {
         if (length > 0) Report(line);
     }
     if (freed < bytes) freed += GiveBackIdleBlocks(bytes - freed);
+    stall.SetBytes(trimmed + freed);
     return trimmed + freed;
 #else
     (void)bytes;
