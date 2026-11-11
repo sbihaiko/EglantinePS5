@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstring>
+#include <atomic>
 #include <cstdlib>
 #include <optional>
 #include <utility>
@@ -34,6 +35,69 @@
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
+
+namespace {
+
+// A device (SMMU) range keeps the host pages that backed its CPU range when it was mapped, and
+// Nx2PrepareMap reuses a range by CPU address. When nx2:gpu 102 destroyed the memory, the game
+// can map new pages at the same address and map it for the GPU again: the reused range still
+// reads the old pages, which the kernel may have given to other data (Ocarina of Time: meshes
+// whose index and vertex bytes were an actor pack and texture blocks, white areas after area
+// changes; Lichii #1236, from PantACRO4life 46e7920081). Stale pages are always counted and
+// logged; with EDEN_NX2_REFRESH_REUSED=1 a non-heap range is pointed at the current pages again.
+// Runs on the GPU thread, before the GMMU map.
+void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Memory& memory,
+                       Core::Asid asid, DAddr device_address, u64 cpu_address, u64 size,
+                       bool heap) {
+    constexpr u64 PageSize = Core::Memory::YUZU_PAGESIZE;
+    constexpr uintptr_t PageMask = static_cast<uintptr_t>(Core::Memory::YUZU_PAGEMASK);
+    static const bool refresh = [] {
+        const char* const value = std::getenv("EDEN_NX2_REFRESH_REUSED");
+        return value != nullptr && value[0] != '0';
+    }();
+    if ((cpu_address & Core::Memory::YUZU_PAGEMASK) != 0 ||
+        (device_address & Core::Memory::YUZU_PAGEMASK) != 0) {
+        return;
+    }
+    u64 stale_pages = 0;
+    u64 first_stale = 0;
+    for (u64 offset = 0; offset < size; offset += PageSize) {
+        const auto* const cpu_page =
+            memory.GetPointerSilent(Common::ProcessAddress{cpu_address + offset});
+        if (cpu_page == nullptr) {
+            continue; // nothing to point at
+        }
+        const auto device_page =
+            reinterpret_cast<uintptr_t>(smmu.GetPointer<u8>(device_address + offset));
+        if ((device_page & ~PageMask) != (reinterpret_cast<uintptr_t>(cpu_page) & ~PageMask)) {
+            if (stale_pages++ == 0) {
+                first_stale = offset;
+            }
+        }
+    }
+    if (stale_pages == 0) {
+        return;
+    }
+    const bool remap = refresh && !heap;
+    static std::atomic<u32> reports{};
+    if (const u32 report = reports.fetch_add(1, std::memory_order_relaxed);
+        report < 256 || report % 1000 == 0) {
+        LOG_WARNING(Service_NVDRV,
+                    "Switch 2 device range {:#x} of CPU {:#x}+{:#x}{}: {} of {} pages point at "
+                    "old memory (first at +{:#x}), {}",
+                    device_address, cpu_address, size, heap ? " (heap)" : "", stale_pages,
+                    (size + PageSize - 1) / PageSize, first_stale,
+                    remap ? "mapped again" : "kept");
+    }
+    if (!remap) {
+        return;
+    }
+    // Unmapping drops the old pages from the reverse map and invalidates the caches over the range.
+    smmu.Unmap(device_address, size);
+    smmu.Map(device_address, cpu_address, size, asid, true);
+}
+
+} // namespace
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
     : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
@@ -236,9 +300,17 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
                  device_pointer != nullptr && device_pointer == cpu_pointer);
     }
     nx2_gpu_views.Map(gpu_address, cpu_address, size);
-    Nx2GpuCommandScope::Run(system.GPU(), [gmmu = gmmu.get(), gpu_address, device_address, size] {
-        gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
-    });
+    const auto* const session = container.GetSession(nx2_session);
+    Nx2GpuCommandScope::Run(
+        system.GPU(), [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(),
+                       &memory = system.ApplicationMemory(),
+                       asid = session != nullptr ? session->asid : Core::Asid{}, gpu_address,
+                       cpu_address, device_address, size, heap, has_session = session != nullptr] {
+            if (has_session) {
+                Nx2RefreshBacking(smmu, memory, asid, device_address, cpu_address, size, heap);
+            }
+            gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+        });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
     prepared->Commit();
