@@ -75,6 +75,8 @@ struct Scheduler {
     bool worker_waiting{};
     std::atomic<unsigned> queued_chunks{};
     int current_cmdbuf{}, current_upload_cmdbuf{};
+    bool uploads_pending{}; // EDEN_NX2_UPLOAD_BATCH (0924): DispatchWork records a pending batch first
+    void FlushUploads() { uploads_pending = false; }
     std::jthread worker_thread;
     Scheduler() : worker_thread([this](std::stop_token stop) { WorkerThread(stop); }) {}
     void WaitWorker();
