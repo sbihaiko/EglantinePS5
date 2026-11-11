@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/assert.h"
@@ -127,9 +128,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    // EDEN_NX2_PENDING_POLL_US=<us> (Lichii #446; 50 there): after the half
+                    // millisecond of yields, sleep this long instead of 1 ms, for up to 2 s since
+                    // the last progress (menus and loading go back to 1 ms). Ocarina of Time waits
+                    // here ~330 times a second and its present waits for the work behind them:
+                    // with 1 ms sleeps the present waited ~17 ms a frame in Kokiri village, with
+                    // 50 us ~1 ms (PC). Unset or 0: 1 ms sleeps, as before.
+                    static const long long poll_us = [] {
+                        const char* const value = std::getenv("EDEN_NX2_PENDING_POLL_US");
+                        const long long us = value != nullptr ? std::atoll(value) : 0;
+                        return us > 0 && us < 1000 ? us : 0LL;
+                    }();
+                    const auto waited = std::chrono::steady_clock::now() - last_progress;
+                    if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (poll_us != 0 && waited < std::chrono::seconds{2}) {
+                        std::this_thread::sleep_for(std::chrono::microseconds{poll_us});
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
