@@ -62,6 +62,10 @@ namespace Tegra::Engines {
 
 class Maxwell3D final : public EngineInterface {
 public:
+    /// EDEN_NX2_COUNTERS: logs and resets this thread's executable method counts (the split's
+    /// back calls it with its own report).
+    static void ReportExecCounters(double seconds);
+
     explicit Maxwell3D(MemoryManager& memory_manager);
     ~Maxwell3D();
 

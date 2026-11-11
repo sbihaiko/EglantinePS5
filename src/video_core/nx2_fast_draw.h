@@ -91,6 +91,35 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
+/// EDEN_NX2_COUNTERS=1: count-only diagnostics, without the profile's clock reads; read once.
+[[nodiscard]] inline bool CountersEnabled() {
+    static const bool on = std::getenv("EDEN_NX2_COUNTERS") != nullptr;
+    return on;
+}
+
+/// The distinct breaks (reason | method << 8) made on this thread since its last draw took them
+/// (EDEN_NX2_COUNTERS): the rasterizer counts which sets end delta chains, not only the last.
+struct BreakSet {
+    static constexpr u32 Max = 8;
+    std::array<u32, Max> sources{};
+    u32 count{};
+    bool overflow{};
+
+    void Add(u32 source) {
+        for (u32 i = 0; i < count; ++i) {
+            if (sources[i] == source) {
+                return;
+            }
+        }
+        if (count < Max) {
+            sources[count++] = source;
+        } else {
+            overflow = true;
+        }
+    }
+};
+inline thread_local BreakSet t_break_set;
+
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
@@ -98,7 +127,11 @@ inline std::atomic<u32> g_last_break{};
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
-        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+        const u32 source = static_cast<u32>(reason) | (method << 8);
+        g_last_break.store(source, std::memory_order_relaxed);
+        if (CountersEnabled()) {
+            t_break_set.Add(source);
+        }
     }
 }
 

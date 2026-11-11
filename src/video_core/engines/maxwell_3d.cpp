@@ -23,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/texture_barrier_epoch.h"
@@ -32,6 +33,57 @@
 #endif
 
 namespace Tegra::Engines {
+
+namespace {
+
+/// EDEN_NX2_COUNTERS: executable 3D methods run on this thread, by method, and how many found the
+/// register holding the value already. Allocated on first use; leaked with the thread.
+struct ExecCounters {
+    std::array<u32, Maxwell3D::Regs::NUM_REGS> calls{};
+    std::array<u32, Maxwell3D::Regs::NUM_REGS> same{};
+};
+thread_local ExecCounters* t_exec_counters{};
+
+ExecCounters* ExecCountersHere() {
+    if (!VideoCommon::Nx2FastDraw::CountersEnabled()) [[likely]] {
+        return nullptr;
+    }
+    if (t_exec_counters == nullptr) {
+        t_exec_counters = new ExecCounters{};
+    }
+    return t_exec_counters;
+}
+
+} // Anonymous namespace
+
+void Maxwell3D::ReportExecCounters(double seconds) {
+    ExecCounters* const counters = t_exec_counters;
+    if (counters == nullptr) {
+        return;
+    }
+    std::vector<std::pair<u32, u32>> methods;
+    u64 total{};
+    u64 same{};
+    for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
+        if (counters->calls[method] != 0) {
+            methods.emplace_back(counters->calls[method], method);
+            total += counters->calls[method];
+            same += counters->same[method];
+        }
+    }
+    const size_t shown = (std::min<size_t>)(methods.size(), 20);
+    std::partial_sort(methods.begin(), methods.begin() + shown, methods.end(), std::greater{});
+    std::string top;
+    for (size_t i = 0; i < shown; ++i) {
+        const u32 method = methods[i].second;
+        top += fmt::format(" {:#x}:{:.0f} ({}% same)", method,
+                           static_cast<double>(methods[i].first) / seconds,
+                           counters->same[method] * 100 / methods[i].first);
+    }
+    LOG_INFO(HW_GPU, "GPU back executable 3D methods per second: {:.0f} ({:.0f} same value) |{}",
+             static_cast<double>(total) / seconds, static_cast<double>(same) / seconds, top);
+    *counters = ExecCounters{};
+}
 
 /// First register id that is actually a Macro call.
 constexpr u32 MacroRegistersStart = 0xE00;
@@ -628,6 +680,10 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
             ProcessDirtyRegisters(method, argument);
         }
         return;
+    }
+    if (ExecCounters* const counters = ExecCountersHere()) [[unlikely]] {
+        ++counters->calls[method];
+        counters->same[method] += regs.reg_array[method] == argument ? 1 : 0;
     }
     ProcessDirtyRegisters(method, argument);
     ProcessMethodCall(method, argument, method_argument, is_last_call);

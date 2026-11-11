@@ -8,6 +8,7 @@
 
 #include <array>
 #include <chrono>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
@@ -300,6 +301,13 @@ private:
         /// StateChanged draws by the reason of the last break, and by its 3D method.
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, FastDrawMaxwell::NUM_REGS> break_methods{};
+        /// EDEN_NX2_COUNTERS: StateChanged draws by the set of breaks since the previous draw.
+        /// Sizes: none on this thread (breaks on another thread), 1, 2, 3, 4-8, more than 8.
+        std::array<u64, 6> set_sizes{};
+        std::unordered_map<u32, u32> sole_sources; ///< Sets of one break: which
+        std::unordered_map<u32, u32> any_sources;  ///< Draws whose set holds the break
+        std::unordered_map<u64, u32> pair_sources; ///< Sets of two breaks
+        u64 probe_only{}; ///< Sets made only of EDEN_NX2_FAST_DRAW_PROBE methods
         u64 window_start{};
     };
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
@@ -311,6 +319,8 @@ private:
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial);
     void ReportFastDraws();
+    u32 fast_draw_report_ticks{};
+    void CountBreakSet(const VideoCommon::Nx2FastDraw::BreakSet& breaks);
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.

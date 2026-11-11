@@ -264,6 +264,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
+    FastDraw::BreakSet break_set{};
+    if (FastDraw::CountersEnabled()) {
+        break_set = std::exchange(FastDraw::t_break_set, FastDraw::BreakSet{});
+    }
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
         return nullptr;
@@ -283,6 +287,9 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         }
         if (const u32 method = last_break >> 8; method < FastDrawMaxwell::NUM_REGS) {
             ++fast_draw_stats.break_methods[method];
+        }
+        if (FastDraw::CountersEnabled()) {
+            CountBreakSet(break_set);
         }
         return full(FullDraw::StateChanged);
     }
@@ -393,6 +400,52 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
     };
 }
 
+void RasterizerVulkan::CountBreakSet(const VideoCommon::Nx2FastDraw::BreakSet& breaks) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    FastDrawStats& stats = fast_draw_stats;
+    const u32 count = breaks.count;
+    ++stats.set_sizes[breaks.overflow ? 5 : (std::min<u32>)(count, 4)];
+    for (u32 i = 0; i < count; ++i) {
+        ++stats.any_sources[breaks.sources[i]];
+    }
+    if (breaks.overflow || count == 0) {
+        return;
+    }
+    if (count == 1) {
+        ++stats.sole_sources[breaks.sources[0]];
+    } else if (count == 2) {
+        const u32 low = (std::min)(breaks.sources[0], breaks.sources[1]);
+        const u32 high = (std::max)(breaks.sources[0], breaks.sources[1]);
+        ++stats.pair_sources[(u64{low} << 32) | high];
+    }
+    // EDEN_NX2_FAST_DRAW_PROBE=<3D methods, comma separated> (default 0x54c,0x556): the methods a
+    // change would stop breaking on, as register writes or as methods. Counts the draws whose
+    // breaks were all among them: the draws that change would turn into delta draws.
+    static const std::vector<u32> probe = [] {
+        std::vector<u32> methods;
+        const char* value = std::getenv("EDEN_NX2_FAST_DRAW_PROBE");
+        std::string_view rest = value != nullptr ? value : "0x54c,0x556";
+        while (!rest.empty()) {
+            const size_t comma = rest.find(',');
+            const std::string item{rest.substr(0, comma)};
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            if (!item.empty()) {
+                methods.push_back(static_cast<u32>(std::strtoul(item.c_str(), nullptr, 0)));
+            }
+        }
+        return methods;
+    }();
+    const bool only_probe = std::all_of(breaks.sources.begin(), breaks.sources.begin() + count,
+                                        [](u32 source) {
+        const auto reason = static_cast<FastDraw::Reason>(source & 0xff);
+        return (reason == FastDraw::Reason::Register || reason == FastDraw::Reason::Method) &&
+               std::find(probe.begin(), probe.end(), source >> 8) != probe.end();
+    });
+    if (only_probe) {
+        ++stats.probe_only;
+    }
+}
+
 void RasterizerVulkan::ReportFastDraws() {
     const u64 now = VideoCommon::Nx2Profile::Now();
     FastDrawStats& stats = fast_draw_stats;
@@ -403,8 +456,9 @@ void RasterizerVulkan::ReportFastDraws() {
     if (now - stats.window_start < 10'000'000'000ULL) {
         return;
     }
-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
+    // Logged only with EDEN_NX2_GPU_PROFILE, EDEN_NX2_FAST_DRAW_VERIFY or EDEN_NX2_COUNTERS.
+    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify &&
+        !VideoCommon::Nx2FastDraw::CountersEnabled()) {
         stats = FastDrawStats{.window_start = now};
         return;
     }
@@ -493,6 +547,47 @@ void RasterizerVulkan::ReportFastDraws() {
     }
     LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
              breaks, top);
+    if (VideoCommon::Nx2FastDraw::CountersEnabled()) {
+        namespace FastDraw = VideoCommon::Nx2FastDraw;
+        const auto source_name = [](u32 source) {
+            const u32 reason = source & 0xff;
+            const u32 method = source >> 8;
+            if (reason == static_cast<u32>(FastDraw::Reason::Register)) {
+                return fmt::format("reg {:#x}", method);
+            }
+            if (reason == static_cast<u32>(FastDraw::Reason::Method)) {
+                return fmt::format("method {:#x}", method);
+            }
+            const char* name = reason < FastDraw::reason_names.size() ? FastDraw::reason_names[reason] : "?";
+            return method != 0 ? fmt::format("{} {:#x}", name, method) : std::string{name};
+        };
+        const auto top_of = [&](const auto& map, size_t limit, const auto& name) {
+            std::vector<std::pair<u32, typename std::decay_t<decltype(map)>::key_type>> sorted;
+            for (const auto& [key, value] : map) {
+                sorted.emplace_back(value, key);
+            }
+            const size_t n = (std::min)(sorted.size(), limit);
+            std::partial_sort(sorted.begin(), sorted.begin() + n, sorted.end(), std::greater{});
+            std::string text;
+            for (size_t i = 0; i < n; ++i) {
+                text += fmt::format(" {}:{:.0f}", name(sorted[i].second),
+                                    static_cast<double>(sorted[i].first) / seconds);
+            }
+            return text.empty() ? std::string{" none"} : text;
+        };
+        const auto pair_name = [&](u64 key) {
+            return source_name(static_cast<u32>(key >> 32)) + "+" + source_name(static_cast<u32>(key));
+        };
+        const auto rate = [&](u64 value) { return static_cast<double>(value) / seconds; };
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw break sets per second (state changed draws): breaks on another thread "
+                 "{:.0f}, 1 {:.0f}, 2 {:.0f}, 3 {:.0f}, 4-8 {:.0f}, over 8 {:.0f} | only probe "
+                 "methods {:.0f} | sole:{} | pairs:{} | in the set:{}",
+                 rate(stats.set_sizes[0]), rate(stats.set_sizes[1]), rate(stats.set_sizes[2]),
+                 rate(stats.set_sizes[3]), rate(stats.set_sizes[4]), rate(stats.set_sizes[5]),
+                 rate(stats.probe_only), top_of(stats.sole_sources, 12, source_name),
+                 top_of(stats.pair_sources, 8, pair_name), top_of(stats.any_sources, 16, source_name));
+    }
     stats = FastDrawStats{.window_start = now};
 }
 
@@ -719,7 +814,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             const size_t index = static_cast<size_t>(path);
             fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
             ++fast_draw_stats.prepare_draws[index];
-            // Every 10 s, from the thread that owns the counters.
+        }
+        // Every 10 s, from the thread that owns the counters (one clock read every 256 draws
+        // when only the counters are on).
+        if (fast_draw_timed ||
+            (VideoCommon::Nx2FastDraw::CountersEnabled() && (++fast_draw_report_ticks & 255) == 0)) {
             ReportFastDraws();
         }
     }

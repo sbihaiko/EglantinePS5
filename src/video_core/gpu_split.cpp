@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -30,6 +33,85 @@
 namespace VideoCommon {
 
 namespace {
+
+/// EDEN_NX2_COUNTERS: the back's ring entries by kind, and its deferred calls by function, counted
+/// without clock reads. Allocated on the back when the counters are on.
+struct BackCounters {
+    enum Kind : size_t {
+        EngineEntry,
+        MethodDirect,
+        MethodRun,
+        MethodSunk,
+        MultiEntry,
+        RegsEntry,
+        RegsWrites,
+        CbDataEntry,
+        CallNeutral,
+        CallBreaking,
+        Count,
+    };
+    std::array<u64, Count> kinds{};
+    std::unordered_map<u64, u64> calls; ///< Kind::Call entries by thunk address
+    u64 window_start{};
+    u32 ticks{};
+};
+thread_local BackCounters* t_back_counters{};
+
+/// Logged with the thunk addresses: its own address in the symbols ELF turns them into names.
+[[gnu::noinline]] u64 Nx2CountersAnchor() {
+    return 0x4e78324374ULL;
+}
+
+void CountBack(BackCounters::Kind kind, u64 amount = 1) {
+    if (BackCounters* const counters = t_back_counters) [[unlikely]] {
+        counters->kinds[kind] += amount;
+    }
+}
+
+void ReportBackCounters() {
+    BackCounters* const counters = t_back_counters;
+    if (counters == nullptr || (++counters->ticks & 255) != 0) {
+        return;
+    }
+    const u64 now = Nx2Profile::Now();
+    if (counters->window_start == 0) {
+        counters->window_start = now;
+        return;
+    }
+    if (now - counters->window_start < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - counters->window_start) / 1e9;
+    const auto rate = [&](size_t kind) {
+        return static_cast<double>(counters->kinds[kind]) / seconds;
+    };
+    std::vector<std::pair<u64, u64>> calls;
+    for (const auto& [thunk, count] : counters->calls) {
+        calls.emplace_back(count, thunk);
+    }
+    const size_t shown = (std::min<size_t>)(calls.size(), 16);
+    std::partial_sort(calls.begin(), calls.begin() + shown, calls.end(), std::greater{});
+    std::string top;
+    for (size_t i = 0; i < shown; ++i) {
+        top += fmt::format(" {:#x}:{:.0f}", calls[i].second,
+                           static_cast<double>(calls[i].first) / seconds);
+    }
+    LOG_INFO(HW_GPU,
+             "GPU back entries per second: engine {:.0f} | methods direct {:.0f}, run {:.0f}, "
+             "sunk {:.0f} | multi {:.0f} | register blocks {:.0f} ({:.0f} writes) | constant "
+             "buffer data {:.0f} | calls {:.0f} fast draw neutral, {:.0f} breaking | calls by "
+             "thunk (anchor {:#x}):{}",
+             rate(BackCounters::EngineEntry), rate(BackCounters::MethodDirect),
+             rate(BackCounters::MethodRun), rate(BackCounters::MethodSunk),
+             rate(BackCounters::MultiEntry), rate(BackCounters::RegsEntry),
+             rate(BackCounters::RegsWrites), rate(BackCounters::CbDataEntry),
+             rate(BackCounters::CallNeutral), rate(BackCounters::CallBreaking),
+             reinterpret_cast<u64>(&Nx2CountersAnchor), top);
+    Tegra::Engines::Maxwell3D::ReportExecCounters(seconds);
+    counters->kinds = {};
+    counters->calls.clear();
+    counters->window_start = now;
+}
 
 void Pause() {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -397,6 +479,7 @@ size_t GpuSplit::Execute(const u64* entry) {
     case Kind::Wrap:
         return 0;
     case Kind::Engine:
+        CountBack(BackCounters::EngineEntry);
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
     case Kind::Method: {
@@ -407,12 +490,15 @@ size_t GpuSplit::Execute(const u64* entry) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
         }
         if ((head & Direct) != 0) {
+            CountBack(BackCounters::MethodDirect);
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
         } else if (!engine->execution_mask[method]) {
+            CountBack(BackCounters::MethodSunk);
             engine->method_sink.emplace_back(method, argument);
         } else {
+            CountBack(BackCounters::MethodRun);
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
@@ -426,6 +512,7 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
+        CountBack(BackCounters::MultiEntry);
         auto* const engine = back_engine;
         if (!engine->reports_fast_draw_breaks) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
@@ -441,6 +528,8 @@ size_t GpuSplit::Execute(const u64* entry) {
     }
     case Kind::Regs: {
         const u32 count = static_cast<u32>((head >> 8) & 0xff);
+        CountBack(BackCounters::RegsEntry);
+        CountBack(BackCounters::RegsWrites, count);
         auto* const engine = back_engine;
         if (!engine->reports_fast_draw_breaks) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
@@ -454,6 +543,7 @@ size_t GpuSplit::Execute(const u64* entry) {
     }
     case Kind::CbData: {
         const u32 count = static_cast<u32>((head >> 8) & 0xff);
+        CountBack(BackCounters::CbDataEntry);
         auto* const engine = back_engine;
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
@@ -461,6 +551,11 @@ size_t GpuSplit::Execute(const u64* entry) {
         return 1 + count;
     }
     case Kind::Call: {
+        if (BackCounters* const counters = t_back_counters) [[unlikely]] {
+            ++counters->kinds[(head & FastDrawNeutral) != 0 ? BackCounters::CallNeutral
+                                                            : BackCounters::CallBreaking];
+            ++counters->calls[entry[1]];
+        }
         if ((head & FastDrawNeutral) == 0) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
@@ -481,9 +576,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
+    if (Nx2FastDraw::CountersEnabled()) {
+        t_back_counters = new BackCounters{};
+    }
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
+        ReportBackCounters();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
