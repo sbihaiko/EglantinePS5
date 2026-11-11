@@ -89,14 +89,13 @@ index 43dda1b1da..a74026b79d 100644
                  back_waiting.store(true, std::memory_order_seq_cst);
                  const u32 seen = wake.load(std::memory_order_seq_cst);
                  available = published.load(std::memory_order_seq_cst);
-@@ -625,6 +628,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+@@ -626,5 +628,6 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         u64 last_store = read_position;
+         g_back_busy.store(true, std::memory_order_relaxed);
++        const Common::StallLedger::BackPhaseScope executing{Common::StallLedger::BackPhase::Execute};
          while (read_position != available) {
              const size_t index = read_position & RingMask;
              Tegra::g_nx2_back_position.store(read_position, std::memory_order_relaxed);
-+            const Common::StallLedger::BackPhaseScope executing{Common::StallLedger::BackPhase::Execute};
-             const size_t size = Execute(&ring[index]);
-             read_position += size != 0 ? size : RingWords - index;
-             if (hook_requested.load(std::memory_order_relaxed) &&
 diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
 index 7e97bb6506..f89ff1b58b 100644
 --- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
