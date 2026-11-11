@@ -1,0 +1,46 @@
+diff --git a/src/video_core/buffer_cache/usage_tracker.h b/src/video_core/buffer_cache/usage_tracker.h
+index 3e2da8bc0b..2f26da8318 100644
+--- a/src/video_core/buffer_cache/usage_tracker.h
++++ b/src/video_core/buffer_cache/usage_tracker.h
+@@ -29,6 +29,7 @@ public:
+     void Reset() noexcept {
+         std::ranges::fill(pages, 0ULL);
+         recent.fill({~u64{0}, 0});
++        covered_begin = covered_end = 0;
+     }
+ 
+     void Track(u64 offset, u64 size) noexcept {
+@@ -40,6 +41,12 @@ public:
+                 return;
+             }
+         }
++        // Inside the largest range tracked since Reset: every bit is already set. Native
++        // programs bind several pointers into one pool of over 100 MiB for every dispatch and
++        // draw, more than the four ranges remembered above.
++        if (offset >= covered_begin && offset + size <= covered_end) {
++            return;
++        }
+         recent[recent_cursor++ % recent.size()] = {offset, size};
+         const size_t page = offset >> BUFFER_PAGE_SHIFT;
+         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
+@@ -56,6 +63,10 @@ public:
+         const size_t offset_end = offset + size;
+         const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
+         TrackPage(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
++        if (size > covered_end - covered_begin) {
++            covered_begin = offset;
++            covered_end = offset_end;
++        }
+     }
+ 
+     [[nodiscard]] bool IsUsed(u64 offset, u64 size) const noexcept {
+@@ -100,6 +111,9 @@ private:
+     /// Ranges tracked last, (offset, size).
+     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+     size_t recent_cursor{};
++    /// The largest range tracked since Reset, [begin, end) in bytes.
++    u64 covered_begin{};
++    u64 covered_end{};
+ };
+ 
+ } // namespace VideoCommon

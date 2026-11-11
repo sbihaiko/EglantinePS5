@@ -770,12 +770,33 @@ static size_t eden_heap_release_arenas(void) {
   return released;
 }
 
+/* EDEN_PS5_HEAP_NO_GIVEBACK=1: the heap keeps every piece and arena it took, and eden_heap_trim
+ * gives nothing back. In Ocarina of Time a GPU page fault or hang followed the first "gave back
+ * 32 MiB: the pool is short" within about 10 s; this tests whether the release is the trigger.
+ * Large blocks of their own (32 MiB or more) still go back when freed. */
+static int eden_heap_no_giveback(void) {
+  static atomic_int value = -1;
+  int seen = atomic_load_explicit(&value, memory_order_relaxed);
+  if (seen < 0) {
+    const char *text = getenv("EDEN_PS5_HEAP_NO_GIVEBACK");
+    seen = text != NULL && text[0] == '1' && text[1] == '\0';
+    atomic_store_explicit(&value, seen, memory_order_relaxed);
+  }
+  return seen;
+}
+
 /* Gives the memory of every space (but the first) that holds no block back to the system: the
  * space is retired, its memory released, its address space kept for a later growth. Returns the
  * bytes given back. */
 size_t eden_heap_trim(void) {
   if (atomic_load_explicit(&ps5_heap_state, memory_order_acquire) != 2 || !eden_heap_grows)
     return 0;
+  if (eden_heap_no_giveback()) {
+    static atomic_uint told;
+    if (atomic_fetch_add_explicit(&told, 1, memory_order_relaxed) == 0)
+      sceKernelDebugOutText(0, "EDEN_PS5_HEAP_NO_GIVEBACK: the heap keeps its memory (trim skipped)\n");
+    return 0;
+  }
   size_t returned = eden_heap_release_arenas();
   eden_heap_grow_acquire();
   const unsigned count = atomic_load_explicit(&eden_heap_space_count, memory_order_relaxed);

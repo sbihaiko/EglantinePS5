@@ -1,0 +1,465 @@
+From 6d25cdb4ac2d5d3f2a13adf387b3ddf630b935a2 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 08:36:42 -0300
+Subject: [PATCH 2/3] texture_cache: delete images whose memory went entirely
+ to newer images, with EDEN_NX2_TC_SUPERSEDED=1
+
+Ocarina of Time moves its render targets within a memory pool every frame
+while the camera moves (about 45 images a frame in the Castle Town guard
+house). The old images stay registered until the collector reaches them,
+far slower than they arrive, and VRAM spills.
+
+At the frame boundary, delete a bad-overlapping image unused for 2 frames
+once the images prepared after it cover all of its range, without a download
+when nothing is lost: the image holds no GPU data, or every covering image
+is GPU-written and cleared its whole surface after the image's last write
+(full_write_tick), so a guest read or a join sees the newer bytes either
+way. Covers that were only drawn into, partial covers, aliased, sparse and
+unbacked images are left to the collector. Switch 2 titles only. The pages
+are not marked stale: the covering images hold the bytes, and a stale page
+lets an image made over them skip its upload without being filled.
+
+The decision is a pure function (superseded_images.h). The 600-frame
+statistics block gets a line for the deletions and the GPU-written
+candidates kept for lack of proof.
+
+Differences from Lichii: this core lacks #817 (skip the upload of a new
+target a clear overwrites whole), so ClearCovers and ClearOverwritesWhole
+are added as new functions; IsFullClear and JoinImages are unchanged.
+PartialDownload images (pending partial readback, GpuModified may be clear)
+are excluded as candidates and as covers. last_use_frame and
+full_write_tick are kept only with the switch on.
+
+Off by default; with the switch unset nothing is scanned or deleted. Port
+of Lichii #1314 (commit 2 of 3); its Catch2 test is run as a host test
+outside the tree, with one more case for PartialDownload.
+---
+ src/video_core/CMakeLists.txt                 |   1 +
+ src/video_core/texture_cache/image_base.h     |   6 +
+ .../texture_cache/superseded_images.h         |  94 ++++++++++
+ src/video_core/texture_cache/texture_cache.h  | 174 ++++++++++++++++++
+ .../texture_cache/texture_cache_base.h        |  21 +++
+ 5 files changed, 296 insertions(+)
+ create mode 100644 src/video_core/texture_cache/superseded_images.h
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 2e29514..e937653 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -269,6 +269,7 @@ add_library(video_core STATIC
+     texture_cache/sampled_views.h
+     texture_cache/samples_helper.h
+     texture_cache/stale_pages.h
++    texture_cache/superseded_images.h
+     texture_cache/texture_cache.cpp
+     texture_cache/texture_cache.h
+     texture_cache/texture_cache_base.h
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index f895ec0..3bce683 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -146,6 +146,12 @@ struct ImageBase {
+     ImageId feedback_source{};
+     u64 feedback_barrier_epoch = ~u64{0};
+     u64 feedback_rt_serial = ~u64{0};
++    /// modification_tick of the latest GPU write that covered the whole image (a clear).
++    /// Kept only with EDEN_NX2_TC_SUPERSEDED (TextureCache::NoteWholeClears).
++    u64 full_write_tick = 0;
++    /// Last frame the image was prepared for use in (TextureCache::PrepareImage), 0 before.
++    /// Kept only with EDEN_NX2_TC_SUPERSEDED.
++    u64 last_use_frame = 0;
+     size_t lru_index = SIZE_MAX;
+ 
+     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
+diff --git a/src/video_core/texture_cache/superseded_images.h b/src/video_core/texture_cache/superseded_images.h
+new file mode 100644
+index 0000000..6c48772
+--- /dev/null
++++ b/src/video_core/texture_cache/superseded_images.h
+@@ -0,0 +1,94 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <utility>
++#include <boost/container/small_vector.hpp>
++
++#include "common/common_types.h"
++#include "video_core/texture_cache/image_base.h"
++
++namespace VideoCommon {
++
++// Superseded images (Lichii #1314), used by TextureCache::DeleteSupersededImages with
++// EDEN_NX2_TC_SUPERSEDED=1.
++
++enum class Supersession : u8 {
++    None,       ///< Keep the image.
++    Unproven,   ///< Newer images cover it, but its GPU-written bytes may outlive their writes.
++    Clean,      ///< Newer images cover it and it holds no GPU data a guest read could want.
++    Rewritten,  ///< Newer images cover it and each cleared itself whole after its last GPU write.
++};
++
++/// Whether the memory of a bad-overlapping image belongs entirely to images used after it, so
++/// that deleting it without a download changes no byte a guest read, or a join, can return.
++///
++/// A guest read downloads the overlapping images in modification_tick order and a join copies
++/// them in that order, each over its whole range: an older image is only seen where no newer one
++/// reaches. An image holding GPU data is therefore dropped only when every byte of its range lies
++/// in newer images that still hold GPU data (downloadable) and cleared their whole surface after
++/// its last write (full_write_tick): those bytes were rewritten, whatever was drawn since. One
++/// that only covers a part, or whose cover was not cleared whole, is Unproven and stays.
++///
++/// Known limit (from Lichii): bytes of the range that belong to no image's texels (block-linear
++/// padding at the bottom of an image) count as covered.
++///
++/// This core also excludes PartialDownload images (Mario Kart World partial readback): their GPU
++/// data is only partly written back and GpuModified may be clear while it is pending, so
++/// IsSafeGpuCopy would call them clean.
++template <typename Images>
++[[nodiscard]] Supersession ClassifySuperseded(const Images& images, const ImageBase& image) {
++    constexpr ImageFlagBits Excluded =
++        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
++        ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse | ImageFlagBits::Remapped |
++        ImageFlagBits::IsDecoding | ImageFlagBits::TrimmedLevels | ImageFlagBits::PartialDownload;
++    if (image.overlapping_images.empty() || !image.aliased_images.empty() ||
++        True(image.flags & Excluded) || image.cpu_addr >= image.cpu_addr_end) {
++        return Supersession::None;
++    }
++    const bool holds_gpu_data = image.IsSafeGpuCopy();
++    using Span = std::pair<VAddr, VAddr>;
++    boost::container::small_vector<Span, 8> used_after;
++    boost::container::small_vector<Span, 8> rewritten_after;
++    for (const ImageId overlap_id : image.overlapping_images) {
++        const ImageBase& other = images[overlap_id];
++        if (other.last_use_frame <= image.last_use_frame ||
++            True(other.flags & (Excluded | ImageFlagBits::CpuModified)) ||
++            False(other.flags & ImageFlagBits::Registered)) {
++            continue;
++        }
++        const Span span{(std::max)(other.cpu_addr, image.cpu_addr),
++                        (std::min)(other.cpu_addr_end, image.cpu_addr_end)};
++        if (span.first >= span.second) {
++            continue;
++        }
++        used_after.push_back(span);
++        if (True(other.flags & ImageFlagBits::GpuModified) &&
++            other.modification_tick > image.modification_tick &&
++            other.full_write_tick > image.modification_tick) {
++            rewritten_after.push_back(span);
++        }
++    }
++    const auto covers = [&image](boost::container::small_vector<Span, 8>& spans) {
++        std::ranges::sort(spans);
++        VAddr reached = image.cpu_addr;
++        for (const auto& [begin, end] : spans) {
++            if (begin > reached) {
++                return false;
++            }
++            reached = (std::max)(reached, end);
++        }
++        return reached >= image.cpu_addr_end;
++    };
++    if (!holds_gpu_data) {
++        return covers(used_after) ? Supersession::Clean : Supersession::None;
++    }
++    if (covers(rewritten_after)) {
++        return Supersession::Rewritten;
++    }
++    return covers(used_after) ? Supersession::Unproven : Supersession::None;
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 97023f1..24f3aa3 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -154,8 +154,64 @@ namespace {
+     }();
+     return enabled;
+ }
++
++// EDEN_NX2_TC_SUPERSEDED=1: delete images whose memory went entirely to newer images
++// (DeleteSupersededImages; Lichii #1314).
++[[nodiscard]] inline bool SupersededImagesEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
+ } // namespace
+ 
++template <class P>
++void TextureCache<P>::DeleteSupersededImages() {
++    // EDEN_NX2_TC_SUPERSEDED=1 (Lichii #1314): Ocarina of Time moves its render targets within a
++    // memory pool every frame while the camera moves (about 45 images a frame in the Castle Town
++    // guard house). The old images stayed registered until the age-based collector reached them,
++    // far slower than they arrived, and VRAM spilled. Once the memory of an image belongs
++    // entirely to newer images (see ClassifySuperseded for what that has to prove) nothing can
++    // read it any more. Switch 2 titles only.
++    static constexpr u64 MinFramesUnused = 2;
++    if (!SupersededImagesEnabled() || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
++        frame_tick <= MinFramesUnused ||
++        frame_tick - superseded_activity_frame > MinFramesUnused + 1) {
++        return;
++    }
++    superseded_ids.clear();
++    lru_cache.ForEachItemBelow(frame_tick - MinFramesUnused, [this](ImageId image_id) {
++        const Image& image = slot_images[image_id];
++        if (image.overlapping_images.empty()) {
++            return false;
++        }
++        switch (ClassifySuperseded(slot_images, image)) {
++        case Supersession::Clean:
++        case Supersession::Rewritten:
++            superseded_ids.push_back(image_id);
++            break;
++        case Supersession::Unproven:
++            ++superseded_unproven;
++            break;
++        case Supersession::None:
++            break;
++        }
++        return false;
++    });
++    for (const ImageId image_id : superseded_ids) {
++        Image& image = slot_images[image_id];
++        ++(image.IsSafeGpuCopy() ? superseded_rewritten_deletes : superseded_clean_deletes);
++        // Not marked stale (MarkStale): the covering images hold the bytes, and marking their
++        // pages would let an image made over them skip its upload without being filled.
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++        UnregisterImage(image_id);
++        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
++    }
++}
++
+ template <class P>
+ void TextureCache<P>::RunGarbageCollector() {
+     const u64 probe_initial_usage = total_used_memory;
+@@ -540,6 +596,15 @@ void TextureCache<P>::TickFrame() {
+                  "for buffer-written pages; {} MiB of pages marked stale",
+                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
+                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
++        if (SupersededImagesEnabled()) {
++            LOG_INFO(HW_GPU,
++                     "Texture cache last 600 frames: superseded images deleted {} ({} held GPU "
++                     "data rewritten by newer images); GPU-written candidates without that proof, "
++                     "summed over frames: {}",
++                     superseded_clean_deletes + superseded_rewritten_deletes,
++                     superseded_rewritten_deletes, superseded_unproven);
++            superseded_clean_deletes = superseded_rewritten_deletes = superseded_unproven = 0;
++        }
+         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
+         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+         astc_opaque_images = astc_alpha_images = 0;
+@@ -557,6 +622,7 @@ void TextureCache<P>::TickFrame() {
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    DeleteSupersededImages();
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+@@ -1022,6 +1088,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+         }
+         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
+         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
++        if (is_clear && SupersededImagesEnabled()) {
++            NoteWholeClears();
++        }
+         return;
+     }
+ 
+@@ -1040,6 +1109,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
+ 
+     PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
++    if (is_clear && SupersededImagesEnabled()) {
++        NoteWholeClears();
++    }
+ 
+     rt_active_mask = 0;
+     rt_image_id = {};
+@@ -3117,6 +3189,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         join_alias_indices.emplace(aliased_id, alias_index);
+         new_image.flags |= ImageFlagBits::Alias;
+     }
++    if (!join_bad_overlap_ids.empty() && SupersededImagesEnabled()) {
++        superseded_activity_frame = frame_tick;
++    }
+     for (const ImageId aliased_id : join_bad_overlap_ids) {
+         ImageBase& aliased = slot_images[aliased_id];
+         aliased.overlapping_images.push_back(new_image_id);
+@@ -4400,6 +4475,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+         MarkModification(image);
+     }
+     lru_cache.Touch(image.lru_index, frame_tick);
++    if (SupersededImagesEnabled()) {
++        image.last_use_frame = frame_tick;
++    }
+ }
+ 
+ template <class P>
+@@ -4586,6 +4664,102 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
+            scissor.max_y >= size.height;
+ }
+ 
++template <class P>
++bool TextureCache<P>::ClearCovers(u32 width, u32 height) const {
++    // From Lichii (#817, used by #1314). Stricter than IsFullClear, which is left unchanged: it
++    // also checks the render area and the lower-left window origin.
++    const auto& regs = maxwell3d->regs;
++    // The render area is the surface clip's size.
++    if (regs.surface_clip.width < width || regs.surface_clip.height < height) {
++        return false;
++    }
++    if (regs.clear_control.use_scissor == 0) {
++        return true;
++    }
++    // With a lower-left window origin, the clear's scissor is flipped around the surface clip's
++    // height (GetScissorState).
++    const auto& scissor = regs.scissor_test[0];
++    const bool lower_left =
++        regs.window_origin.mode != Tegra::Engines::Maxwell3D::Regs::WindowOrigin::Mode::UpperLeft;
++    const s32 clip_height = static_cast<s32>(regs.surface_clip.height.Value());
++    const s32 min_y = static_cast<s32>(scissor.min_y.Value());
++    const s32 max_y = static_cast<s32>(scissor.max_y.Value());
++    const s32 top = lower_left ? clip_height - max_y : min_y;
++    const s32 bottom = lower_left ? clip_height - min_y : max_y;
++    return scissor.min_x == 0 && top <= 0 && scissor.max_x >= width &&
++           bottom >= static_cast<s32>(height);
++}
++
++template <class P>
++bool TextureCache<P>::ClearOverwritesWhole(const ImageInfo& new_info, GPUVAddr gpu_addr) const {
++    // Lichii's check for a new target a clear overwrites whole (#817), which this core does not
++    // have; here only NoteWholeClears calls it, during a clear.
++    if (new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
++        new_info.resources.layers != 1 || new_info.num_samples != 1) {
++        return false;
++    }
++    const auto& regs = maxwell3d->regs;
++    const auto& surface = regs.clear_surface;
++    if (surface.layer != 0) {
++        return false;
++    }
++    const u32 width = new_info.size.width;
++    const u32 height = new_info.size.height;
++    if (!ClearCovers(width, height)) {
++        return false;
++    }
++    // The clear covers the framebuffer's render area, the smallest bound target.
++    for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
++        const auto& rt = regs.rt[index];
++        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
++            (rt.width < width || rt.height < height)) {
++            return false;
++        }
++    }
++    if (regs.zeta_enable && regs.zeta.Address() != 0 &&
++        (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
++        return false;
++    }
++    const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
++    const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
++    switch (VideoCore::Surface::GetFormatType(new_info.format)) {
++    case VideoCore::Surface::SurfaceType::ColorTexture: {
++        // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
++        const u32 index = surface.RT;
++        return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
++               index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
++               regs.rt[index].Address() == gpu_addr;
++    }
++    case VideoCore::Surface::SurfaceType::Depth:
++        return is_depth_target && surface.Z;
++    case VideoCore::Surface::SurfaceType::Stencil:
++        return is_depth_target && full_stencil;
++    case VideoCore::Surface::SurfaceType::DepthStencil:
++        return is_depth_target && surface.Z && full_stencil;
++    default:
++        return false;
++    }
++}
++
++template <class P>
++void TextureCache<P>::NoteWholeClears() {
++    const auto note = [this](ImageViewId view_id) {
++        if (!PreparesImage(slot_image_views, view_id)) {
++            return;
++        }
++        Image& image = slot_images[slot_image_views[view_id].image_id];
++        if (ClearOverwritesWhole(image.info, image.gpu_addr) &&
++            slot_image_views[view_id].size == image.info.size) {
++            image.full_write_tick = image.modification_tick;
++            superseded_activity_frame = frame_tick;
++        }
++    };
++    for (const ImageViewId view_id : render_targets.color_buffer_ids) {
++        note(view_id);
++    }
++    note(render_targets.depth_buffer_id);
++}
++
+ template <class P>
+ void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel) {
+     VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannel(channel);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 3fd2cd1..33413aa 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -44,6 +44,7 @@
+ #include "video_core/texture_cache/render_targets.h"
+ #include "video_core/texture_cache/sampled_views.h"
+ #include "video_core/texture_cache/stale_pages.h"
++#include "video_core/texture_cache/superseded_images.h"
+ #include "video_core/texture_cache/types.h"
+ #include "video_core/textures/texture.h"
+ 
+@@ -427,6 +428,16 @@ private:
+     /// Runs the Garbage Collector.
+     void RunGarbageCollector();
+ 
++    /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
++    void DeleteSupersededImages();
++
++    /// Whether the clear being made writes all of an image, bound at gpu_addr as a render target.
++    /// Only meaningful while a clear binds its render targets (UpdateRenderTargets(true)).
++    [[nodiscard]] bool ClearOverwritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
++
++    /// Records the render targets the current clear writes whole (ImageBase::full_write_tick).
++    void NoteWholeClears();
++
+     /// Find or create an image view in the guest descriptor table
+     ImageViewId VisitImageView(u32 index, bool compute);
+ 
+@@ -565,6 +576,9 @@ private:
+     /// Returns true if the current clear parameters clear the whole image of a given image view
+     [[nodiscard]] bool IsFullClear(ImageViewId id);
+ 
++    /// Returns true if the current clear's render area and scissor cover a width x height image
++    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
++
+     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
+                                                       bool mark_as_modified);
+ 
+@@ -705,6 +719,13 @@ private:
+     std::deque<PendingUnswizzle> unswizzle_queue;
+     u8 current_unswizzle_frame;
+ 
++    // Superseded images (DeleteSupersededImages)
++    std::vector<ImageId> superseded_ids;
++    u64 superseded_activity_frame{}; ///< Last frame a bad overlap appeared or a clear wrote whole
++    u64 superseded_clean_deletes{};
++    u64 superseded_rewritten_deletes{};
++    u64 superseded_unproven{}; ///< Candidates kept for lack of proof, per scan
++
+     // Join caching
+     boost::container::small_vector<ImageId, 4> join_overlap_ids;
+     ::Common::unordered_set<ImageId> join_overlaps_found;
+-- 
+2.53.0
+

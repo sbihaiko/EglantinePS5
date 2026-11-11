@@ -1,8 +1,8 @@
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index 92572febd7..6453919f3c 100644
+index 988ce5f..e6357ce 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
-@@ -2420,10 +2420,33 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+@@ -2528,10 +2528,33 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
          const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
                                          packed_size != 0 &&
                                          packed_size <= memory_layout_size;
@@ -36,5 +36,5 @@ index 92572febd7..6453919f3c 100644
 +        }
 +        return fallback;
      }();
- 
-     // Alignment only applies to the offset of the buffer
+     if ((native_pointer || table_pointer) && size != 0) {
+         // Stop where the mapping or its device range does: the binding is one device range.

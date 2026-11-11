@@ -46,7 +46,23 @@ python3 "$root/tools/patch-radv-disk-cache.py"
 python3 "$root/tools/patch-radv-memory-report.py"
 python3 "$root/tools/patch-radv-pieces.py"
 python3 "$root/tools/patch-radv-trim.py"
+# Mihawk PS5_Mesa f5610fe270: freed buffers kept until the GPU has run what was submitted before
+# (RADV_PS5_RETIRE=1; off by default). After the trim: a held buffer leaves its list.
+python3 "$root/tools/patch-radv-retire.py"
+# Log lines to match a GPU fault address against frees, pieces, sparse binds, replaced queue
+# buffers and trims (RADV_PS5_FREE_LOG=1; off by default).
+python3 "$root/tools/patch-radv-free-log.py"
 python3 "$root/tools/patch-radv-gs-compute.py"
+# Mihawk PS5_Mesa 0f86253f: the mesh shaders' scratch ring is 128 MiB, not 320. The ring held 320
+# MiB of the console's one pool from the first mesh draw to process end; a title that draws scenery
+# with mesh shaders ran out of memory with it standing idle.
+mesh_ring="$root/tools/radv-patches/0f86253f-mesh-ring.patch"
+if git -C "$PS5_MESA_FORK" apply --check "$mesh_ring" 2> /dev/null; then
+    git -C "$PS5_MESA_FORK" apply "$mesh_ring"
+elif ! git -C "$PS5_MESA_FORK" apply --check --reverse "$mesh_ring" 2> /dev/null; then
+    echo "$mesh_ring applies neither forward nor backward to $PS5_MESA_FORK" >&2
+    exit 1
+fi
 # PlayTendoh's submit thread, by way of Vampinity (RADV_PS5_SUBMIT_THREAD=1; off by default).
 python3 "$root/tools/patch-radv-submit-thread.py"
 # ProsperoEden's patch-radv-transfer-split.py (splitting before transfers and barriers) is not
@@ -63,6 +79,10 @@ python3 "$root/tools/patch-radv-pieces.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_MEMORY_PIECES_SHA256"
 python3 "$root/tools/patch-radv-trim.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_MEMORY_TRIM_SHA256"
+python3 "$root/tools/patch-radv-retire.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_RETIRE_SHA256"
+python3 "$root/tools/patch-radv-free-log.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_FREE_LOG_SHA256"
 python3 "$root/tools/patch-radv-gs-compute.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_GS_COMPUTE_SHA256"
 python3 "$root/tools/patch-radv-submit-thread.py" --digest \

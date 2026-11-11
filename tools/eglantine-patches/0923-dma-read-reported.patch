@@ -1,0 +1,73 @@
+From 033fceb882d33486dd0875420064fe1e8003490d Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 11:10:09 -0300
+Subject: [PATCH] maxwell_3d: read report slots ahead once their report ran,
+ with EDEN_NX2_DMA_READ_REPORTED=1
+
+The split front reads an MME DMA source ahead of the back unless a wait for
+idle is pending, a write to it is still queued, or a report was ever sent to
+one of its words: the back's query cache can hold a result after running it.
+Lichii found Ocarina of Time's macro 0xe2c reading report slots in 97.5% of
+its ~51,600 reads a second, and the drains changed none of those words. With
+the switch, a word whose report the back already ran is read ahead when no
+page of the range may hold GPU-written data (Nx2MayBeGpuWritten, or no CPU
+mapping). A pending wait for idle still drains, since this tree has no
+narrower wait for compute and copy writers. Measured by Lichii: Kokiri
+42.5 -> 47.0 FPS (PC).
+
+Risk, as Lichii #1032 said too: a result the back ran but its query cache
+still holds is read stale, since the query cache flush runs only after a
+drain. That would show as a wrong occlusion-based decision for a frame.
+
+Off by default; with the switch unset the drain condition is unchanged.
+Port of Lichii #1032 (closed unmerged), mapped onto 0027's EverReported
+condition; Lichii #1056, the merged alternative, is not ported.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/engines/maxwell_3d.cpp | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index f0a6290..5fc0d3f 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -23,6 +23,7 @@
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/rasterizer_interface.h"
+@@ -1473,9 +1474,26 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     const u64 space = u64{memory_manager.GetID()} << 48;
+     bool pending = false;
+     const bool checkable = read_ahead && words <= 64;
++    // EDEN_NX2_DMA_READ_REPORTED=1 (Lichii #1032): a word a report was sent to is read ahead once
++    // the back has run that report (WritePending covers one still queued), when no page of the
++    // range may hold GPU-written data. Ocarina of Time's macro 0xe2c reads report slots 97.5% of
++    // the time, and Lichii's drains changed none of them. Risk: a result the back ran but its
++    // query cache still holds is read stale (the flush below runs only after a drain).
++    static const bool reported_ahead = [] {
++        const char* value = std::getenv("EDEN_NX2_DMA_READ_REPORTED");
++        return value != nullptr && value[0] != '0';
++    }();
++    bool reported_matters = true;
++    if (reported_ahead && checkable) {
++        reported_matters = false;
++        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
++            const auto device = memory_manager.GpuToCpuAddress(page);
++            reported_matters |= !device || Tegra::Nx2MayBeGpuWritten(*device, 0x1000);
++        }
++    }
+     for (u32 i = 0; i < (checkable ? words : 0); ++i) {
+         const u64 key = space | (source + u64{i} * sizeof(u32));
+-        if (split.WritePending(key) || split.EverReported(key)) {
++        if (split.WritePending(key) || (reported_matters && split.EverReported(key))) {
+             pending = true;
+             break;
+         }
+-- 
+2.53.0
+

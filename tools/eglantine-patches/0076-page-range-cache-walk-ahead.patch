@@ -1,0 +1,162 @@
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 1937c7334a..4b2e1fb34e 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -225,10 +225,33 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_)
+     rasterizer = rasterizer_;
+ }
+ 
++void MemoryManager::NoteMapChange(GPUVAddr gpu_addr, std::size_t size) {
++    std::scoped_lock lock{map_log_guard};
++    const u64 next = map_serial.load(std::memory_order_relaxed) + 1;
++    map_log[next % map_log.size()] = {gpu_addr, gpu_addr + size};
++    map_serial.store(next, std::memory_order_release);
++}
++
++bool MemoryManager::MapChangedSince(u64 since_serial, u64 now_serial, GPUVAddr begin,
++                                    GPUVAddr end) const {
++    if (now_serial - since_serial > map_log.size()) {
++        return true;
++    }
++    std::scoped_lock lock{map_log_guard};
++    for (u64 serial = since_serial + 1; serial <= now_serial; ++serial) {
++        const auto& [changed_begin, changed_end] = map_log[serial % map_log.size()];
++        // Touching counts: a mapping that starts where a range ended can extend it.
++        if (changed_begin <= end && changed_end >= begin) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
+-    map_serial.fetch_add(1, std::memory_order_release);
++    NoteMapChange(gpu_addr, size);
+     SCOPE_EXIT {
+-        map_serial.fetch_add(1, std::memory_order_release);
++        NoteMapChange(gpu_addr, size);
+     };
+     if (is_big_pages)
+         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+@@ -236,9 +259,9 @@ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
+ }
+ 
+ GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
+-    map_serial.fetch_add(1, std::memory_order_release);
++    NoteMapChange(gpu_addr, size);
+     SCOPE_EXIT {
+-        map_serial.fetch_add(1, std::memory_order_release);
++        NoteMapChange(gpu_addr, size);
+     };
+     if (is_big_pages)
+         return BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+@@ -249,9 +272,9 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
+     if (size == 0) {
+         return;
+     }
+-    map_serial.fetch_add(1, std::memory_order_release);
++    NoteMapChange(gpu_addr, size);
+     SCOPE_EXIT {
+-        map_serial.fetch_add(1, std::memory_order_release);
++        NoteMapChange(gpu_addr, size);
+     };
+     GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
+ 
+@@ -638,11 +661,24 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+     };
+     thread_local Cache cache{};
+     const u64 serial = map_serial.load(std::memory_order_acquire);
+-    if (cache.owner != unique_identifier + 1 || cache.serial != serial) {
++    if (cache.owner != unique_identifier + 1) {
+         cache.owner = unique_identifier + 1;
+         cache.serial = serial;
+         cache.count = 0;
+         cache.next = 0;
++    } else if (cache.serial != serial) {
++        // Keep the intervals no change since then touches (the game maps and unmaps small
++        // ranges several times a second; dropping everything cost ~80 walks each time).
++        size_t kept = 0;
++        for (size_t i = 0; i < cache.count; ++i) {
++            const Interval interval = cache.intervals[i];
++            if (!MapChangedSince(cache.serial, serial, interval.begin, interval.end)) {
++                cache.intervals[kept++] = interval;
++            }
++        }
++        cache.count = kept;
++        cache.next = kept % cache.intervals.size();
++        cache.serial = serial;
+     }
+     for (size_t i = 0; i < cache.count; ++i) {
+         const Interval& interval = cache.intervals[i];
+@@ -651,14 +687,23 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+             return (std::min<size_t>)(size, interval.end - gpu_addr);
+         }
+     }
+-    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+-    if (result != 0) {
++    // Walk well past what was asked, to the end of the device range if it is near: draws bind
++    // hundreds of pointers into the same few ranges, and an interval that ends where one query
++    // did answers none that reach further.
++    static constexpr size_t walk_ahead = size_t{256} << 20;
++    if (gpu_addr >= address_space_size || size > address_space_size - gpu_addr) {
++        return MaxContinuousRangeUncached(gpu_addr, size);
++    }
++    const size_t limit = static_cast<size_t>(address_space_size - gpu_addr);
++    const size_t walk = (std::min)((std::max)(size, walk_ahead), limit);
++    const size_t found = MaxContinuousRangeUncached(gpu_addr, walk);
++    if (found != 0) {
+         Interval& slot = cache.intervals[cache.next];
+-        slot = {gpu_addr, gpu_addr + result, result < size};
++        slot = {gpu_addr, gpu_addr + found, found < walk};
+         cache.next = (cache.next + 1) % cache.intervals.size();
+         cache.count = (std::min)(cache.count + 1, cache.intervals.size());
+     }
+-    return result;
++    return (std::min)(size, found);
+ }
+ 
+ size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
+@@ -714,9 +759,14 @@ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr, size_t max_size) co
+     thread_local std::array<Entry, 4096> cache{};
+     const u64 serial = map_serial.load(std::memory_order_acquire);
+     Entry& entry = cache[(gpu_addr * 0x9E3779B97F4A7C15ULL) >> 52];
+-    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr &&
+-        entry.serial == serial) {
+-        return entry.result;
++    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr) {
++        if (entry.serial == serial) {
++            return entry.result;
++        }
++        if (!MapChangedSince(entry.serial, serial, gpu_addr, gpu_addr + entry.result)) {
++            entry.serial = serial;
++            return entry.result;
++        }
+     }
+     size_t result;
+     {
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 0fc6581493..32a5c10ea2 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <atomic>
+ #include <map>
+ #include <mutex>
+@@ -219,6 +220,13 @@ private:
+     std::atomic<GPUVAddr> native_syncpoint_shim{};
+     /// Bumped before and after every Map, MapSparse and Unmap (MapSerial).
+     std::atomic<u64> map_serial{1};
++    /// The address ranges of the last page table changes, by the serial each one produced, so a
++    /// cache of page table answers drops only what a change can have touched.
++    mutable std::mutex map_log_guard;
++    std::array<std::pair<GPUVAddr, GPUVAddr>, 64> map_log{};
++    void NoteMapChange(GPUVAddr gpu_addr, std::size_t size);
++    /// Whether a change since `since_serial` touches [begin, end] (or is no longer in the log).
++    bool MapChangedSince(u64 since_serial, u64 now_serial, GPUVAddr begin, GPUVAddr end) const;
+     Core::System& system;
+     MaxwellDeviceMemoryManager& memory;
+ 

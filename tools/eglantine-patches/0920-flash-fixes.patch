@@ -1,0 +1,116 @@
+From 78ea14bc39011fec3063fe98e6f125f1ffea0d8e Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 11:05:23 -0300
+Subject: [PATCH] vulkan: blend state on every refresh and no compare for plain
+ samples, with EDEN_NX2_FLASH_FIXES=1
+
+Without VK_EXT_extended_dynamic_state3 blending (the PS5 driver has none) the
+blend state is part of the pipeline key, but FixedPipelineState::Refresh read
+it only when Dirty::Blending was set, and native paths write blend registers
+without the flag: a pipeline could keep the previous draw's blending. With the
+switch it is read on every refresh. A depth-compare sampler read by a plain
+sample (not a shadow lookup) also gets a variant without the compare, since
+AMD returns the compare's result there (white where the texture should be).
+
+Off by default; with the switch unset both paths are unchanged.
+Port of exploitizm/Eglantine e0ce856 (Lichii #679 items 2 and 3, sharkiix
+858c115541 and 45d3b1b84b).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/fixed_pipeline_state.cpp     | 16 +++++++++++++++-
+ .../renderer_vulkan/vk_texture_cache.cpp         | 11 +++++++++++
+ .../renderer_vulkan/vk_texture_cache.h           |  1 +
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index 9dac98c..81d6c1c 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <bit>
+ #include <numeric>
+@@ -18,6 +19,16 @@
+ 
+ namespace Vulkan {
+ namespace {
++// EDEN_NX2_FLASH_FIXES=1 (exploitizm e0ce856, Lichii #679 items 2 and 3): without EDS3 blending,
++// read the blend state on every Refresh, not only when Dirty::Blending is set.
++[[nodiscard]] bool FlashFixesEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_FLASH_FIXES");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
+ constexpr size_t POINT = 0;
+ constexpr size_t LINE = 1;
+ constexpr size_t POLYGON = 2;
+@@ -248,7 +259,10 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
+     }
+     if (!extended_dynamic_state_3_blend) {
+-        if (maxwell3d.dirty.flags[Dirty::Blending]) {
++        // EDEN_NX2_FLASH_FIXES=1: without dynamic blending the blend state is part of the pipeline,
++        // and native paths write blend registers without setting Dirty::Blending, so a pipeline
++        // kept the previous draw's blending (white veil and flashes on AMD in Ocarina of Time).
++        if (maxwell3d.dirty.flags[Dirty::Blending] || FlashFixesEnabled()) {
+             maxwell3d.dirty.flags[Dirty::Blending] = false;
+             for (size_t index = 0; index < attachments.size(); ++index) {
+                 attachments[index].Refresh(regs, index);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index b11b889..30c7853 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -3612,12 +3612,20 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
+ }
+ 
+ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth) const noexcept {
++    // EDEN_NX2_FLASH_FIXES=1 (exploitizm e0ce856, Lichii #679 item 3): a depth-compare sampler read
++    // by a plain sample (not a shadow lookup) gets a variant without the compare. AMD returns the
++    // compare's result for it, white where the texture should be (Ocarina of Time).
++    static const bool flash_fixes = [] {
++        const char* const value = std::getenv("EDEN_NX2_FLASH_FIXES");
++        return value != nullptr && value[0] != '0';
++    }();
+     VariantKey key{};
+     key.reduce_anisotropy = has_added_anisotropy && !image_view.SupportsAnisotropy();
+     key.force_nearest = has_linear_filtering && IsPixelFormatInteger(image_view.format);
+     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
+     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
+     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
++    key.drop_compare = flash_fixes && has_depth_comparison && !is_depth;
+     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
+         const VkComponentMapping& mapping = image_view.Swizzle();
+         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
+@@ -3682,6 +3690,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
+ 
+     VkSamplerCreateInfo create_info = base_ci;
+     create_info.pNext = chain;
++    if (key.drop_compare) {
++        create_info.compareEnable = VK_FALSE;
++    }
+     if (key.force_nearest) {
+         create_info.magFilter = VK_FILTER_NEAREST;
+         create_info.minFilter = VK_FILTER_NEAREST;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index a2fda32..dedb29f 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -686,6 +686,7 @@ private:
+         bool drop_reduction;
+         bool drop_custom_border;
+         bool srgb_border;
++        bool drop_compare; // EDEN_NX2_FLASH_FIXES
+         std::array<VkComponentSwizzle, 4> swizzle;
+ 
+         bool operator==(const VariantKey&) const noexcept = default;
+-- 
+2.53.0
+

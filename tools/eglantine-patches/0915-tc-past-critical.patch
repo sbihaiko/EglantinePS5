@@ -1,0 +1,47 @@
+From 740eab8259ab97b87ad6c1378a07caa03791ea7a Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 08:25:09 -0300
+Subject: [PATCH] texture_cache: collect faster the further past the critical
+ memory, with EDEN_NX2_TC_PAST_CRITICAL=1
+
+Breaking pots in Ocarina of Time's Hyrule Castle makes ~55 images a frame
+that replace none of the older ones; 40 deletions a frame let the cache
+grow 4 GiB in two seconds until the driver crashed. Past the critical
+memory, one more image per 2 MiB over it (up to 1024), and 3 frames of
+age instead of 10 once 1 GiB over. Port of Lichii #1306.
+---
+ src/video_core/texture_cache/texture_cache.h | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 5fc6ac7..d7df48d 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -166,6 +166,24 @@ void TextureCache<P>::RunGarbageCollector() {
+         }();
+         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
++        // EDEN_NX2_TC_PAST_CRITICAL=1: past the critical memory, 40 images a frame is not enough
++        // where the game makes more: breaking pots in Ocarina of Time's Hyrule Castle makes ~55 a
++        // frame (25 384x384 shadow maps and the frame's targets, at addresses that move every
++        // frame), none of which replaces an older one (bad overlaps). The cache grew ~15 images a
++        // frame, 4 GiB in two seconds, until the device heap was full and the driver crashed on
++        // the next image. So delete more the further past it, and sooner after an image's last
++        // use (Lichii #1306).
++        static const bool past_critical = [] {
++            const char* const value = std::getenv("EDEN_NX2_TC_PAST_CRITICAL");
++            return value != nullptr && value[0] != '0';
++        }();
++        if (past_critical && aggressive_mode && total_used_memory > critical_memory) {
++            const u64 over = total_used_memory - critical_memory;
++            num_iterations += static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
++            if (over >= 1_GiB) {
++                ticks_to_destroy = (std::max)(min_age, u64{3});
++            }
++        }
+     };
+     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
+                           &probe_estimated, &probe_actual, &probe_deletes, &probe_scanned,
+-- 
+2.53.0
+

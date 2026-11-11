@@ -31,9 +31,49 @@ sudo install -D -m 0644 "$key" /etc/apt/keyrings/apt.llvm.org.asc
 rm -f "$key"
 echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" |
     sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
-sudo apt-get update
-# shellcheck disable=SC2046 # one package name per word
-sudo apt-get install --yes --no-install-recommends $(grep -v '^#' "$here/ubuntu-24.04-packages.txt")
+# Ubuntu's packages, from archive.ubuntu.com and security.ubuntu.com by name
+# instead of the runner's apt-mirrors.txt. On the hosted runners that file points
+# at azure.archive.ubuntu.com, which failed to resolve on 2026-11-11.
+for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+    [[ -f $f ]] || continue
+    sudo sed -i -E \
+        -e 's|URIs: *mirror\+file:/etc/apt/apt-mirrors\.txt|URIs: http://archive.ubuntu.com/ubuntu|' \
+        -e 's|https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+        -e 's|https?://[a-z0-9.-]*security\.ubuntu\.com/ubuntu|http://security.ubuntu.com/ubuntu|g' "$f"
+done
+# The runner's resolver drops archive.ubuntu.com for minutes at a time while
+# hosts reached over HTTPS (apt.llvm.org, packages.microsoft.com) stay up: on
+# 2026-11-11 four attempts over 29 minutes all failed with "Could not resolve".
+# When the resolver has no answer, pin the addresses from a DNS-over-HTTPS
+# answer, which travels over the HTTPS egress that still works.
+pin_archive_hosts() {
+    local host=$1 ips ip
+    getent hosts "$host" > /dev/null && return 0
+    ips=$(curl --silent --max-time 20 -H 'accept: application/dns-json' \
+        "https://cloudflare-dns.com/dns-query?name=$host&type=A" |
+        python3 -c 'import json, sys
+answer = json.load(sys.stdin).get("Answer", [])
+print(" ".join(a["data"] for a in answer if a.get("type") == 1))' 2> /dev/null) || true
+    [[ -n $ips ]] || return 0
+    echo "the resolver had no answer for $host; pinning $ips" >&2
+    for ip in $ips; do echo "$ip $host"; done | sudo tee -a /etc/hosts > /dev/null
+}
+
+# Retry the whole apt sequence: one window of a few minutes used to fail this
+# step after 15 minutes of a 200 kB/s fetch.
+apt_opts=(-o Acquire::Retries=10 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 -o Acquire::ForceIPv4=true)
+for attempt in 1 2 3 4 5 6; do
+    pin_archive_hosts archive.ubuntu.com
+    pin_archive_hosts security.ubuntu.com
+    if sudo apt-get update "${apt_opts[@]}" &&
+        # shellcheck disable=SC2046 # one package name per word
+        sudo apt-get install --yes --no-install-recommends "${apt_opts[@]}" $(grep -v '^#' "$here/ubuntu-24.04-packages.txt"); then
+        break
+    fi
+    [[ $attempt == 6 ]] && { echo "apt failed 6 times; giving up" >&2; exit 1; }
+    echo "apt failed (attempt $attempt of 6); retrying in 30 s" >&2
+    sleep 30
+done
 
 # Meson, for this user (pipx on the runner; pip elsewhere).
 if [[ $(meson --version 2>/dev/null) != "$meson_version" ]]; then

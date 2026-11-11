@@ -18,8 +18,24 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
 | `0910-count-only-counters` | `EDEN_NX2_COUNTERS=1` (`EDEN_NX2_FAST_DRAW_PROBE` picks the probed methods) | off | ours |
 | `0911-nan-guard-and-invariant-position` | `EDEN_NX2_NAN_GUARD=1`, `EDEN_NX2_POSITION_INVARIANT=1` | off | notquiteog/Dragoon `395547c` (Shakoquo/Hookshot `f04461bc9`) |
-| `0912-routed-global-atomics` | `EDEN_NX2_GLOBAL_ATOMICS=1` | off | the fork's own earlier `0065-ocarina-global-reduction` (SPIR-V part) |
+| `0913-destroy-unmap-all` | `EDEN_NX2_DESTROY_UNMAP_ALL=1` (the log line is always on) | off | Lichii #1199 (`bcb37c49f7`) |
+| `0914-refresh-reused-device-ranges` | `EDEN_NX2_REFRESH_REUSED=1` (the log line is always on) | off | Lichii #1236, PantACRO4life `46e7920081` |
+| `0915-tc-past-critical` | `EDEN_NX2_TC_PAST_CRITICAL=1` | off | Lichii #1306 |
+| `0916-tc-padded-square-depth` | `EDEN_NX2_TC_PADDED_SQUARE=1` | off | Lichii #1314, commit 1 |
+| `0917-tc-superseded-images` | `EDEN_NX2_TC_SUPERSEDED=1` | off | Lichii #1314, commit 2 |
+| `0918-tc-square-depth-unscaled` | `EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1` | off | Lichii #1314, commit 3 |
+| `0920-flash-fixes` | `EDEN_NX2_FLASH_FIXES=1` | off | exploitizm/Eglantine `e0ce856` (Lichii #679 items 2 and 3, sharkiix `858c115541`, `45d3b1b84b`) |
+| `0921-pending-poll-us` | `EDEN_NX2_PENDING_POLL_US=50` (1-999 µs; unset or 0 keeps 1 ms) | off | Lichii #446 (`acb9c18d6`) |
+| `0922-skip-loop-writes` | `EDEN_NX2_SKIP_LOOP_WRITES=1` (split front only) | off | Lichii #178 (`7e2a9fe20`) with #488 (`5ba52f772`), without #488's restart part |
+| `0923-dma-read-reported` | `EDEN_NX2_DMA_READ_REPORTED=1` (risk: a stale occlusion result for a frame) | off | Lichii #1032 (closed unmerged), on 0027's `EverReported` condition |
+| `0924-upload-batch` | `EDEN_NX2_UPLOAD_BATCH=1` | off | Lichii #1245 |
+| `0925-dispatch-barrier-inline` | `EDEN_NX2_DISPATCH_BARRIER_INLINE=1` | off | Lichii #1246 |
+| `0926-device-alloc` | none of its own: `dev_alloc_n`, `dev_alloc_ms` and `dev_alloc_mib` join the `EDEN_STALL` line, and the timing is a no-op without `EDEN_NX2_STALL_REPORT` | — | ours: b3-A's pure `split_wait` stalls had no back-side cost to explain them |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
+| driver: `tools/patch-radv-retire.py` | `RADV_PS5_RETIRE=1`; `RADV_PS5_RETIRE_SLACK=<n>` (default 0) holds each freed buffer n submissions past the newest one at its destroy, for command lists the split's front recorded but the back had not submitted yet | off | mihawk-99/PS5_Mesa `f5610fe270` |
+| driver: `tools/radv-patches/0f86253f-mesh-ring.patch` | none: an entry of the mesh shaders' scratch ring is 64 KiB instead of 160 KiB, so the ring is 128 MiB instead of 320 MiB. Take the patch file out to go back; the driver says on stderr when a shader keeps more than an entry | always on | mihawk-99/PS5_Mesa `0f86253f` |
+| driver: `tools/patch-radv-free-log.py` | `RADV_PS5_FREE_LOG=1` (`RADV_PS5_FREE_LOG_LINES`, default 200 lines per kind per 10 s): `radv/ps5 free-log` lines for frees and allocations of 16 MiB or more, pieces, sparse binds, replaced queue buffers and trimmed granules; lifts the trim and pieces line caps | off | ours |
+| app: `headless/heap_arenas.inc` (`eden_heap_trim`) | `EDEN_PS5_HEAP_NO_GIVEBACK=1` (the heap never gives pieces or arenas back; large blocks of their own still go back when freed) | off | ours |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
   AMD writes undefined values (NaN) there, and bloom spreads them into white glow.
@@ -64,6 +80,12 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   measured both with the colour output masks (viejunerd/Eglantine-PS5- #21): flashes from a few
   per walk to nearly none, no FPS cost. The first boot after a change builds the new pipelines.
 
+- **On this branch (`pr99-test`): the parent's PR #99 and #100 (core 0070, 0072-0078).** 0070
+  tracks storage buffers natively and routes global atomics, so 0912 is gone; it also reads 8 and
+  16-byte storage accesses word by word whenever the binding alignment is below their size, so
+  0902 keeps only its float min/max and memory parts. 0903 still applies. The parent measured
+  OoT at ~25 FPS in Link's house with #99 (from ~40) and #100 taking back part of that.
+
 - **Routed global atomics.** In every Ocarina session 8 compute pipelines fail at load with
   `SPIR-V Instruction EmitGlobalAtomicIAdd32 is not implemented`, right after `Storage buffer failed
   to track, using global memory fallbacks`, so those passes never run. With
@@ -79,6 +101,37 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   dropped`), so their atomics still go nowhere, and the flashes are unchanged. The address
   these shaders use is not one the storage buffer pass can track; parent PR #99 (native
   storage buffer tracking) is the next thing to try.
+
+- **Ranges into freed memory (0913, 0914).** Lichii #849 found Ocarina of Time drawing meshes
+  whose index buffers held an actor pack and texture blocks: NaN that bloom spreads into a white
+  wash, and white areas after area changes. Two ways the GPU can still read memory the game has
+  freed and reused as heap: a range a sub 211 mapped into the memory at another address, which
+  sub 102 left mapped (0913 unmaps it), and a device range reused for new pages at the same CPU
+  address, which still points at the old ones (0914 maps it again; heap ranges are only logged).
+  Both log what they find even with their switch off, so one session with them off says whether
+  either path happens at all: look for `nx2:gpu 102 destroy of memory` and `pages point at old
+  memory` in `stderr.log`. The release half of #1236 is already how this registry works: sub 102
+  releases the device range once no mapping uses it.
+- **Collect faster past the critical memory (0915).** Past `EDEN_NX2_TC_CRITICAL_MIB` the
+  collector deletes one more image per 2 MiB over it (up to 1024 more a frame), and at 1 GiB over
+  it deletes images 3 frames after their last use instead of 10. Lichii saw the cache grow 4 GiB
+  in two seconds and the driver crash while pots broke in Hyrule Castle. With 2560/3328 the
+  cache peaked at 2135 MB on our route, so this guards later areas, not the route.
+- **Shadow map churn (0916-0918, Lichii #1314).** Ocarina of Time draws its local shadow maps
+  into depth targets padded to whole GOBs (800x793) and samples them as squares (793x793), so each
+  map was two images and a copy, for every new size while the camera moves; it also moves its
+  render targets within a pool every frame, and the old images wait for the age-based collector.
+  0916 looks a padded depth target up as its square; 0917 deletes, at the frame boundary, a
+  bad-overlapping image unused for 2 frames once newer images cover all of it and nothing is lost
+  (no GPU data, or every cover cleared its whole surface after the image's last write; images with
+  a partial readback pending are kept); 0918 leaves a square depth-only pass unscaled. Lichii, on
+  an RTX 4080: the guard house went from 4-7 to 53-59 fps with all three, and none of the three
+  alone helped, so test them together. Risk: 0917 deletes GPU-written images without a download
+  when a full clear covered them; that rests on `ClearOverwritesWhole`, ported because this pin
+  lacks Lichii #817. 0918 does nothing at 1x resolution.
+- **Empty flush submits** (Lichii #1329, Fritchii EXP61): already in the port.
+  `tools/prepare-vulkan-port.py` makes `FlushCommands` return when a submission has taken every
+  draw since the last one (`recorded_tick`).
 
 - **Submit thread (driver).** `sceAgcDriverSubmitDcb` keeps the submitting thread in the kernel
   for a while; in run11 the driver spent 135-220 ms a second in `agc`. With the switch, RADV

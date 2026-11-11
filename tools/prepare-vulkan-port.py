@@ -734,7 +734,8 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
     }
 '''),
     ('#include "video_core/vulkan_common/vulkan_wrapper.h"\n',
-     '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "performance.h"\n#include "staging_buffers.h"\n'),
+     '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "performance.h"\n#include "staging_buffers.h"\n'
+     '#include "common/stall_ledger.h"\n'),
     # While the console's pool is short, every staging buffer the GPU is done with goes back at the
     # frame's end. Eden frees them slowly - one size class a frame, 16 buffers at most, so a buffer
     # can stay 64 frames after its last use - and a course loading in Mario Kart World stages its
@@ -776,7 +777,10 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '        });\n'
      '    }\n'),
     ('        .size = 1ULL << log2_size,\n', '        .size = made,\n'),
+    # EDEN_NX2_STALL_REPORT (common/stall_ledger.h, tools/eglantine-patches/0919): the time and
+    # size of each staging buffer made, for the frame report.
     ('    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n',
+     '    const auto stall_begin = ::Common::StallLedger::Begin();\n'
      '    vk::Buffer buffer;\n'
      '    try {\n'
      '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
@@ -800,6 +804,7 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '                     static_cast<unsigned long long>(released.bytes >> 20));\n'
      '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
      '    }\n'
+     '    ::Common::StallLedger::End(::Common::StallLedger::Category::StagingCreate, stall_begin, made);\n'
      '    // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.\n'
      '    if (exact && made >= (VkDeviceSize{64} << 20) && made < (VkDeviceSize{1} << log2_size)) {\n'
      '        static std::atomic<unsigned long long> large{0};\n'

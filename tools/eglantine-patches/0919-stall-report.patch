@@ -1,0 +1,454 @@
+From 67e1532e202dbf953855ce4a147aed45452bc4f3 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 10:31:08 -0300
+Subject: [PATCH] nx2: say where the time of each long frame went, with
+ EDEN_NX2_STALL_REPORT=<ms>
+
+Ocarina of Time stops for half a second to four seconds now and then, and
+no log line says on what. common/stall_ledger.h is one ledger for the
+process: per category, relaxed counters of time, count and bytes, and the
+longest piece. The sites that already log add what they spend to it:
+
+  buffer cache    CreateBuffer (with its merge of overlaps), UploadMemory
+  pipelines       built on the GPU thread (ReportRuntimePipeline), and the
+                  GPU thread's waits for a worker's pipeline
+  split GPU       the front's waits for the back: Drain with the list zone
+                  (a command list on a GPU-written page), and every other
+                  Drain, DrainTo and WaitForSpace (the ring full)
+  texture cache   RunGarbageCollector, RefreshContents (bytes for a whole
+                  image upload)
+  fences          MasterSemaphore::Wait past its fast checks
+  audio           a sink block padded with the held frame because the
+                  queue was empty (SinkStream::held_frames counts the
+                  frames for the output thread)
+
+The frontend reads the ledger at every presented frame and prints one
+EDEN_STALL line for a frame longer than <ms>, from the difference of two
+readings rather than a clear the other threads race. Guest memory packing
+and the staging buffers are timed in the fork itself.
+
+Off by default; with the switch unset each site costs one check of a
+cached flag, nothing is timed, and no output changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/audio_core/sink/sink_stream.cpp           |   7 +
+ src/audio_core/sink/sink_stream.h             |   3 +
+ src/common/CMakeLists.txt                     |   1 +
+ src/common/stall_ledger.h                     | 177 ++++++++++++++++++
+ src/video_core/buffer_cache/buffer_cache.h    |   4 +
+ src/video_core/gpu_split.cpp                  |   7 +
+ .../renderer_vulkan/vk_master_semaphore.cpp   |   3 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |   9 +
+ src/video_core/texture_cache/texture_cache.h  |   4 +
+ 9 files changed, 215 insertions(+)
+ create mode 100644 src/common/stall_ledger.h
+
+diff --git a/src/audio_core/sink/sink_stream.cpp b/src/audio_core/sink/sink_stream.cpp
+index 9dfd3bf..c9af6ae 100644
+--- a/src/audio_core/sink/sink_stream.cpp
++++ b/src/audio_core/sink/sink_stream.cpp
+@@ -19,6 +19,7 @@
+ #include "common/fixed_point.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
++#include "common/stall_ledger.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ 
+@@ -190,6 +191,12 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
+ 
+             if (!queue.TryPop(playing_buffer)) {
+                 lk.unlock();
++                // EDEN_NX2_STALL_REPORT: the queue ran dry, and the held frame fills the rest.
++                if (Common::StallLedger::Enabled()) {
++                    held_frames += num_frames - frames_written;
++                    Common::StallLedger::Add(Common::StallLedger::Category::AudioDry, 0, 1,
++                                             num_frames - frames_written);
++                }
+                 for (size_t i = frames_written; i < num_frames; i++)
+                     std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
+                 frames_written = num_frames;
+diff --git a/src/audio_core/sink/sink_stream.h b/src/audio_core/sink/sink_stream.h
+index 280b774..8b9f397 100644
+--- a/src/audio_core/sink/sink_stream.h
++++ b/src/audio_core/sink/sink_stream.h
+@@ -235,6 +235,9 @@ protected:
+     std::atomic<bool> paused{true};
+     /// Name of this stream
+     std::string name{};
++    /// Frames ProcessAudioOutAndRender filled with the held frame because the queue was empty,
++    /// counted only with EDEN_NX2_STALL_REPORT (read by the thread that calls it)
++    u64 held_frames{};
+ 
+ private:
+     /// Ring buffer of the samples waiting to be played or consumed
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index c4a1cf5..9bfc51a 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -111,6 +111,7 @@ add_library(
+     socket_types.h
+     sparse_large_vector.cpp
+     sparse_large_vector.h
++    stall_ledger.h
+     stb.cpp
+     stb.h
+     steady_clock.cpp
+diff --git a/src/common/stall_ledger.h b/src/common/stall_ledger.h
+new file mode 100644
+index 0000000..b12f711
+--- /dev/null
++++ b/src/common/stall_ledger.h
+@@ -0,0 +1,177 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++
++// EDEN_NX2_STALL_REPORT=<ms>: where the time of a long frame went. The sites below add what they
++// spent to one ledger for the process (relaxed counters: time, count, bytes, and the longest
++// piece); the frontend (headless/graphics.cpp) reads it at every presented frame and prints one
++// EDEN_STALL line for a frame longer than <ms>, with what the ledger gained during that frame.
++// Unset or 0: off, each site costs one check of a cached flag, and nothing is printed.
++// Header only, so the core and the frontend share it.
++namespace Common::StallLedger {
++
++enum class Category : std::size_t {
++    CramUnpack,    ///< A fault unpacks a packed slot of the guest's memory (the faulting thread)
++    CramPack,      ///< A slot packed (the scanner thread, or a thread in RecoverMemory)
++    CramRecover,   ///< RecoverMemory: the driver or the heap ran out (the thread that asked)
++    CramWait,      ///< A written slot waited for a block (WaitForBlock: the faulting thread)
++    BufferCreate,  ///< Buffer cache: a buffer made, overlaps merged into it (GPU thread)
++    BufferUpload,  ///< Buffer cache: guest memory uploaded to a buffer (GPU thread)
++    StagingCreate, ///< A staging buffer made (the thread that asked, mostly the GPU thread)
++    PipelineBuild, ///< A pipeline built on the GPU thread
++    PipelineWait,  ///< The GPU thread waited for a pipeline a worker translates
++    ListWait,      ///< Split GPU thread: the front waited for the back, a GPU-written list
++    SplitWait,     ///< Split GPU thread: the front waited for the back otherwise (drains, ring full)
++    TextureGc,     ///< Texture cache: the garbage collector (GPU thread)
++    TextureUpload, ///< Texture cache: an image's contents uploaded (GPU thread)
++    FenceWait,     ///< A wait for a GPU tick that was not reached yet (any thread)
++    AudioLate,     ///< Audio: a submit came after the port had run dry (the audio output thread)
++    AudioDry,      ///< Audio: a block padded with the held frame, the queue empty (same thread)
++    Count,
++};
++
++inline constexpr std::size_t CategoryCount = static_cast<std::size_t>(Category::Count);
++
++struct Counter {
++    std::atomic<std::uint64_t> ns{0};
++    std::atomic<std::uint64_t> count{0};
++    std::atomic<std::uint64_t> bytes{0};
++    std::atomic<std::uint64_t> max_ns{0}; ///< Taken (and cleared) by the reporter
++};
++
++inline std::array<Counter, CategoryCount> counters{};
++
++using Clock = std::chrono::steady_clock;
++
++/// The time the process started (its static initialization), for the reports' t=.
++inline const Clock::time_point process_start = Clock::now();
++
++/// The frame time that counts as a stall, in ms; 0 when off.
++[[nodiscard]] inline std::uint64_t ThresholdMs() {
++    static const std::uint64_t ms = [] {
++        const char* const value = std::getenv("EDEN_NX2_STALL_REPORT");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++    }();
++    return ms;
++}
++
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = ThresholdMs() != 0;
++    return enabled;
++}
++
++[[nodiscard]] inline double SecondsSinceStart(Clock::time_point when = Clock::now()) noexcept {
++    return std::chrono::duration<double>(when - process_start).count();
++}
++
++inline void Add(Category category, std::uint64_t ns, std::uint64_t count, std::uint64_t bytes) noexcept {
++    Counter& counter = counters[static_cast<std::size_t>(category)];
++    counter.ns.fetch_add(ns, std::memory_order_relaxed);
++    counter.count.fetch_add(count, std::memory_order_relaxed);
++    if (bytes != 0) {
++        counter.bytes.fetch_add(bytes, std::memory_order_relaxed);
++    }
++}
++
++/// Keeps the longest piece of `category` since the reporter last took it.
++inline void NoteMax(Category category, std::uint64_t ns) noexcept {
++    std::atomic<std::uint64_t>& max = counters[static_cast<std::size_t>(category)].max_ns;
++    std::uint64_t seen = max.load(std::memory_order_relaxed);
++    while (seen < ns && !max.compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
++    }
++}
++
++/// The start of a timed piece: now when on, the zero time point when off.
++[[nodiscard]] inline Clock::time_point Begin() {
++    return Enabled() ? Clock::now() : Clock::time_point{};
++}
++
++/// Adds the time since `begin` (from Begin) and `bytes` to `category`; nothing when off.
++inline void End(Category category, Clock::time_point begin, std::uint64_t bytes = 0) noexcept {
++    if (begin == Clock::time_point{}) {
++        return;
++    }
++    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count();
++    Add(category, static_cast<std::uint64_t>(ns > 0 ? ns : 0), 1, bytes);
++}
++
++/// Times its own scope into `category`.
++class Scope {
++public:
++    explicit Scope(Category category_, std::uint64_t bytes_ = 0) : category{category_}, bytes{bytes_}, begin{Begin()} {}
++    ~Scope() {
++        End(category, begin, bytes);
++    }
++    void SetBytes(std::uint64_t value) noexcept {
++        bytes = value;
++    }
++
++    Scope(const Scope&) = delete;
++    Scope& operator=(const Scope&) = delete;
++
++private:
++    Category category;
++    std::uint64_t bytes;
++    Clock::time_point begin;
++};
++
++/// Every counter now. The reporter subtracts the previous one, so nothing is cleared under the
++/// threads that add.
++struct Totals {
++    std::array<std::uint64_t, CategoryCount> ns{};
++    std::array<std::uint64_t, CategoryCount> count{};
++    std::array<std::uint64_t, CategoryCount> bytes{};
++};
++
++[[nodiscard]] inline Totals Read() noexcept {
++    Totals totals;
++    for (std::size_t i = 0; i < CategoryCount; ++i) {
++        totals.ns[i] = counters[i].ns.load(std::memory_order_relaxed);
++        totals.count[i] = counters[i].count.load(std::memory_order_relaxed);
++        totals.bytes[i] = counters[i].bytes.load(std::memory_order_relaxed);
++    }
++    return totals;
++}
++
++[[nodiscard]] inline std::uint64_t TakeMax(Category category) noexcept {
++    return counters[static_cast<std::size_t>(category)].max_ns.exchange(0, std::memory_order_relaxed);
++}
++
++/// One audio gap waiting to be printed (EDEN_AUDIO_GAP). The audio thread does not print: a
++/// print that meets the log flush waits for the storage, and the port would run dry again. It
++/// leaves the gap here and the frontend's frame report prints it. Bits 0-21: the gap in ms;
++/// bit 22: 1 for a dry queue, 0 for a late submit; bits 23-63: ms since the process started.
++inline std::atomic<std::uint64_t> audio_gap_post{0};
++
++inline void PostAudioGap(Clock::time_point when, std::uint64_t gap_ms, bool dry) noexcept {
++    const auto at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(when - process_start).count();
++    const std::uint64_t gap = gap_ms < (1ULL << 22) ? gap_ms : (1ULL << 22) - 1;
++    audio_gap_post.store((static_cast<std::uint64_t>(at_ms > 0 ? at_ms : 0) << 23) | (dry ? 1ULL << 22 : 0) | gap,
++                         std::memory_order_relaxed);
++}
++
++struct AudioGap {
++    double seconds;
++    std::uint64_t gap_ms;
++    bool dry;
++};
++
++/// The posted gap, if any, taken.
++[[nodiscard]] inline bool TakeAudioGap(AudioGap& gap) noexcept {
++    const std::uint64_t value = audio_gap_post.exchange(0, std::memory_order_relaxed);
++    if (value == 0) {
++        return false;
++    }
++    gap = AudioGap{static_cast<double>(value >> 23) / 1000.0, value & ((1ULL << 22) - 1), ((value >> 22) & 1) != 0};
++    return true;
++}
++
++} // namespace Common::StallLedger
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index e6357ce..ab0188a 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -19,6 +19,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include "common/range_sets.inc"
++#include "common/stall_ledger.h"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -1989,11 +1990,13 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+ template <class P>
+ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
+                                       bool sparse_compatible) {
++    Common::StallLedger::Scope stall{Common::StallLedger::Category::BufferCreate};
+     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+     wanted_size = static_cast<u32>(device_addr_end - device_addr);
+     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
++    stall.SetBytes(size);
+     if (size >= 32_MiB) {
+         static std::atomic<unsigned> samples{0};
+         if (samples.fetch_add(1, std::memory_order_relaxed) < 64) {
+@@ -2126,6 +2129,7 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+ template <class P>
+ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
+                                   std::span<BufferCopy> copies) {
++    const Common::StallLedger::Scope stall{Common::StallLedger::Category::BufferUpload, total_size_bytes};
+     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+         MappedUploadMemory(buffer, total_size_bytes, copies);
+     } else {
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index c91c2a4..43dda1b 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -20,6 +20,7 @@
+ #include <cstdio>
+ 
+ #include "common/logging.h"
++#include "common/stall_ledger.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "core/core.h"
+@@ -267,6 +268,7 @@ void GpuSplit::WaitForSpace(size_t words) {
+     }
+     Publish();
+     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitFull};
++    const Common::StallLedger::Scope stall{Common::StallLedger::Category::SplitWait};
+     for (u32 spins = 0;; ++spins) {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (write_position + words - consumed_cache <= RingWords) {
+@@ -380,6 +382,10 @@ void GpuSplit::Drain(Nx2Profile::Zone zone) {
+     }
+     Publish();
+     Nx2Profile::Scope scope{zone};
++    // EDEN_NX2_STALL_REPORT: a list on a GPU-written page apart from the other waits.
++    const Common::StallLedger::Scope stall{zone == Nx2Profile::Zone::DrainList
++                                               ? Common::StallLedger::Category::ListWait
++                                               : Common::StallLedger::Category::SplitWait};
+     for (u32 spins = 0;; ++spins) {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (consumed_cache == write_position) {
+@@ -417,6 +423,7 @@ void GpuSplit::DrainTo(u64 position) {
+     }
+     Publish();
+     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    const Common::StallLedger::Scope stall{Common::StallLedger::Category::SplitWait};
+     for (u32 spins = 0;; ++spins) {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (consumed_cache >= position) {
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index a6c05ef..7e97bb6 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <ranges>
+ #include "common/settings.h"
++#include "common/stall_ledger.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -96,6 +97,7 @@ void MasterSemaphore::Wait(u64 tick) {
+             return;
+         }
+ 
++        const Common::StallLedger::Scope stall{Common::StallLedger::Category::FenceWait};
+         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
+         while (gpu_tick.load(std::memory_order_acquire) < tick) {
+             gpu_tick.wait(last_tick, std::memory_order_acquire);
+@@ -117,6 +119,7 @@ void MasterSemaphore::Wait(u64 tick) {
+     }
+ 
+     // If none of the above is hit, fallback to a regular wait
++    const Common::StallLedger::Scope stall{Common::StallLedger::Category::FenceWait};
+     VideoCommon::LoadingProbe::wait.Mark("timeline wait", tick);
+     while (!semaphore.Wait(tick)) {
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 72934b0..df9e009 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -20,6 +20,7 @@
+ #include <numeric>
+ #include "common/cityhash.h"
+ #include "common/scope_exit.h"
++#include "common/stall_ledger.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/thread_worker.h"
+@@ -1223,6 +1224,10 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
+     const auto elapsed = now - begin;
+     total += elapsed;
+     ++count;
++    if (Common::StallLedger::Enabled()) {
++        Common::StallLedger::Add(Common::StallLedger::Category::PipelineBuild,
++                                 static_cast<u64>(std::chrono::nanoseconds{elapsed}.count()), 1, 0);
++    }
+     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+     if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
+         ++logged;
+@@ -1258,6 +1263,10 @@ public:
+ 
+     void Waited(Duration wait) {
+         wait_time += wait;
++        if (Common::StallLedger::Enabled()) {
++            Common::StallLedger::Add(Common::StallLedger::Category::PipelineWait,
++                                     static_cast<u64>(std::chrono::nanoseconds{wait}.count()), 1, 0);
++        }
+         LogEvery10Seconds();
+     }
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index c63d92b..11af509 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -24,6 +24,7 @@
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
++#include "common/stall_ledger.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/kepler_compute.h"
+@@ -224,6 +225,7 @@ void TextureCache<P>::DeleteSupersededImages() {
+ 
+ template <class P>
+ void TextureCache<P>::RunGarbageCollector() {
++    const Common::StallLedger::Scope stall{Common::StallLedger::Category::TextureGc};
+     const u64 probe_initial_usage = total_used_memory;
+     u64 probe_estimated = 0, probe_actual = 0, probe_deletes = 0, probe_scanned = 0;
+     u64 probe_costly_skips = 0, probe_dirty_skips = 0, probe_decoding_skips = 0;
+@@ -2067,6 +2069,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         return;
+     }
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
++    Common::StallLedger::Scope stall{Common::StallLedger::Category::TextureUpload};
+ 
+     if (!image.partial_dirty_pages.empty() || !image.partial_remapped.empty()) {
+         // Only some pages changed and the rest of the image is still tracked.
+@@ -2146,6 +2149,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         QueueAsyncUnswizzle(image, image_id);
+         return;
+     }
++    stall.SetBytes(image.guest_size_bytes);
+     ++images_uploaded;
+     uploaded_bytes += image.guest_size_bytes;
+     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+-- 
+2.53.0
+

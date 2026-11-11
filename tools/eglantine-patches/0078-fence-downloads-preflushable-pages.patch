@@ -1,0 +1,69 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 0333f0b7a5..ebbd1c26d8 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -609,14 +609,41 @@ private:
+     /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next
+     /// fence.
+     void QueueDownload(DAddr addr, u64 size) {
+-        if (DownloadsAtFence(addr, size)) {
++        if (AsyncBufferDownloads()) {
+             uncommitted_gpu_modified_ranges.Add(addr, size);
+             return;
+         }
+-        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
+-            uncommitted_gpu_modified_ranges.Add(start, end - start);
++        // With only Preflushable marks, just the marked pages are queued (upstream Eglantine
++        // 0bf0f834b9): a write that covers one CPU-read page of a large binding copied the whole
++        // binding back at every fence. Ocarina of Time's compute programs with unknown store
++        // extents mark 8 MiB bindings: ~60 MiB a frame came back, 850 MiB a second.
++        // EDEN_NX2_EXACT_PREFLUSH=0 restores the whole-range behaviour.
++        static const bool exact = [] {
++            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
++            return value == nullptr || value[0] != '0';
++        }();
++        if (!exact && memory_tracker.IsRegionPreflushable(addr, size)) {
++            uncommitted_gpu_modified_ranges.Add(addr, size);
++            return;
++        }
++        const DAddr end = addr + size;
++        u64 queued = 0;
++        if (exact) {
++            memory_tracker.ForEachPreflushableRange(addr, size, [&](DAddr begin, u64 length) {
++                const DAddr lower = (std::max)(begin, addr);
++                const DAddr upper = (std::min)(begin + length, end);
++                if (lower < upper) {
++                    uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
++                    queued += upper - lower;
++                }
++            });
++        }
++        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr range_end) {
++            uncommitted_gpu_modified_ranges.Add(start, range_end - start);
+         });
+-        ArmReadTraps(addr, size);
++        if (queued < size) {
++            ArmReadTraps(addr, size);
++        }
+     }
+ 
+     // Async Buffers
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+index 8f7d445426..99c519c068 100644
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -198,6 +198,14 @@ public:
+         });
+     }
+ 
++    /// Call 'func' for each range marked as Preflushable
++    template <typename Func>
++    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
++        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
++            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
++        });
++    }
++
+     template <typename Func>
+     void ForEachDownloadRangeAndClear(VAddr query_cpu_range, u64 query_size, Func&& func) {
+         IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {

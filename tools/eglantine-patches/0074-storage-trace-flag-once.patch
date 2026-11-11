@@ -1,0 +1,30 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c9fdebf63e..988ce5fa32 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2471,6 +2471,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         return NULL_BINDING;
+     }
+ 
++    static const bool storage_trace = std::getenv("EDEN_NX2_STORAGE_TRACE") != nullptr;
+     u32 size = [&]() {
+         const u32 memory_layout_size = static_cast<u32>((std::min)(
+             u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+@@ -2488,7 +2489,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+                 return mib != 0 && mib < 1024 ? static_cast<u32>(mib << 20)
+                                               : static_cast<u32>(1_GiB - 64_KiB);
+             }();
+-            if (std::getenv("EDEN_NX2_STORAGE_TRACE")) {
++            if (storage_trace) {
+                 static std::mutex trace_mutex;
+                 static std::unordered_set<u64> traced;
+                 std::scoped_lock lock{trace_mutex};
+@@ -2503,7 +2504,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         // A native compute program's pointer is bare: the word after it is another parameter (a
+         // dimension, stride or texture handle), not an NVN buffer size.
+         if (native_pointer) {
+-            if (std::getenv("EDEN_NX2_STORAGE_TRACE")) {
++            if (storage_trace) {
+                 static std::mutex trace_mutex;
+                 static std::unordered_set<u64> traced;
+                 std::scoped_lock lock{trace_mutex};
