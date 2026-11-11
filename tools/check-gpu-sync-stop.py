@@ -80,6 +80,7 @@ bool Wait(){
 struct Memory {std::atomic<u32> value{};template<class T>T Read(unsigned){return value.load();}};
 struct Raster {std::atomic_uint calls{};void ReleaseFences(){++calls;}};
 struct DmaPusher {System system;Memory memory_manager;Raster raster;Raster*rasterizer=&raster;};
+void ReleaseFencesOnBack(DmaPusher&dma_pusher){dma_pusher.rasterizer->ReleaseFences();} // runs on the split's back (engines/puller.cpp)
 struct Puller {void BreakFastDrawAtAcquire(){} // ends a fast draw chain (video_core/nx2_fast_draw.h)
 struct Regs {struct Address{unsigned SemaphoreAddress(){return 0;}}semaphore_address;u32 semaphore_acquire=4,acquire_value{};bool acquire_active{},acquire_mode{},acquire_source{};}regs;
 void ProcessSemaphoreAcquire(DmaPusher&dma_pusher){
