@@ -31,9 +31,19 @@ sudo install -D -m 0644 "$key" /etc/apt/keyrings/apt.llvm.org.asc
 rm -f "$key"
 echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" |
     sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
-sudo apt-get update
-# shellcheck disable=SC2046 # one package name per word
-sudo apt-get install --yes --no-install-recommends $(grep -v '^#' "$here/ubuntu-24.04-packages.txt")
+# The runner's DNS and its mirrors flake: one window of a few minutes used to
+# fail this step after 15 minutes of a 200 kB/s fetch. Retry the whole sequence.
+apt_opts=(-o Acquire::Retries=10 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60)
+for attempt in 1 2 3 4; do
+    if sudo apt-get update "${apt_opts[@]}" &&
+        # shellcheck disable=SC2046 # one package name per word
+        sudo apt-get install --yes --no-install-recommends "${apt_opts[@]}" $(grep -v '^#' "$here/ubuntu-24.04-packages.txt"); then
+        break
+    fi
+    [[ $attempt == 4 ]] && { echo "apt failed 4 times; giving up" >&2; exit 1; }
+    echo "apt failed (attempt $attempt of 4); retrying in 30 s" >&2
+    sleep 30
+done
 
 # Meson, for this user (pipx on the runner; pip elsewhere).
 if [[ $(meson --version 2>/dev/null) != "$meson_version" ]]; then
