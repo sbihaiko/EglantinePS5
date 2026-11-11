@@ -24,6 +24,10 @@
 #include <vector>
 
 #include "fastmem.h"
+#if __has_include("common/stall_ledger.h")
+#include "common/stall_ledger.h"
+#define EDEN_HAVE_STALL_LEDGER 1
+#endif
 // Linked in the app (common, lz4); absent in the host checks that build this file alone.
 // The driver gives back device memory no bound resource uses (tools/patch-radv-trim.py; the RADV
 // archive's symbols carry the isolation prefix). Absent in the host checks and other drivers.
@@ -873,6 +877,9 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
 // everything (0).
 int DecommitMemoryRange(void* address, std::size_t size) noexcept {
     if (address == nullptr || size == 0) return 0;
+#ifdef EDEN_HAVE_STALL_LEDGER
+    const Common::StallLedger::Scope give_back{Common::StallLedger::Category::GuestRelease};
+#endif
 #ifdef PS5_NATIVE
     static const bool kept = DevSetting("heap_return=off");
     if (kept) return 0;
@@ -911,6 +918,9 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
 // range is as it was).
 constexpr std::size_t SmallPage = 0x4000;
 int PageOutRange(void* address, std::size_t size) noexcept {
+#ifdef EDEN_HAVE_STALL_LEDGER
+    const Common::StallLedger::Scope page_out{Common::StallLedger::Category::GuestPageOut};
+#endif
     const auto begin = reinterpret_cast<std::uintptr_t>(address);
     if (address == nullptr || size == 0 || size % SmallPage != 0 || begin % SmallPage != 0) return 0;
 #ifdef PS5_NATIVE

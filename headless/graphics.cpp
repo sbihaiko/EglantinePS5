@@ -287,14 +287,15 @@ void Cleanup(bool success, const char* operation) noexcept {
              {Category::CramUnpack, Category::CramPack, Category::CramWait, Category::BufferCreate,
               Category::BufferUpload, Category::PipelineBuild, Category::PipelineWait, Category::ListWait,
               Category::SplitWait, Category::TextureGc, Category::TextureUpload, Category::FenceWait,
-              Category::DeviceAlloc})
+              Category::DeviceAlloc, Category::GuestRelease, Category::GuestPageOut})
             accounted += ms(category);
         std::printf("EDEN_STALL t=%.3f frame_ms=%.1f cram_unpack_ms=%.1f cram_unpack_mib=%.1f cram_pack_ms=%.1f "
                     "cram_wait_ms=%.1f cram_recover_ms=%.1f buf_create_ms=%.1f buf_upload_ms=%.1f buf_upload_mib=%.1f "
                     "staging_create_ms=%.1f staging_create_mib=%.1f pipe_n=%llu pipe_ms=%.1f pipe_wait_ms=%.1f "
                     "gpuw_wait_ms=%.1f split_wait_ms=%.1f tc_gc_ms=%.1f tc_upload_ms=%.1f tc_upload_mib=%.1f "
                     "fence_wait_ms=%.1f dev_alloc_n=%llu dev_alloc_ms=%.1f dev_alloc_mib=%.1f "
-                    "audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f other_ms=%.1f "
+                    "audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f mem_release_ms=%.1f mem_pageout_ms=%.1f "
+                    "other_ms=%.1f "
                     "back_phase=%s back_phase_ms=%.1f\n",
                     Ledger::SecondsSinceStart(), frame_ms, ms(Category::CramUnpack), mib(Category::CramUnpack),
                     ms(Category::CramPack), ms(Category::CramWait), ms(Category::CramRecover),
@@ -306,6 +307,7 @@ void Cleanup(bool success, const char* operation) noexcept {
                     count(Category::DeviceAlloc), ms(Category::DeviceAlloc), mib(Category::DeviceAlloc),
                     count(Category::AudioLate),
                     count(Category::AudioDry), static_cast<double>(std::max(late_max, dry_max)) / 1e6,
+                    ms(Category::GuestRelease), ms(Category::GuestPageOut),
                     frame_ms - accounted,
                     Ledger::BackProfileEnabled()
                         ? Ledger::BackPhaseName(Ledger::back_phase.load(std::memory_order_relaxed))

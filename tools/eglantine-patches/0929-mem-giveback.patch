@@ -1,0 +1,13 @@
+diff --git a/src/common/stall_ledger.h b/src/common/stall_ledger.h
+index 36857b2db1..0eb5956c36 100644
+--- a/src/common/stall_ledger.h
++++ b/src/common/stall_ledger.h
+@@ -34,6 +34,8 @@ enum class Category : std::size_t {
+     TextureUpload, ///< Texture cache: an image's contents uploaded (GPU thread)
+     FenceWait,     ///< A wait for a GPU tick that was not reached yet (any thread)
+     DeviceAlloc,   ///< The driver's memory for a buffer, an image or a staging (the thread that asked)
++    GuestRelease,  ///< Giving a committed range back to the system (DecommitMemoryRange)
++    GuestPageOut,  ///< Giving one page back to the system (PageOutRange)
+     AudioLate,     ///< Audio: a submit came after the port had run dry (the audio output thread)
+     AudioDry,      ///< Audio: a block padded with the held frame, the queue empty (same thread)
+     Count,
