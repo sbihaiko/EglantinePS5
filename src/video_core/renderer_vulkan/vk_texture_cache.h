@@ -686,6 +686,7 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare; // EDEN_NX2_FLASH_FIXES
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;

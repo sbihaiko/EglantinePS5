@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <bit>
 #include <numeric>
@@ -18,6 +19,16 @@
 
 namespace Vulkan {
 namespace {
+// EDEN_NX2_FLASH_FIXES=1 (exploitizm e0ce856, Lichii #679 items 2 and 3): without EDS3 blending,
+// read the blend state on every Refresh, not only when Dirty::Blending is set.
+[[nodiscard]] bool FlashFixesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FLASH_FIXES");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 constexpr size_t POINT = 0;
 constexpr size_t LINE = 1;
 constexpr size_t POLYGON = 2;
@@ -248,7 +259,10 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
     }
     if (!extended_dynamic_state_3_blend) {
-        if (maxwell3d.dirty.flags[Dirty::Blending]) {
+        // EDEN_NX2_FLASH_FIXES=1: without dynamic blending the blend state is part of the pipeline,
+        // and native paths write blend registers without setting Dirty::Blending, so a pipeline
+        // kept the previous draw's blending (white veil and flashes on AMD in Ocarina of Time).
+        if (maxwell3d.dirty.flags[Dirty::Blending] || FlashFixesEnabled()) {
             maxwell3d.dirty.flags[Dirty::Blending] = false;
             for (size_t index = 0; index < attachments.size(); ++index) {
                 attachments[index].Refresh(regs, index);

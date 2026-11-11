@@ -3612,12 +3612,20 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
 }
 
 Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth) const noexcept {
+    // EDEN_NX2_FLASH_FIXES=1 (exploitizm e0ce856, Lichii #679 item 3): a depth-compare sampler read
+    // by a plain sample (not a shadow lookup) gets a variant without the compare. AMD returns the
+    // compare's result for it, white where the texture should be (Ocarina of Time).
+    static const bool flash_fixes = [] {
+        const char* const value = std::getenv("EDEN_NX2_FLASH_FIXES");
+        return value != nullptr && value[0] != '0';
+    }();
     VariantKey key{};
     key.reduce_anisotropy = has_added_anisotropy && !image_view.SupportsAnisotropy();
     key.force_nearest = has_linear_filtering && IsPixelFormatInteger(image_view.format);
     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
+    key.drop_compare = flash_fixes && has_depth_comparison && !is_depth;
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
         const VkComponentMapping& mapping = image_view.Swizzle();
         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
@@ -3682,6 +3690,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
 
     VkSamplerCreateInfo create_info = base_ci;
     create_info.pNext = chain;
+    if (key.drop_compare) {
+        create_info.compareEnable = VK_FALSE;
+    }
     if (key.force_nearest) {
         create_info.magFilter = VK_FILTER_NEAREST;
         create_info.minFilter = VK_FILTER_NEAREST;
