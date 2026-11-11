@@ -136,6 +136,20 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   deferred submission still references memory the trim released. Keep the switch off until the
   trim waits for the submit thread.
 
+- **Performance.** Every sibling survey also looks for FPS. Base PS5, Docked, best env so far
+  (0912 + 2560/3328): Link's house 49 -> 27, after the house 19-33, Kokiri 38-39. Candidates:
+  - parent PR #100 (0076-0078): takes back part of PR #99's CPU cost (15.7 -> 20.2 outdoors on
+    the parent's Pro); on `pr99-test`.
+  - Lichii #1329: skip empty `FlushCommands` submits (+6% there); needs the change in
+    `tools/prepare-vulkan-port.py`, which replaces that function.
+  - Lichii #1056: macros on the back thread (front waits 17.9k/s -> 0, +8% there). viejunerd cut
+    drains 17k -> 3.5k/s with no FPS change, so the gain on our base is uncertain.
+  - The submit thread (+2-4 FPS mid-route), once the trim waits for it.
+  - Thread layout (run B: +2-7 after the house), in the env since run B; one session each.
+  - viejunerd's texture switches (`GPU_TRANSCODE_MIB=256`, `TC_KEEP_ASYNC=300`,
+    `AREA_EVICT=40`): not on our pin; they need porting.
+  - Lichii #1314 (texture cache) and #1334 (pipeline rebuild): open upstream, not yet read.
+
 ## Looked at, not ported
 
 - **Null image on a memo hit** (Lichii `c2e293ec8`, #910). This pin already gates
