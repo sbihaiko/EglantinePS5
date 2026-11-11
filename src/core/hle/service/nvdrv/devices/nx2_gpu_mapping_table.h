@@ -136,6 +136,24 @@ public:
         return false;
     }
 
+    /// The GPU ranges whose mapping reaches CPU memory [cpu, +size), each cut to the part that
+    /// reaches it (leases are left out: they map an address to itself).
+    std::vector<Range> MappedInto(u64 cpu, u64 size) const {
+        std::vector<Range> result;
+        if (!Valid(cpu, size)) {
+            return result;
+        }
+        const u64 end = cpu + size;
+        for (const auto& range : mappings) {
+            const u64 first = (std::max)(range.cpu, cpu);
+            const u64 last = (std::min)(range.cpu + range.size, end);
+            if (first < last) {
+                result.push_back({range.gpu + (first - range.cpu), first, last - first});
+            }
+        }
+        return result;
+    }
+
     std::vector<Range> Effective() const {
         if (leases.empty()) {
             return mappings;

@@ -574,7 +574,11 @@ private:
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
     // memory (svc 0x80 clears GPU access) and reuses it as ordinary heap right after, so nothing
-    // on the GPU side may keep it: drop the mapping 101 made at its own address.
+    // on the GPU side may keep it: drop the mapping 101 made at its own address. A GPU range a
+    // 211 mapped into the memory elsewhere would still read it, now heap (Ocarina of Time drew
+    // meshes whose index buffers held an actor pack and texture blocks: NaN that bloom spreads
+    // into a white wash, Lichii #849 and #1199). Such ranges are always logged; with
+    // EDEN_NX2_DESTROY_UNMAP_ALL=1 they are unmapped too.
     void SubDestroyMemory(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u32 handle = w[2];
@@ -587,7 +591,22 @@ private:
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unregister(address, size);
+                static const bool unmap_all = [] {
+                    const char* const value = std::getenv("EDEN_NX2_DESTROY_UNMAP_ALL");
+                    return value != nullptr && value[0] != '0';
+                }();
+                const auto others = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().UnregisterMemory(
+                    address, size, unmap_all);
+                for (const auto& [gpu_address, range_size] : others) {
+                    // The first 32, then every 1000th.
+                    if (++m_destroy_leftovers <= 32 || m_destroy_leftovers % 1000 == 0) {
+                        LOG_WARNING(Service,
+                                    "nx2:gpu 102 destroy of memory {} [{:#x}, +{:#x}]: GPU range "
+                                    "[{:#x}, +{:#x}] still mapped into it, {} ({} so far)",
+                                    handle, address, size, gpu_address, range_size,
+                                    unmap_all ? "unmapped" : "kept", m_destroy_leftovers);
+                    }
+                }
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);
@@ -1169,6 +1188,7 @@ private:
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, NumIds> m_events{};
     std::map<u32, GpuMemory> m_memory;
+    u64 m_destroy_leftovers{}; ///< GPU ranges still mapped into memory a 102 destroyed
     u32 m_next_memory_handle{1};
     u32 m_next_device{1};
 };

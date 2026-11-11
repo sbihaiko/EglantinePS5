@@ -76,6 +76,31 @@ public:
         });
     }
 
+    // Sub 102: memory [address, +size) is destroyed and the game reuses it as heap right away.
+    // Like Unregister, the mapping at the memory's own address goes. Every other GPU range still
+    // mapped into the memory (a sub 211 map at another address) is returned, as (GPU address,
+    // size), and with unmap_all it goes as well, so no draw reads the heap through it and the
+    // memory's device range is released (port of Lichii #1199).
+    std::vector<std::pair<u64, u64>> UnregisterMemory(u64 address, u64 size, bool unmap_all) {
+        return Nx2GpuCommandScope::Execute([&]() -> std::vector<std::pair<u64, u64>> {
+            std::scoped_lock lk{mutex};
+        VideoCommon::LoadingProbe::RegistryOwnerProbe registry_owner_probe;
+            std::vector<std::pair<u64, u64>> others;
+            if (!Nx2GpuMappingTable::Valid(address, size)) {
+                return others;
+            }
+            pending_releases.try_emplace(std::pair{address, size});
+            Apply(mappings.Unmap(address, size));
+            for (const auto& range : mappings.MappedInto(address, size)) {
+                others.emplace_back(range.gpu, range.size);
+                if (unmap_all) {
+                    Apply(mappings.Unmap(range.gpu, range.size));
+                }
+            }
+            return others;
+        });
+    }
+
     bool MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
         return Nx2GpuCommandScope::Execute([&]() -> bool {
             std::scoped_lock lk{mutex};
