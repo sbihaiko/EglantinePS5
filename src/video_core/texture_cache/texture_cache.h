@@ -24,6 +24,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "common/stall_ledger.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
@@ -224,6 +225,7 @@ void TextureCache<P>::DeleteSupersededImages() {
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector() {
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::TextureGc};
     const u64 probe_initial_usage = total_used_memory;
     u64 probe_estimated = 0, probe_actual = 0, probe_deletes = 0, probe_scanned = 0;
     u64 probe_costly_skips = 0, probe_dirty_skips = 0, probe_decoding_skips = 0;
@@ -2067,6 +2069,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    Common::StallLedger::Scope stall{Common::StallLedger::Category::TextureUpload};
 
     if (!image.partial_dirty_pages.empty() || !image.partial_remapped.empty()) {
         // Only some pages changed and the rest of the image is still tracked.
@@ -2146,6 +2149,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         QueueAsyncUnswizzle(image, image_id);
         return;
     }
+    stall.SetBytes(image.guest_size_bytes);
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);

@@ -11,6 +11,7 @@
 
 #include <ranges>
 #include "common/settings.h"
+#include "common/stall_ledger.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -96,6 +97,7 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
+        const Common::StallLedger::Scope stall{Common::StallLedger::Category::FenceWait};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
@@ -117,6 +119,7 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::FenceWait};
     VideoCommon::LoadingProbe::wait.Mark("timeline wait", tick);
     while (!semaphore.Wait(tick)) {
     }

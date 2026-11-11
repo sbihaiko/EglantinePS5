@@ -20,6 +20,7 @@
 #include <numeric>
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
+#include "common/stall_ledger.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/thread_worker.h"
@@ -1223,6 +1224,10 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
+    if (Common::StallLedger::Enabled()) {
+        Common::StallLedger::Add(Common::StallLedger::Category::PipelineBuild,
+                                 static_cast<u64>(std::chrono::nanoseconds{elapsed}.count()), 1, 0);
+    }
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
         ++logged;
@@ -1258,6 +1263,10 @@ public:
 
     void Waited(Duration wait) {
         wait_time += wait;
+        if (Common::StallLedger::Enabled()) {
+            Common::StallLedger::Add(Common::StallLedger::Category::PipelineWait,
+                                     static_cast<u64>(std::chrono::nanoseconds{wait}.count()), 1, 0);
+        }
         LogEvery10Seconds();
     }
 

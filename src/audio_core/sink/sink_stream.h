@@ -235,6 +235,9 @@ protected:
     std::atomic<bool> paused{true};
     /// Name of this stream
     std::string name{};
+    /// Frames ProcessAudioOutAndRender filled with the held frame because the queue was empty,
+    /// counted only with EDEN_NX2_STALL_REPORT (read by the thread that calls it)
+    u64 held_frames{};
 
 private:
     /// Ring buffer of the samples waiting to be played or consumed

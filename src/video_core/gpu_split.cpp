@@ -20,6 +20,7 @@
 #include <cstdio>
 
 #include "common/logging.h"
+#include "common/stall_ledger.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -267,6 +268,7 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitFull};
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::SplitWait};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
@@ -380,6 +382,10 @@ void GpuSplit::Drain(Nx2Profile::Zone zone) {
     }
     Publish();
     Nx2Profile::Scope scope{zone};
+    // EDEN_NX2_STALL_REPORT: a list on a GPU-written page apart from the other waits.
+    const Common::StallLedger::Scope stall{zone == Nx2Profile::Zone::DrainList
+                                               ? Common::StallLedger::Category::ListWait
+                                               : Common::StallLedger::Category::SplitWait};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
@@ -417,6 +423,7 @@ void GpuSplit::DrainTo(u64 position) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::SplitWait};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= position) {

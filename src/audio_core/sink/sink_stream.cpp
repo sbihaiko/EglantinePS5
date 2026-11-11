@@ -19,6 +19,7 @@
 #include "common/fixed_point.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/stall_ledger.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -190,6 +191,12 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
+                // EDEN_NX2_STALL_REPORT: the queue ran dry, and the held frame fills the rest.
+                if (Common::StallLedger::Enabled()) {
+                    held_frames += num_frames - frames_written;
+                    Common::StallLedger::Add(Common::StallLedger::Category::AudioDry, 0, 1,
+                                             num_frames - frames_written);
+                }
                 for (size_t i = frames_written; i < num_frames; i++)
                     std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
                 frames_written = num_frames;

@@ -19,6 +19,7 @@
 #include <fmt/ranges.h>
 
 #include "common/range_sets.inc"
+#include "common/stall_ledger.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -1989,11 +1990,13 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
                                       bool sparse_compatible) {
+    Common::StallLedger::Scope stall{Common::StallLedger::Category::BufferCreate};
     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    stall.SetBytes(size);
     if (size >= 32_MiB) {
         static std::atomic<unsigned> samples{0};
         if (samples.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -2126,6 +2129,7 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    const Common::StallLedger::Scope stall{Common::StallLedger::Category::BufferUpload, total_size_bytes};
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
