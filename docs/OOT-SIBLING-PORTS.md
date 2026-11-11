@@ -21,6 +21,9 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0913-destroy-unmap-all` | `EDEN_NX2_DESTROY_UNMAP_ALL=1` (the log line is always on) | off | Lichii #1199 (`bcb37c49f7`) |
 | `0914-refresh-reused-device-ranges` | `EDEN_NX2_REFRESH_REUSED=1` (the log line is always on) | off | Lichii #1236, PantACRO4life `46e7920081` |
 | `0915-tc-past-critical` | `EDEN_NX2_TC_PAST_CRITICAL=1` | off | Lichii #1306 |
+| `0916-tc-padded-square-depth` | `EDEN_NX2_TC_PADDED_SQUARE=1` | off | Lichii #1314, commit 1 |
+| `0917-tc-superseded-images` | `EDEN_NX2_TC_SUPERSEDED=1` | off | Lichii #1314, commit 2 |
+| `0918-tc-square-depth-unscaled` | `EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1` | off | Lichii #1314, commit 3 |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
@@ -103,6 +106,18 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   it deletes images 3 frames after their last use instead of 10. Lichii saw the cache grow 4 GiB
   in two seconds and the driver crash while pots broke in Hyrule Castle. With 2560/3328 the
   cache peaked at 2135 MB on our route, so this guards later areas, not the route.
+- **Shadow map churn (0916-0918, Lichii #1314).** Ocarina of Time draws its local shadow maps
+  into depth targets padded to whole GOBs (800x793) and samples them as squares (793x793), so each
+  map was two images and a copy, for every new size while the camera moves; it also moves its
+  render targets within a pool every frame, and the old images wait for the age-based collector.
+  0916 looks a padded depth target up as its square; 0917 deletes, at the frame boundary, a
+  bad-overlapping image unused for 2 frames once newer images cover all of it and nothing is lost
+  (no GPU data, or every cover cleared its whole surface after the image's last write; images with
+  a partial readback pending are kept); 0918 leaves a square depth-only pass unscaled. Lichii, on
+  an RTX 4080: the guard house went from 4-7 to 53-59 fps with all three, and none of the three
+  alone helped, so test them together. Risk: 0917 deletes GPU-written images without a download
+  when a full clear covered them; that rests on `ClearOverwritesWhole`, ported because this pin
+  lacks Lichii #817. 0918 does nothing at 1x resolution.
 - **Empty flush submits** (Lichii #1329, Fritchii EXP61): already in the port.
   `tools/prepare-vulkan-port.py` makes `FlushCommands` return when a submission has taken every
   draw since the last one (`recorded_tick`).

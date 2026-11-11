@@ -1,0 +1,144 @@
+From 188fb567d2b10243506e05e854cdb3204d0c8b1b Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 08:31:45 -0300
+Subject: [PATCH 1/3] texture_cache: draw a padded depth target as the square
+ it is, with EDEN_NX2_TC_PADDED_SQUARE=1
+
+Ocarina of Time draws its local shadow maps into D32_FLOAT depth targets
+whose width is the height padded to whole GOBs (800x793), then samples them
+as 793x793 textures at the same address. Image lookups compare sizes
+strictly, so each shadow map was two images and a copy between them, and
+these change size every frame while the camera moves.
+
+Such a target takes the same guest memory, with the same layout, as the
+square (IsPaddedSquare). The surface clip bounds rendering, so when the clip
+lies inside the square nothing is drawn into the padding, and the target is
+looked up at the square size. The clip has no dirty flag of its own (it
+marks only RenderTargets), so the target is looked up again while it is
+padded. A clip that reaches the padding keeps the size the game gave.
+
+Off by default; with the switch unset FindDepthBuffer and
+RescaleRenderTargets behave as before. Port of Lichii #1314 (commit 1 of 3);
+its Catch2 test is run as a host test outside the tree.
+---
+ src/video_core/texture_cache/texture_cache.h  | 32 +++++++++++++++++--
+ .../texture_cache/texture_cache_base.h        |  2 ++
+ src/video_core/texture_cache/util.cpp         |  9 ++++++
+ src/video_core/texture_cache/util.h           |  4 +++
+ 4 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d7df48d..97023f1 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -144,6 +144,16 @@ namespace {
+     }();
+     return enabled;
+ }
++
++// EDEN_NX2_TC_PADDED_SQUARE=1: a depth target padded to whole GOBs is looked up as the square it
++// is (FindDepthBuffer; Lichii #1314).
++[[nodiscard]] inline bool PaddedSquareDepthEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_PADDED_SQUARE");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
+ } // namespace
+ 
+ template <class P>
+@@ -945,7 +955,10 @@ bool TextureCache<P>::RescaleRenderTargets() {
+             }
+             check_rescale(color_buffer_id, tmp_color_images[index]);
+         }
+-        if (flags[Dirty::ZetaBuffer] || force) {
++        // The surface clip, which a padded depth target's size depends on, has no flag of its
++        // own (it marks only RenderTargets), so look the target up again while it is padded.
++        // depth_target_padded stays false without EDEN_NX2_TC_PADDED_SQUARE.
++        if (flags[Dirty::ZetaBuffer] || force || depth_target_padded) {
+             flags[Dirty::ZetaBuffer] = false;
+             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
+         }
+@@ -3402,6 +3415,7 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
+ template <class P>
+ ImageViewId TextureCache<P>::FindDepthBuffer() {
+     const auto& regs = maxwell3d->regs;
++    depth_target_padded = false;
+     if (!regs.zeta_enable) {
+         return ImageViewId{};
+     }
+@@ -3409,7 +3423,21 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
+     if (gpu_addr == 0) {
+         return ImageViewId{};
+     }
+-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
++    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
++    // EDEN_NX2_TC_PADDED_SQUARE=1 (Lichii #1314): Ocarina of Time draws its local shadow maps into
++    // D32_FLOAT depth targets padded to whole GOBs (800x793) and samples them as the square
++    // textures they are (793x793) at the same address. Image lookups compare sizes strictly, so
++    // each shadow map was two images and a copy between them, for every new size while the camera
++    // moves. The padding is not part of the image: the surface clip bounds rendering, so a clip
++    // inside the square never reaches it, and one image then serves both. A clip that reaches the
++    // padding keeps the size the game gave.
++    if (PaddedSquareDepthEnabled()) {
++        depth_target_padded = IsPaddedSquare(info);
++        const u32 clip_right = regs.surface_clip.x.Value() + regs.surface_clip.width.Value();
++        if (depth_target_padded && clip_right <= info.size.height) {
++            info.size.width = info.size.height;
++        }
++    }
+     return FindRenderTargetView(info, gpu_addr);
+ }
+ 
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 1ef91b4..3fd2cd1 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -633,6 +633,8 @@ private:
+     std::vector<ImageId>* prepare_log{}; ///< LogPrepares
+     bool prepare_log_dry{};
+     bool is_rescaling = false;
++    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
++    bool depth_target_padded = false;
+     u64 total_used_memory = 0;
+     u64 minimum_memory;
+     u64 expected_memory;
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 2ae46df..693d910 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -1731,6 +1731,15 @@ bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32
+     }
+ }
+ 
++bool IsPaddedSquare(const ImageInfo& info) noexcept {
++    if (info.type != ImageType::e2D || info.num_samples != 1 || info.size.width <= info.size.height) {
++        return false;
++    }
++    ImageInfo square = info;
++    square.size.width = info.size.height;
++    return IsBlockLinearSizeCompatible(info, square, 0, 0, false);
++}
++
+ bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,
+                                            u32 lhs_level, u32 rhs_level) noexcept {
+     ASSERT(lhs.type != ImageType::Linear);
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index f480a87..e997467 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -149,6 +149,10 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
+                                                const ImageInfo& overlap_info, u32 new_level,
+                                                u32 overlap_level, bool strict_size) noexcept;
+ 
++/// Whether a block-linear 2D image is wider than tall by padding only: made as wide as it is
++/// tall, it takes the same guest memory with the same layout (Lichii #1314).
++[[nodiscard]] bool IsPaddedSquare(const ImageInfo& info) noexcept;
++
+ [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,
+                                          bool strict_size) noexcept;
+ 
+-- 
+2.53.0
+

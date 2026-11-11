@@ -1,0 +1,64 @@
+From 4e086c8441dd4d9c7bc7a91c204160cc4d86b308 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 08:37:29 -0300
+Subject: [PATCH 3/3] texture_cache: leave a square depth-only pass unscaled,
+ with EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1
+
+A depth-only pass over a square target is a shadow map. Resolution scaling
+does not sharpen the picture through it; it multiplies the map's memory by
+the square of the scale. Ocarina of Time keeps a 12288x12288 sun shadow map
+that took 648 MiB at 1.5x, and its local shadow maps in the Hyrule Castle
+Town guard house change size every frame. Decide it with the other passes'
+rescale checks: a full-screen depth prepass is not square, and a pass with a
+color target keeps the scale of that target. With
+EDEN_NX2_TC_PADDED_SQUARE=1 the padded local shadow maps are square too.
+
+Off by default; with the switch unset RescaleRenderTargets is unchanged.
+Port of Lichii #1314 (commit 3 of 3).
+---
+ src/video_core/texture_cache/texture_cache.h | 22 ++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 24f3aa3..c63d92b 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -164,6 +164,16 @@ namespace {
+     }();
+     return enabled;
+ }
++
++// EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1: a pass with no color target and a square depth target is
++// not rescaled (RescaleRenderTargets; Lichii #1314).
++[[nodiscard]] inline bool SquareDepthUnscaledEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
+ } // namespace
+ 
+ template <class P>
+@@ -1029,6 +1039,18 @@ bool TextureCache<P>::RescaleRenderTargets() {
+             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
+         }
+         check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
++        // EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1 (Lichii #1314): a square depth target with no color
++        // target is a shadow map. Scaling it doesn't sharpen the picture, it multiplies the map's
++        // memory by the square of the scale (648 MiB for Ocarina of Time's 12288x12288 sun shadow
++        // map at 1.5x), and the guard house's local shadow maps change size every frame, each
++        // size rescaled again. A full-screen depth prepass isn't square, and a pass with a color
++        // target keeps that target's scale, so both still scale. With EDEN_NX2_TC_PADDED_SQUARE
++        // the padded local shadow maps become square too.
++        if (SquareDepthUnscaledEnabled() && can_rescale && tmp_depth_image != CORRUPT_ID &&
++            std::ranges::all_of(tmp_color_images, [](ImageId id) { return id == CORRUPT_ID; })) {
++            const Extent3D& size = slot_images[tmp_depth_image].info.size;
++            can_rescale = size.width != size.height;
++        }
+ 
+         if (can_rescale) {
+             rescaled = any_rescaled || scale_rating >= 2;
+-- 
+2.53.0
+
