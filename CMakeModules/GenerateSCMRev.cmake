@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# SPDX-FileCopyrightText: 2019 yuzu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# generate git/build information
+include(GetSCMRev)
+
+function(get_timestamp _var)
+    string(TIMESTAMP timestamp UTC)
+    set(${_var} "${timestamp}" PARENT_SCOPE)
+endfunction()
+
+get_timestamp(BUILD_DATE)
+
+if (DEFINED GIT_RELEASE)
+    set(BUILD_VERSION "${GIT_TAG}")
+    set(GIT_REFSPEC "${GIT_RELEASE}")
+    set(IS_DEV_BUILD false)
+elseif (EGLANTINE_BUILD_TAG)
+    set(BUILD_VERSION "${EGLANTINE_BUILD_TAG}")
+    set(IS_DEV_BUILD false)
+else()
+    string(SUBSTRING ${GIT_COMMIT} 0 10 BUILD_VERSION)
+    set(BUILD_VERSION "${BUILD_VERSION}-${GIT_REFSPEC}")
+    set(IS_DEV_BUILD true)
+endif()
+
+if (NIGHTLY_BUILD)
+    set(IS_NIGHTLY_BUILD true)
+else()
+    set(IS_NIGHTLY_BUILD false)
+endif()
+
+set(GIT_DESC ${BUILD_VERSION})
+
+# Generate cpp with Git revision from template
+
+if (NIGHTLY_BUILD)
+    set(REPO_NAME "Eglantine Nightly")
+else()
+    set(REPO_NAME "Eglantine")
+endif()
+
+set(BUILD_ID ${GIT_REFSPEC})
+set(BUILD_FULLNAME "${REPO_NAME} ${BUILD_VERSION} ")
+set(CXX_COMPILER "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+
+configure_file(scm_rev.cpp.in scm_rev.cpp @ONLY)
