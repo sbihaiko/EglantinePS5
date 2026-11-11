@@ -1,0 +1,362 @@
+From 40835d639f9586f414010750c3ecde144e735a55 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 03:07:55 -0300
+Subject: [PATCH] shader_recompiler: route unrouted 32-bit global atomics to
+ bound storage buffers (off by default)
+
+EDEN_NX2_GLOBAL_ATOMICS=1: a 32-bit global atomic the storage buffer pass
+could not route walks the bound NVN storage buffers and runs on the word
+that holds its address, instead of failing the whole pipeline. Port of
+the fork's own earlier 0065 (Ocarina global reduction), SPIR-V part only.
+---
+ .../backend/spirv/emit_spirv_atomic.cpp       |  58 ++++++----
+ .../backend/spirv/emit_spirv_instructions.h   |  24 ++--
+ .../backend/spirv/spirv_emit_context.cpp      | 104 +++++++++++++++++-
+ .../backend/spirv/spirv_emit_context.h        |  22 +++-
+ 4 files changed, 169 insertions(+), 39 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+index 15dfb59..a280769 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -107,6 +107,16 @@ Id StorageAtomicU32x2(EmitContext& ctx, const IR::Value& binding, const IR::Valu
+     ctx.OpStore(pointer, result);
+     return original_value;
+ }
++/// A 32-bit global atomic through its routing function (DefineGlobalMemoryFunctions). With
++/// EDEN_NX2_GLOBAL_ATOMICS off no function exists and the instruction stays unimplemented.
++Id GlobalAtomic(EmitContext& ctx, EmitContext::GlobalAtomic kind, Id type,
++                const IR::Value& address, Id value, const char* name) {
++    const Id function{ctx.global_atomic_funcs[static_cast<size_t>(kind)]};
++    if (!Sirit::ValidId(function)) {
++        throw NotImplementedException("SPIR-V Instruction {}", name);
++    }
++    return ctx.OpFunctionCall(type, function, ctx.Def(address), value);
++}
+ } // Anonymous namespace
+ 
+ Id EmitSharedAtomicIAdd32(EmitContext& ctx, Id offset, Id value) {
+@@ -417,48 +427,48 @@ Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const I
+     return ctx.OpPackHalf2x16(ctx.U32[1], result);
+ }
+ 
+-Id EmitGlobalAtomicIAdd32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::IAdd, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicSMin32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::SMin, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicUMin32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::UMin, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicSMax32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::SMax, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicUMax32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::UMax, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicInc32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicInc32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Inc, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicDec32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicDec32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Dec, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicAnd32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicAnd32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::And, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicOr32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicOr32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Or, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicXor32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicXor32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Xor, ctx.U32[1], address, value, __func__);
+ }
+ 
+-Id EmitGlobalAtomicExchange32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicExchange32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Exchange, ctx.U32[1], address, value, __func__);
+ }
+ 
+ Id EmitGlobalAtomicIAdd64(EmitContext&) {
+@@ -549,8 +559,8 @@ Id EmitGlobalAtomicExchange32x2(EmitContext&) {
+     throw NotImplementedException("SPIR-V Instruction {}", __func__);
+ }
+ 
+-Id EmitGlobalAtomicAddF32(EmitContext&) {
+-    throw NotImplementedException("SPIR-V Instruction {}", __func__);
++Id EmitGlobalAtomicAddF32(EmitContext& ctx, const IR::Value& address, Id value) {
++    return GlobalAtomic(ctx, EmitContext::GlobalAtomic::AddF32, ctx.F32[1], address, value, __func__);
+ }
+ 
+ Id EmitGlobalAtomicAddF16x2(EmitContext&) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+index 2a7111a..93d60f2 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -421,17 +421,17 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
+                              Id value);
+ Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                              Id value);
+-Id EmitGlobalAtomicIAdd32(EmitContext& ctx);
+-Id EmitGlobalAtomicSMin32(EmitContext& ctx);
+-Id EmitGlobalAtomicUMin32(EmitContext& ctx);
+-Id EmitGlobalAtomicSMax32(EmitContext& ctx);
+-Id EmitGlobalAtomicUMax32(EmitContext& ctx);
+-Id EmitGlobalAtomicInc32(EmitContext& ctx);
+-Id EmitGlobalAtomicDec32(EmitContext& ctx);
+-Id EmitGlobalAtomicAnd32(EmitContext& ctx);
+-Id EmitGlobalAtomicOr32(EmitContext& ctx);
+-Id EmitGlobalAtomicXor32(EmitContext& ctx);
+-Id EmitGlobalAtomicExchange32(EmitContext& ctx);
++Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicInc32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicDec32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicAnd32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicOr32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicXor32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitGlobalAtomicExchange32(EmitContext& ctx, const IR::Value& address, Id value);
+ Id EmitGlobalAtomicIAdd64(EmitContext& ctx);
+ Id EmitGlobalAtomicSMin64(EmitContext& ctx);
+ Id EmitGlobalAtomicUMin64(EmitContext& ctx);
+@@ -454,7 +454,7 @@ Id EmitGlobalAtomicAnd32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicOr32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicXor32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicExchange32x2(EmitContext& ctx);
+-Id EmitGlobalAtomicAddF32(EmitContext& ctx);
++Id EmitGlobalAtomicAddF32(EmitContext& ctx, const IR::Value& address, Id value);
+ Id EmitGlobalAtomicAddF16x2(EmitContext& ctx);
+ Id EmitGlobalAtomicAddF32x2(EmitContext& ctx);
+ Id EmitGlobalAtomicMinF16x2(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index f0960ce..7944f2d 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -8,6 +8,7 @@
+ #include <array>
+ #include <bit>
+ #include <climits>
++#include <optional>
+ #include <cstdlib>
+ #include <span>
+ 
+@@ -16,6 +17,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include "common/common_types.h"
++#include "common/logging.h"
+ #include "common/div_ceil.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+@@ -46,6 +48,14 @@ bool PositionInvariant() {
+     return enabled;
+ }
+ 
++bool GlobalAtomics() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_GLOBAL_ATOMICS");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
+ namespace {
+ enum class Operation {
+     Increment,
+@@ -567,7 +577,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
+     DefineImages(program.info, image_binding, bindings.image_scaling_index);
+     DefineAttributeMemAccess(program.info);
+     DefineWriteStorageCasLoopFunction(program.info);
+-    DefineGlobalMemoryFunctions(program.info);
++    DefineGlobalMemoryFunctions(program);
+     DefineRescalingInput(program.info);
+     DefineRenderArea(program.info);
+ }
+@@ -1048,7 +1058,8 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
+     write_storage_cas_loop_func = func;
+ }
+ 
+-void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
++void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
++    const Info& info{program.info};
+     if (!info.uses_global_memory || !profile.support_int64) {
+         return;
+     }
+@@ -1172,6 +1183,95 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
+     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
+         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
++
++    // EDEN_NX2_GLOBAL_ATOMICS=1: global atomics the storage buffer pass could not route to a
++    // binding walk the bound NVN storage buffers here and run on the word that holds the address.
++    // INC, DEC and the float add have no host atomic of their own and go through the storage
++    // buffer CAS loops. Without this, a compute shader with one such atomic fails to build and its
++    // pass never runs (Ocarina of Time: 8 compute pipelines at load).
++    if (!GlobalAtomics()) {
++        return;
++    }
++    using enum GlobalAtomic;
++    const auto kind_of = [](IR::Opcode opcode) -> std::optional<GlobalAtomic> {
++        switch (opcode) {
++        case IR::Opcode::GlobalAtomicIAdd32: return IAdd;
++        case IR::Opcode::GlobalAtomicSMin32: return SMin;
++        case IR::Opcode::GlobalAtomicUMin32: return UMin;
++        case IR::Opcode::GlobalAtomicSMax32: return SMax;
++        case IR::Opcode::GlobalAtomicUMax32: return UMax;
++        case IR::Opcode::GlobalAtomicInc32: return Inc;
++        case IR::Opcode::GlobalAtomicDec32: return Dec;
++        case IR::Opcode::GlobalAtomicAnd32: return And;
++        case IR::Opcode::GlobalAtomicOr32: return Or;
++        case IR::Opcode::GlobalAtomicXor32: return Xor;
++        case IR::Opcode::GlobalAtomicExchange32: return Exchange;
++        case IR::Opcode::GlobalAtomicAddF32: return AddF32;
++        default: return std::nullopt;
++        }
++    };
++    std::array<bool, static_cast<size_t>(Count)> used{};
++    for (const IR::Block* const block : program.blocks) {
++        for (const IR::Inst& inst : block->Instructions()) {
++            if (const auto kind = kind_of(inst.GetOpcode())) {
++                used[static_cast<size_t>(*kind)] = true;
++            }
++        }
++    }
++    if (std::ranges::none_of(used, [](bool kind) { return kind; })) {
++        return;
++    }
++    if (info.nvn_buffer_used.none()) {
++        // Nothing to route to, but the functions still have to exist or the pipeline fails: with
++        // no bound buffer define_body emits no branch and each function returns zero, the shape
++        // the global load and store functions take in a program with no NVN buffers.
++        LOG_WARNING(Shader_SPIRV, "Global atomic with no bound NVN storage buffer: dropped");
++    }
++    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
++    for (size_t index = 0; index < used.size(); ++index) {
++        if (!used[index]) {
++            continue;
++        }
++        const auto kind{static_cast<GlobalAtomic>(index)};
++        const Id type{kind == AddF32 ? F32[1] : U32[1]};
++        const Id func_id{
++            OpFunction(type, spv::FunctionControlMask::MaskNone, TypeFunction(type, U64, type))};
++        const Id addr{OpFunctionParameter(U64)};
++        const Id value{OpFunctionParameter(type)};
++        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                    [&](Id pointer, Id ssbo, Id word) {
++                        const auto atomic = [&](Id (Sirit::Module::*op)(Id, Id, Id, Id, Id)) {
++                            return (this->*op)(U32[1], pointer, scope, zero, value);
++                        };
++                        switch (kind) {
++                        case IAdd: OpReturnValue(atomic(&Sirit::Module::OpAtomicIAdd)); break;
++                        case SMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMin)); break;
++                        case UMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMin)); break;
++                        case SMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMax)); break;
++                        case UMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMax)); break;
++                        case And: OpReturnValue(atomic(&Sirit::Module::OpAtomicAnd)); break;
++                        case Or: OpReturnValue(atomic(&Sirit::Module::OpAtomicOr)); break;
++                        case Xor: OpReturnValue(atomic(&Sirit::Module::OpAtomicXor)); break;
++                        case Exchange: OpReturnValue(atomic(&Sirit::Module::OpAtomicExchange)); break;
++                        case Inc:
++                            OpReturnValue(
++                                OpFunctionCall(U32[1], increment_cas_ssbo, word, value, ssbo));
++                            break;
++                        case Dec:
++                            OpReturnValue(
++                                OpFunctionCall(U32[1], decrement_cas_ssbo, word, value, ssbo));
++                            break;
++                        case AddF32:
++                            OpReturnValue(OpFunctionCall(F32[1], f32_add_cas, word, value, ssbo));
++                            break;
++                        case Count: break;
++                        }
++                    });
++        // No buffer matched: drop the operation, as the storage path does for an unrouted address.
++        OpReturnValue(ConstantNull(type));
++        OpFunctionEnd();
++        global_atomic_funcs[index] = func_id;
++    }
+ }
+ 
+ void EmitContext::DefineRescalingInput(const Info& info) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 3e0e405..029417a 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -37,6 +37,9 @@ namespace Shader::Backend::SPIRV {
+ /// compute a slightly different position and reject the colour pass in spots, which shows the
+ /// bright sky through holes that bloom then blows up. Read once.
+ [[nodiscard]] bool PositionInvariant();
++/// EDEN_NX2_GLOBAL_ATOMICS=1: 32-bit global atomics the storage buffer pass could not route
++/// run on the bound storage buffer that holds their address (port of the fork's old 0065).
++[[nodiscard]] bool GlobalAtomics();
+ 
+ static std::bitset<8> clip_distance_written;
+ 
+@@ -378,6 +381,23 @@ public:
+ 
+     Id write_storage_cas_loop_func{};
+ 
++    enum class GlobalAtomic : size_t {
++        IAdd,
++        SMin,
++        UMin,
++        SMax,
++        UMax,
++        Inc,
++        Dec,
++        And,
++        Or,
++        Xor,
++        Exchange,
++        AddF32,
++        Count,
++    };
++    std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
++
+     Id load_global_func_u32{};
+     Id load_global_func_u32x2{};
+     Id load_global_func_u32x4{};
+@@ -462,7 +482,7 @@ private:
+     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
+     void DefineAttributeMemAccess(const Info& info);
+     void DefineWriteStorageCasLoopFunction(const Info& info);
+-    void DefineGlobalMemoryFunctions(const Info& info);
++    void DefineGlobalMemoryFunctions(const IR::Program& program);
+     void DefineRescalingInput(const Info& info);
+     void DefineRescalingInputPushConstant();
+     void DefineRescalingInputUniformConstant();
+-- 
+2.53.0
+

@@ -18,6 +18,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
 | `0910-count-only-counters` | `EDEN_NX2_COUNTERS=1` (`EDEN_NX2_FAST_DRAW_PROBE` picks the probed methods) | off | ours |
 | `0911-nan-guard-and-invariant-position` | `EDEN_NX2_NAN_GUARD=1`, `EDEN_NX2_POSITION_INVARIANT=1` | off | notquiteog/Dragoon `395547c` (Shakoquo/Hookshot `f04461bc9`) |
+| `0912-routed-global-atomics` | `EDEN_NX2_GLOBAL_ATOMICS=1` | off | the fork's own earlier `0065-ocarina-global-reduction` (SPIR-V part) |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
@@ -62,6 +63,17 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   up: `EDEN_NX2_POSITION_INVARIANT=1` decorates `gl_Position` Invariant. GrowingBlackBeans
   measured both with the colour output masks (viejunerd/Eglantine-PS5- #21): flashes from a few
   per walk to nearly none, no FPS cost. The first boot after a change builds the new pipelines.
+
+- **Routed global atomics.** In every Ocarina session 8 compute pipelines fail at load with
+  `SPIR-V Instruction EmitGlobalAtomicIAdd32 is not implemented`, right after `Storage buffer failed
+  to track, using global memory fallbacks`, so those passes never run. With
+  `EDEN_NX2_GLOBAL_ATOMICS=1` a 32-bit global atomic the storage buffer pass could not route walks
+  the bound NVN storage buffers, as the global load and store fallbacks already do, and runs on the
+  word that holds its address (INC, DEC and the float add through the storage CAS loops); with no
+  buffer matching, the operation is dropped. A 32-bit atomic add in a compute pass is the usual
+  shape of a luminance histogram, so this is the lead for the flashes the NaN guard did not stop.
+  This is the SPIR-V part of the fork's earlier 0065, dropped on 2026-11-10 only because the
+  parent's 0068 changed the same lines; 0068 replaces its Ampere lowering part.
 
 - **Submit thread (driver).** `sceAgcDriverSubmitDcb` keeps the submitting thread in the kernel
   for a while; in run11 the driver spent 135-220 ms a second in `agc`. With the switch, RADV
