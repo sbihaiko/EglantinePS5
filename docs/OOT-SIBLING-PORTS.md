@@ -66,8 +66,11 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   route): 1-3 FPS more in most 5 s windows (house 19-20 against 17-19, after it 26 against 23-24,
   Kokiri 34-38 against 36-37), but longer stalls (10 s and 6 s, then 4 s and 2 s, against two of
   1.4 s off), each at a driver request for 512 MiB that came back nearly empty while the app packed
-  guest memory. The second session ended at 240 s with the system's crash screen and no crash
-  file of the app. Left off until the memory pressure is understood.
+  guest memory (14 and 6 packing passes, against 6 off). The second session ended at 240 s with the system's crash screen and no crash
+  file of the app. A third session on (no memory packing at all) had no stall over 0.7 s and no
+  crash, at the same FPS gain: the stalls follow the memory packing, which varies per session,
+  more than the switch. Left off until the crash is explained (the watcher now keeps the kernel
+  log).
 
 - **Batched submissions.** In run11 the back GPU thread made 850-1,540 queue submissions a
   second, one per fence and per command list end, and the driver spent 135-220 ms a second in
