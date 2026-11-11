@@ -33,6 +33,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0926-device-alloc` | none of its own: `dev_alloc_n`, `dev_alloc_ms` and `dev_alloc_mib` join the `EDEN_STALL` line, and the timing is a no-op without `EDEN_NX2_STALL_REPORT` | — | ours: b3-A's pure `split_wait` stalls had no back-side cost to explain them |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 | driver: `tools/patch-radv-retire.py` | `RADV_PS5_RETIRE=1` | off | mihawk-99/PS5_Mesa `f5610fe270` |
+| driver: `tools/radv-patches/0f86253f-mesh-ring.patch` | none: an entry of the mesh shaders' scratch ring is 64 KiB instead of 160 KiB, so the ring is 128 MiB instead of 320 MiB. Take the patch file out to go back; the driver says on stderr when a shader keeps more than an entry | always on | mihawk-99/PS5_Mesa `0f86253f` |
 | driver: `tools/patch-radv-free-log.py` | `RADV_PS5_FREE_LOG=1` (`RADV_PS5_FREE_LOG_LINES`, default 200 lines per kind per 10 s): `radv/ps5 free-log` lines for frees and allocations of 16 MiB or more, pieces, sparse binds, replaced queue buffers and trimmed granules; lifts the trim and pieces line caps | off | ours |
 | app: `headless/heap_arenas.inc` (`eden_heap_trim`) | `EDEN_PS5_HEAP_NO_GIVEBACK=1` (the heap never gives pieces or arenas back; large blocks of their own still go back when freed) | off | ours |
 
