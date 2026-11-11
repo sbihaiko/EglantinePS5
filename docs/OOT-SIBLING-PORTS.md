@@ -74,6 +74,11 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   shape of a luminance histogram, so this is the lead for the flashes the NaN guard did not stop.
   This is the SPIR-V part of the fork's earlier 0065, dropped on 2026-11-10 only because the
   parent's 0068 changed the same lines; 0068 replaces its Ampere lowering part.
+  On the console (2026-11-11, with 0911 on): no pipeline fails any more, but 5 of the shaders
+  have no bound NVN storage buffer at all (`Global atomic with no bound NVN storage buffer:
+  dropped`), so their atomics still go nowhere, and the flashes are unchanged. The address
+  these shaders use is not one the storage buffer pass can track; parent PR #99 (native
+  storage buffer tracking) is the next thing to try.
 
 - **Submit thread (driver).** `sceAgcDriverSubmitDcb` keeps the submitting thread in the kernel
   for a while; in run11 the driver spent 135-220 ms a second in `agc`. With the switch, RADV
