@@ -1,0 +1,63 @@
+From 5d3f625d360dd40324bd2fe9a360b8089e6046d7 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 11:06:12 -0300
+Subject: [PATCH] gpu_thread: poll suspended channels in short sleeps, with
+ EDEN_NX2_PENDING_POLL_US=<us>
+
+While a channel waits on a semaphore the CPU releases, the GPU thread yields
+for half a millisecond and then sleeps 1 ms between polls. Ocarina of Time
+waits there about 330 times a second, and its present waits for the work
+behind those waits: Lichii measured the present waiting ~17 ms a frame in
+Kokiri village with 1 ms sleeps and ~1 ms with 50 us sleeps (+11% FPS, PC).
+With the switch the poll sleeps <us> (1-999) for up to 2 s since the last
+progress, then goes back to 1 ms. Lichii's prctl timer slack call is Linux
+only and left out.
+
+Off by default; unset or 0 keeps the 1 ms sleeps.
+Port of Lichii #446 (acb9c18d6).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/gpu_thread.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index b83000c..7c5d1da 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -6,6 +6,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <thread>
+ 
+ #include "common/assert.h"
+@@ -127,9 +128,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                     // millisecond before sleeping, or every wait also waits out a host sleep
+                     // (title 1 waits ~25 times a second).
+                     Profile::Scope scope{Profile::Zone::PendingSleep};
+-                    if (std::chrono::steady_clock::now() - last_progress <
+-                        std::chrono::microseconds{500}) {
++                    // EDEN_NX2_PENDING_POLL_US=<us> (Lichii #446; 50 there): after the half
++                    // millisecond of yields, sleep this long instead of 1 ms, for up to 2 s since
++                    // the last progress (menus and loading go back to 1 ms). Ocarina of Time waits
++                    // here ~330 times a second and its present waits for the work behind them:
++                    // with 1 ms sleeps the present waited ~17 ms a frame in Kokiri village, with
++                    // 50 us ~1 ms (PC). Unset or 0: 1 ms sleeps, as before.
++                    static const long long poll_us = [] {
++                        const char* const value = std::getenv("EDEN_NX2_PENDING_POLL_US");
++                        const long long us = value != nullptr ? std::atoll(value) : 0;
++                        return us > 0 && us < 1000 ? us : 0LL;
++                    }();
++                    const auto waited = std::chrono::steady_clock::now() - last_progress;
++                    if (waited < std::chrono::microseconds{500}) {
+                         std::this_thread::yield();
++                    } else if (poll_us != 0 && waited < std::chrono::seconds{2}) {
++                        std::this_thread::sleep_for(std::chrono::microseconds{poll_us});
+                     } else {
+                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                     }
+-- 
+2.53.0
+
