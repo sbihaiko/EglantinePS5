@@ -30,15 +30,15 @@ index cf1dd46c84..36857b2db1 100644
 +        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 +}
 +
-+inline void SetBackThread(bool on) {
-+    on_back_thread = on;
-+    if (!on) EnterBackPhase(BackPhase::Idle);
-+}
-+
 +inline void EnterBackPhase(BackPhase phase) {
 +    if (!BackProfileEnabled() || !on_back_thread) return;
 +    back_phase_ns.store(BackNowNs(), std::memory_order_relaxed);
 +    back_phase.store(static_cast<std::uint32_t>(phase), std::memory_order_relaxed);
++}
++
++inline void SetBackThread(bool on) {
++    on_back_thread = on;
++    if (!on) EnterBackPhase(BackPhase::Idle);
 +}
 +
 +[[nodiscard]] inline const char* BackPhaseName(std::uint32_t phase) {
