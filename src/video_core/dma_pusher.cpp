@@ -434,7 +434,7 @@ bool DmaPusher::Step() {
                                              return memory_manager.GpuToCpuAddress(page);
                                          }))) {
                     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-                        split.Drain();
+                        split.Drain(VideoCommon::Nx2Profile::Zone::DrainMacroParameters);
                     }
                     const GPUVAddr address = dma_state.dma_get;
                     const size_t bytes = words * sizeof(u32);
@@ -453,7 +453,7 @@ bool DmaPusher::Step() {
                 } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     if (g_nx2_ampere.load(std::memory_order_relaxed)) {
-                        split.Drain();
+                        split.Drain(VideoCommon::Nx2Profile::Zone::DrainMacroParameters);
                         engine_state->current_dirty = memory_manager.IsMemoryDirty(
                             dma_state.dma_get, words * sizeof(u32));
                     } else {
@@ -546,7 +546,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain();
+        VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainSync);
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;

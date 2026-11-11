@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/nx2_profile.h"
 
 namespace Core {
 class System;
@@ -193,7 +194,7 @@ public:
     /// Makes what was sent visible to the back.
     void Publish();
     /// Waits until the back executed everything sent so far.
-    void Drain();
+    void Drain(Nx2Profile::Zone zone = Nx2Profile::Zone::SplitDrain);
     /// The entry just sent can write guest memory (a compute, copy or upload engine's method):
     /// a command list on a GPU-written page waits for the back only up to here (DrainToLastWriter).
     void NoteWriter() {

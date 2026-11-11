@@ -71,7 +71,7 @@ void OnBack(const Func& func) {
 }
 
 void DrainBack() {
-    VideoCommon::GpuSplit::Get().Drain();
+    VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainPuller);
 }
 
 // A semaphore acquire: what the CPU (or another channel) wrote before the release it waits for

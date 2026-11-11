@@ -53,6 +53,14 @@ enum class Zone : u32 {
     SplitWait,    ///< Split GPU thread: the back waits for work
     Submit,       ///< Scheduler::Flush: the chunk handed to the worker, a new context begun
     GpuWait,      ///< Waiting for a GPU tick (Scheduler::Wait)
+    SplitFull,    ///< Split GPU thread: the front waits for room in the ring (the back is behind)
+    DrainMacroParameters, ///< Front waits for the back: macro parameters on a GPU-written page
+    DrainSync,    ///< Front waits for the back: a command list with a sync fence
+    DrainDmaRead, ///< Front waits for the back: a native macro reads guest memory
+    DrainCommand, ///< Front waits for the back: the end of a GPU thread command
+    DrainPuller,  ///< Front waits for the back: a puller method that needs its result
+    DrainCpuRead, ///< Front waits for the back: a CPU read of GPU-written memory
+    DrainList,    ///< Front waits for the back: a command list on a GPU-written page
     Count,
 };
 
@@ -64,6 +72,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait", "submit", "GPU wait",
+    "split full", "drain: macro parameters", "drain: sync fence", "drain: DMA read",
+    "drain: command end", "drain: puller", "drain: CPU read", "drain: list",
 };
 
 inline bool Enabled() {

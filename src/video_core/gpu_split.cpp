@@ -184,7 +184,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitFull};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
@@ -289,7 +289,7 @@ bool GpuSplit::WritePending(u64 key) {
     return PendingRelease(key) || PendingPosition(key) || PendingLowerBound(key, 0);
 }
 
-void GpuSplit::Drain() {
+void GpuSplit::Drain(Nx2Profile::Zone zone) {
     sync_pending = false;
     CloseRegs();
     consumed_cache = consumed.load(std::memory_order_acquire);
@@ -297,7 +297,7 @@ void GpuSplit::Drain() {
         return;
     }
     Publish();
-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Nx2Profile::Scope scope{zone};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
@@ -322,7 +322,7 @@ void GpuSplit::DrainToLastWriter() {
         return value != nullptr && value[0] == '1';
     }();
     if (!to_writer) {
-        Drain();
+        Drain(Nx2Profile::Zone::DrainList);
         return;
     }
     DrainTo(last_writer_position);

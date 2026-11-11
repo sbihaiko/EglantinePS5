@@ -249,7 +249,7 @@ struct GPU::Impl {
             if (split.Active()) {
                 VideoCore::RasterizerDownloadArea area{};
                 split.Defer([this, addr, size, &area] { area = OnCPURead(addr, size); });
-                split.Drain();
+                split.Drain(VideoCommon::Nx2Profile::Zone::DrainCpuRead);
                 return area;
             }
         }

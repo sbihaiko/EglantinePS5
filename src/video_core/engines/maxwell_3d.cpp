@@ -1367,7 +1367,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     }
     if (drain) {
-        split.Drain();
+        split.Drain(VideoCommon::Nx2Profile::Zone::DrainDmaRead);
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);

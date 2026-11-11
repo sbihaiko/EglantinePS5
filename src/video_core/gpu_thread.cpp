@@ -219,7 +219,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             SignalCommand(state, next.fence, next.completion);
         }
         if (split.Active()) {
-            split.Drain();
+            split.Drain(VideoCommon::Nx2Profile::Zone::DrainCommand);
         }
     });
 }
