@@ -389,6 +389,10 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
 6. Which of 0913-0918 gave the b2-B gain, and what reaches 38 FPS in Kokiri? Candidates in
    `docs/OOT-SIBLING-PORTS.md`: Lichii #1329 and #1056, viejunerd's texture switches, and Lichii
    #1334.
+7. Where does the back wait during the pure `split_wait` stalls? The b3-A logs cannot answer it
+   offline: `EDEN_STALL` counts emulator seconds and the free log's `t=` counts milliseconds since
+   boot, with no shared origin and no timestamp on the `EDEN_MEMORY` lines. The next diagnostic
+   gives `vkAllocateMemory` its own stall category, which both times it and puts it in the report.
 
 **What b3-A settled.** Guest memory compression is not a cause of the stalls: `cram_unpack_ms` was
 0.0 in all 51 `EDEN_STALL` lines. The stalls are the front GPU thread waiting for the back
