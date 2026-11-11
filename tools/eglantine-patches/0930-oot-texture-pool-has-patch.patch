@@ -1,0 +1,19 @@
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 5d03535872..b404d28b67 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -554,6 +554,14 @@ bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name)
+ 
+     LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
+ 
++    // The loader only calls PatchNSO when this says yes: the built-in patch above has to be
++    // announced here too, or it is never reached.
++    static const bool builtin = std::getenv("EDEN_NX2_OOT_TEXTURE_POOL_X2") != nullptr;
++    if (builtin && name == "main" && title_id == OOT_TEXTURE_POOL_TITLE_ID &&
++        build_id == OOT_TEXTURE_POOL_BUILD_ID) {
++        return true;
++    }
++
+     const auto load_dir = GetModificationLoadRoot();
+     if (load_dir == nullptr) {
+         LOG_ERROR(Loader, "Cannot load mods for invalid title_id={:016X}", title_id);
