@@ -1430,6 +1430,12 @@ void PlatformChecks() {
 }
 } // namespace Eden::Performance
 
+// RADV's submit thread (tools/patch-radv-submit-thread.py, weak there): named, placed and listed in a
+// crash report like the app's own secondary threads (EDEN_PS5_PLACE=RadvSubmit=<cpu> pins it).
+extern "C" void eden_thread_named(const char* name) {
+    Eden::Performance::RegisterWorker(name);
+}
+
 // dynarmic A64 hooks (weak there): whole-cache evacuations and block compilation time.
 extern "C" void eden_jit_evacuation(unsigned core) {
     if (core < Eden::Performance::evacuations.size())

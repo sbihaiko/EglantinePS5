@@ -15,7 +15,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 prepare = (root / 'tools/prepare-build.sh').read_text()
 build = (root / 'tools/build-radv-dependencies.sh').read_text()
-scripts = {'patch-radv-gs-compute.py': 'EDEN_GS_COMPUTE_SHA256'}
+scripts = {'patch-radv-gs-compute.py': 'EDEN_GS_COMPUTE_SHA256',
+           'patch-radv-submit-thread.py': 'EDEN_SUBMIT_THREAD_SHA256'}
 
 for name, stamp_name in scripts.items():
     script = root / 'tools' / name
@@ -49,6 +50,7 @@ if export.is_dir():
         vulkan = tree / 'src/amd/vulkan'
         assert 'const uint64_t null_sink = radv_gs_compute_upload' in (vulkan / 'radv_cmd_buffer.c').read_text()
         assert 'block->ro_sink;\n      p->count_buffer' in (vulkan / 'cl/radv_gs_compute.cl').read_text()
+        assert 'radv_ps5_submitter_push(' in (vulkan / 'winsys/ps5/radv_ps5_cs.c').read_text()
     print('RADV robustness: wired in, stamped, applies to the export and is idempotent')
 else:
     print('RADV robustness: wired in and stamped (no driver export here to apply to)')

@@ -17,6 +17,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0908-fence-batching-off-by-default` | — | — | ours |
 | `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
 | `0910-count-only-counters` | `EDEN_NX2_COUNTERS=1` (`EDEN_NX2_FAST_DRAW_PROBE` picks the probed methods) | off | ours |
+| driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
   AMD writes undefined values (NaN) there, and bloom spreads them into white glow.
@@ -51,6 +52,16 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   executable 3D methods it runs. Thunk addresses are absolute: subtract the logged anchor, add
   the address of `Nx2CountersAnchor` in the symbols ELF (`llvm-nm -C`), then symbolize. Measure FPS
   with neither switch set.
+
+- **Submit thread (driver).** `sceAgcDriverSubmitDcb` keeps the submitting thread in the kernel
+  for a while; in run11 the driver spent 135-220 ms a second in `agc`. With the switch, RADV
+  numbers a submission and copies it into the ring as before, then hands it to a thread of its own
+  (`RadvSubmit`), which submits in order. Clock reads and AGC setting changes wait for the thread
+  first; a refused submission loses the device instead of hanging a wait. The app names and places
+  the thread like its own (`EDEN_PS5_PLACE=RadvSubmit=<cpu>`). GrowingBlackBeans measured it on
+  Vampinity's base (viejunerd/Eglantine-PS5- #21, run H1, firmware 13.60, Handheld): walking 23.9
+  to 25.2 FPS, walking 1% low 94 to 82 ms, present fence wait 13.9 to 6.5 ms. A host stress test
+  (four submitters, 200,000 jobs, ThreadSanitizer) kept the order and found no race.
 
 - **Batched submissions.** In run11 the back GPU thread made 850-1,540 queue submissions a
   second, one per fence and per command list end, and the driver spent 135-220 ms a second in
