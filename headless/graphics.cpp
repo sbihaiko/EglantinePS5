@@ -294,7 +294,8 @@ void Cleanup(bool success, const char* operation) noexcept {
                     "staging_create_ms=%.1f staging_create_mib=%.1f pipe_n=%llu pipe_ms=%.1f pipe_wait_ms=%.1f "
                     "gpuw_wait_ms=%.1f split_wait_ms=%.1f tc_gc_ms=%.1f tc_upload_ms=%.1f tc_upload_mib=%.1f "
                     "fence_wait_ms=%.1f dev_alloc_n=%llu dev_alloc_ms=%.1f dev_alloc_mib=%.1f "
-                    "audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f other_ms=%.1f\n",
+                    "audio_late=%llu audio_dry=%llu audio_gap_ms=%.1f other_ms=%.1f "
+                    "back_phase=%s back_phase_ms=%.1f\n",
                     Ledger::SecondsSinceStart(), frame_ms, ms(Category::CramUnpack), mib(Category::CramUnpack),
                     ms(Category::CramPack), ms(Category::CramWait), ms(Category::CramRecover),
                     ms(Category::BufferCreate), ms(Category::BufferUpload), mib(Category::BufferUpload),
@@ -305,7 +306,11 @@ void Cleanup(bool success, const char* operation) noexcept {
                     count(Category::DeviceAlloc), ms(Category::DeviceAlloc), mib(Category::DeviceAlloc),
                     count(Category::AudioLate),
                     count(Category::AudioDry), static_cast<double>(std::max(late_max, dry_max)) / 1e6,
-                    frame_ms - accounted);
+                    frame_ms - accounted,
+                    Ledger::BackProfileEnabled()
+                        ? Ledger::BackPhaseName(Ledger::back_phase.load(std::memory_order_relaxed))
+                        : "off",
+                    Ledger::BackProfileEnabled() ? Ledger::BackPhaseMs() : 0.0);
     }
     previous = now;
     if (Ledger::AudioGap gap; Ledger::TakeAudioGap(gap))

@@ -1,0 +1,131 @@
+diff --git a/src/common/stall_ledger.h b/src/common/stall_ledger.h
+index cf1dd46c84..36857b2db1 100644
+--- a/src/common/stall_ledger.h
++++ b/src/common/stall_ledger.h
+@@ -175,4 +175,65 @@ struct AudioGap {
+     return true;
+ }
+ 
++
++// EDEN_NX2_BACK_PROFILE=1: where the split's back thread was when the front waited. The back sets
++// its phase as it works (Execute: running ring entries, Submit: a queue submission, FenceWait: a
++// wait for a GPU tick); the EDEN_STALL line reads it, so a stall says whether the back was idle,
++// submitting or waiting on the GPU while the front waited seconds.
++enum class BackPhase : std::uint32_t { Idle, Execute, Submit, FenceWait, Alloc, Count };
++
++inline thread_local bool on_back_thread = false;
++inline std::atomic<std::uint32_t> back_phase{static_cast<std::uint32_t>(BackPhase::Idle)};
++inline std::atomic<std::uint64_t> back_phase_ns{0};
++
++[[nodiscard]] inline bool BackProfileEnabled() {
++    static const bool on = [] {
++        const char* const value = std::getenv("EDEN_NX2_BACK_PROFILE");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return on;
++}
++
++[[nodiscard]] inline std::uint64_t BackNowNs() {
++    return static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
++}
++
++inline void SetBackThread(bool on) {
++    on_back_thread = on;
++    if (!on) EnterBackPhase(BackPhase::Idle);
++}
++
++inline void EnterBackPhase(BackPhase phase) {
++    if (!BackProfileEnabled() || !on_back_thread) return;
++    back_phase_ns.store(BackNowNs(), std::memory_order_relaxed);
++    back_phase.store(static_cast<std::uint32_t>(phase), std::memory_order_relaxed);
++}
++
++[[nodiscard]] inline const char* BackPhaseName(std::uint32_t phase) {
++    switch (static_cast<BackPhase>(phase)) {
++    case BackPhase::Idle: return "idle";
++    case BackPhase::Execute: return "execute";
++    case BackPhase::Submit: return "submit";
++    case BackPhase::FenceWait: return "fence";
++    case BackPhase::Alloc: return "alloc";
++    default: return "?";
++    }
++}
++
++[[nodiscard]] inline double BackPhaseMs() {
++    const std::uint64_t at = back_phase_ns.load(std::memory_order_relaxed);
++    return at == 0 ? 0.0 : static_cast<double>(BackNowNs() - at) / 1e6;
++}
++
++struct BackPhaseScope {
++    BackPhase saved;
++    explicit BackPhaseScope(BackPhase next) : saved{static_cast<BackPhase>(back_phase.load(std::memory_order_relaxed))} {
++        EnterBackPhase(next);
++    }
++    ~BackPhaseScope() { EnterBackPhase(saved); }
++    BackPhaseScope(const BackPhaseScope&) = delete;
++    BackPhaseScope& operator=(const BackPhaseScope&) = delete;
++};
++
+ } // namespace Common::StallLedger
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 43dda1b1da..a74026b79d 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -576,6 +576,8 @@ size_t GpuSplit::Execute(const u64* entry) {
+ 
+ void GpuSplit::BackLoop(std::stop_token stop_token) {
+     back_thread_context = true;
++    Common::StallLedger::SetBackThread(true);
++    Common::StallLedger::EnterBackPhase(Common::StallLedger::BackPhase::Idle);
+     Common::SetCurrentThreadName("GPUBack");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
+@@ -608,6 +610,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             if (available == read_position) {
+                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
+                 // at `published`, so a publish in between ends the wait at once.
++                Common::StallLedger::EnterBackPhase(Common::StallLedger::BackPhase::Idle);
+                 back_waiting.store(true, std::memory_order_seq_cst);
+                 const u32 seen = wake.load(std::memory_order_seq_cst);
+                 available = published.load(std::memory_order_seq_cst);
+@@ -625,6 +628,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         while (read_position != available) {
+             const size_t index = read_position & RingMask;
+             Tegra::g_nx2_back_position.store(read_position, std::memory_order_relaxed);
++            const Common::StallLedger::BackPhaseScope executing{Common::StallLedger::BackPhase::Execute};
+             const size_t size = Execute(&ring[index]);
+             read_position += size != 0 ? size : RingWords - index;
+             if (hook_requested.load(std::memory_order_relaxed) &&
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index 7e97bb6506..f89ff1b58b 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -98,6 +98,7 @@ void MasterSemaphore::Wait(u64 tick) {
+         }
+ 
+         const Common::StallLedger::Scope stall{Common::StallLedger::Category::FenceWait};
++        const Common::StallLedger::BackPhaseScope waiting{Common::StallLedger::BackPhase::FenceWait};
+         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
+         while (gpu_tick.load(std::memory_order_acquire) < tick) {
+             gpu_tick.wait(last_tick, std::memory_order_acquire);
+@@ -120,6 +121,7 @@ void MasterSemaphore::Wait(u64 tick) {
+ 
+     // If none of the above is hit, fallback to a regular wait
+     const Common::StallLedger::Scope stall{Common::StallLedger::Category::FenceWait};
++    const Common::StallLedger::BackPhaseScope waiting{Common::StallLedger::BackPhase::FenceWait};
+     VideoCommon::LoadingProbe::wait.Mark("timeline wait", tick);
+     while (!semaphore.Wait(tick)) {
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6b2137d60d..a0a7db64f7 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -525,6 +525,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+         }
+ 
+         std::scoped_lock lock{submit_mutex};
++        const Common::StallLedger::BackPhaseScope submitting{Common::StallLedger::BackPhase::Submit};
+         VideoCommon::ReadbackDiagnostics::Scope diagnostic{
+             VideoCommon::ReadbackDiagnostics::Event::Submit};
+         switch (const VkResult result = master_semaphore->SubmitQueue(
