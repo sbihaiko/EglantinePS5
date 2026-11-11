@@ -15,6 +15,7 @@
 #include <thread>
 #include <utility>
 #include <queue>
+#include <span>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
@@ -38,6 +39,7 @@ class Device;
 class Framebuffer;
 class GraphicsPipeline;
 class StateTracker;
+class UploadBatch;
 
 struct QueryCacheParams;
 
@@ -129,12 +131,21 @@ public:
         on_submit = std::move(func);
     }
 
+    /// EDEN_NX2_UPLOAD_BATCH=1 (Lichii #1245): consecutive in-order stream buffer uploads share
+    /// barriers until their destinations overlap, a source depends on a pending copy, or the batch
+    /// is full. Call outside a render pass.
+    void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
+
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        if (uploads_pending) {
+            // Pending uploads precede every other recorded command, upload-buffer work included.
+            FlushUploads();
         }
         if (chunk->Record(command)) {
             return;
@@ -356,6 +367,11 @@ private:
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
     std::unique_ptr<CommandPool> command_pool;
+
+    std::unique_ptr<UploadBatch> upload_batch; ///< EDEN_NX2_UPLOAD_BATCH=1 only
+    bool uploads_pending{};
+    /// Records pending uploads before another command, the worker handoff, or a submission.
+    void FlushUploads();
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

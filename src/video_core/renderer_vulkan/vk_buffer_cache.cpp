@@ -28,6 +28,16 @@
 
 namespace Vulkan {
 namespace {
+// EDEN_NX2_UPLOAD_BATCH=1 (Lichii #1245): stream buffer uploads in order share one command and
+// one barrier pair (Scheduler::RecordUpload), and the barrier after a copy reaches transfers.
+bool UploadBatchEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_UPLOAD_BATCH");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
     return VkBufferCopy{
         .srcOffset = copy.src_offset,
@@ -738,15 +748,29 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+    // EDEN_NX2_UPLOAD_BATCH=1 (Lichii #1245): in-order stream buffer uploads join one batch (one
+    // command, one barrier before and one after; vk_scheduler RecordUpload), and the barrier after
+    // a copy reaches transfers too: a reordered upload of the same bytes in a later submission
+    // has no barrier of its own before it. Dedicated staging buffers keep this path.
+    if (UploadBatchEnabled() && barrier && src_buffer == staging_pool.StreamBuf() &&
+        !vk_copies.empty()) {
+        scheduler.RecordUpload(src_buffer, dst_buffer,
+                               std::span<const VkBufferCopy>{vk_copies.data(), vk_copies.size()});
+        for (const auto& copy : copies)
+            readback_writers.TransferWrite(dst_buffer, copy.dst_offset, copy.size, scheduler.CurrentTick(), false);
+        return;
+    }
+    const VkPipelineStageFlags after_stages = UploadBatchEnabled()
+                                                  ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                                                  : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier, after_stages](vk::CommandBuffer cmdbuf) {
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
         }
         cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         if (barrier) {
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, WRITE_BARRIER);
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, after_stages, 0, WRITE_BARRIER);
         }
     });
     for (const auto& copy : copies)
@@ -776,9 +800,12 @@ void BufferCacheRuntime::PostCopyBarrier() {
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                               0, WRITE_BARRIER);
+    // EDEN_NX2_UPLOAD_BATCH=1: copies bracketed explicitly get CopyBuffer's ordering, transfers too.
+    const VkPipelineStageFlags after_stages = UploadBatchEnabled()
+                                                  ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                                                  : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+    scheduler.Record([after_stages](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, after_stages, 0, WRITE_BARRIER);
     });
 }
 
