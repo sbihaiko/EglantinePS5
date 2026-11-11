@@ -69,13 +69,13 @@ is the agent's way to see the console and its safe way back from a freeze.
 
 ## Status against the goal
 
-As of 2026-11-11, build `0f537b0`, sessions b2-B to b2-D3. Build 3 (`30d1655`) is installed and untested. FPS is in 5 s windows, frame generation off.
+As of 2026-11-11, build `0f537b0` for the sessions below, and build 3 (`30d1655`) played once as b3-A. Build 4 (`9e519f5`) is installed and untested. FPS is in 5 s windows, frame generation off.
 
 | criterion | target | status |
 |---|---|---|
 | Bloom | normal, as the player judges it | **met** (b2-A and b2-B) |
 | Flashes | none, as the player judges it | not met: still present, much weaker |
-| Stability | no crash in 2 sessions of 20+ min | not met: GPU page fault at about 10 min (b2-B) and 9 min (b2-D); a freeze with the GPU stuck at about 10 min (b2-D2); stalls of 7.5 s and 17.6 s with the memory pool exhausted (b2-D3); without `skip` the GPU hangs (b2-C) |
+| Stability | no crash in 2 sessions of 20+ min | not met: GPU page fault at about 10 min (b2-B) and 9 min (b2-D); a freeze with the GPU stuck at about 10 min (b2-D2); stalls of 7.5 s and 17.6 s with the memory pool exhausted (b2-D3); without `skip` the GPU hangs (b2-C). b3-A had no page fault at all, but only reached about 17 min before the memory pressure made it unplayable |
 | FPS in Link's house | 30 or more | **met**: 30-34 |
 | FPS after the house | 30 or more | not met: 22-31 |
 | FPS in Kokiri Forest | 38 or more | not met: 13-37 |
@@ -371,6 +371,7 @@ house.
 | b2-D | `0f537b0` | b2-B plus quarantine 10000 ms | 31-34 | 25-31 | 15-37 | GPU page fault at about 9 min |
 | b2-D2 | `0f537b0` | same (the app restarted itself) | n/a | 29-33 | n/a | freeze with the GPU stuck at about 10 min |
 | b2-D3 | `0f537b0` | same | 31-34 | n/a | 16-36 | stalls of 7.5 s and 17.6 s, pool exhausted; closed by hand |
+| b3-A | `30d1655` | b2-D without the quarantine; plus `RADV_PS5_RETIRE=1`, `EDEN_PS5_HEAP_NO_GIVEBACK=1`, `EDEN_NX2_STALL_REPORT=400`, `RADV_PS5_FREE_LOG=1` | 26-34 | 21-32 | 15-38 | no page fault in 17 min; six `EDEN_HANG` of 10.4-20.6 s; after about 10 min mostly 0-2 FPS; pool at 2 MiB; closed by hand |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
@@ -378,7 +379,9 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
 
 1. Does the bloom fix come from the PR #99 base or from the mesh skip?
 2. What causes the remaining one-frame flashes?
-3. What causes the async GPU page fault, now that it happens with the submit thread off?
+3. What causes the async GPU page fault, now that it happens with the submit thread off? b3-A, with
+   retire on and no page fault in 17 min, points at a free while a submission still reads it, but
+   retire was not isolated from no-giveback.
 4. Why do the mesh-only draws hang the GPU here, when the parent's bisect found they draw the leaves
    correctly?
 5. Is the door a mesh-only draw, or a task draw that waits on pointer binding for graphics stages?
@@ -387,10 +390,32 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
    `docs/OOT-SIBLING-PORTS.md`: Lichii #1329 and #1056, viejunerd's texture switches, and Lichii
    #1334.
 
-**Build 3 session**, next: the b2-B lines plus `EDEN_NX2_STALL_REPORT=400`, `RADV_PS5_RETIRE=1`,
-`EDEN_PS5_HEAP_NO_GIVEBACK=1`, and `RADV_PS5_FREE_LOG=1`, played past 10 min. It tests whether
-holding freed memory stops the page fault and the freeze, and the stall report says where each long
-frame and audio cut goes.
+**What b3-A settled.** Guest memory compression is not a cause of the stalls: `cram_unpack_ms` was
+0.0 in all 51 `EDEN_STALL` lines. The stalls are the front GPU thread waiting for the back
+(`split_wait_ms` 283 s of the 286 s of frame time summed over those lines); the measured back-side
+costs are `tc_upload` 29 s, `staging_create` 21 s, `pipe` 20 s and `fence_wait` 7 s. Several late
+stalls are pure `split_wait` with no back-side category to explain them, so the back is blocked
+somewhere the report does not see, most likely in memory allocation.
+
+What the pool did, from `EDEN_MEMORY` and the free log:
+
+| | largest free block | guest memory |
+|---|---|---|
+| start | 10028 MiB | 3744 MiB |
+| house | 4852 MiB | |
+| Kokiri | 1600 → 1190 MiB | |
+| about 9 min | 526 → 255 MiB, `short=1` starts | |
+| after 10 min | 1-32 MiB, mostly 2 MiB | 4769 MiB |
+
+The driver made 1213 allocations from 2 MiB pieces, and the RADV trim gave back 3008 MiB while
+2446 MiB of it was taken again. Retire and no-giveback both hold memory longer, so together they may
+bring the pressure sooner; b2-D3 reached the same 2 MiB state without them, so the pressure is not
+new.
+
+**Build 4 session**, next: b3-A without `EDEN_PS5_HEAP_NO_GIVEBACK`, plus `EDEN_NX2_FLASH_FIXES=1`,
+`EDEN_NX2_PENDING_POLL_US=50`, `EDEN_NX2_SKIP_LOOP_WRITES=1`, `EDEN_NX2_DMA_READ_REPORTED=1`,
+`EDEN_NX2_UPLOAD_BATCH=1` and `EDEN_NX2_DISPATCH_BARRIER_INLINE=1`. Six switches at once, so a gain
+is theirs and not one switch's; the next session splits them.
 
 ## Links
 
