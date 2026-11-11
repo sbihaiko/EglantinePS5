@@ -146,6 +146,12 @@ struct ImageBase {
     ImageId feedback_source{};
     u64 feedback_barrier_epoch = ~u64{0};
     u64 feedback_rt_serial = ~u64{0};
+    /// modification_tick of the latest GPU write that covered the whole image (a clear).
+    /// Kept only with EDEN_NX2_TC_SUPERSEDED (TextureCache::NoteWholeClears).
+    u64 full_write_tick = 0;
+    /// Last frame the image was prepared for use in (TextureCache::PrepareImage), 0 before.
+    /// Kept only with EDEN_NX2_TC_SUPERSEDED.
+    u64 last_use_frame = 0;
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

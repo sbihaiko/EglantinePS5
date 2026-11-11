@@ -44,6 +44,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
+#include "video_core/texture_cache/superseded_images.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
@@ -427,6 +428,16 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector();
 
+    /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
+    void DeleteSupersededImages();
+
+    /// Whether the clear being made writes all of an image, bound at gpu_addr as a render target.
+    /// Only meaningful while a clear binds its render targets (UpdateRenderTargets(true)).
+    [[nodiscard]] bool ClearOverwritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
+
+    /// Records the render targets the current clear writes whole (ImageBase::full_write_tick).
+    void NoteWholeClears();
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -564,6 +575,9 @@ private:
 
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
+
+    /// Returns true if the current clear's render area and scissor cover a width x height image
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
 
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
@@ -704,6 +718,13 @@ private:
 
     std::deque<PendingUnswizzle> unswizzle_queue;
     u8 current_unswizzle_frame;
+
+    // Superseded images (DeleteSupersededImages)
+    std::vector<ImageId> superseded_ids;
+    u64 superseded_activity_frame{}; ///< Last frame a bad overlap appeared or a clear wrote whole
+    u64 superseded_clean_deletes{};
+    u64 superseded_rewritten_deletes{};
+    u64 superseded_unproven{}; ///< Candidates kept for lack of proof, per scan
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

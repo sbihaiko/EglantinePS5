@@ -154,7 +154,63 @@ namespace {
     }();
     return enabled;
 }
+
+// EDEN_NX2_TC_SUPERSEDED=1: delete images whose memory went entirely to newer images
+// (DeleteSupersededImages; Lichii #1314).
+[[nodiscard]] inline bool SupersededImagesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
 } // namespace
+
+template <class P>
+void TextureCache<P>::DeleteSupersededImages() {
+    // EDEN_NX2_TC_SUPERSEDED=1 (Lichii #1314): Ocarina of Time moves its render targets within a
+    // memory pool every frame while the camera moves (about 45 images a frame in the Castle Town
+    // guard house). The old images stayed registered until the age-based collector reached them,
+    // far slower than they arrived, and VRAM spilled. Once the memory of an image belongs
+    // entirely to newer images (see ClassifySuperseded for what that has to prove) nothing can
+    // read it any more. Switch 2 titles only.
+    static constexpr u64 MinFramesUnused = 2;
+    if (!SupersededImagesEnabled() || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        frame_tick <= MinFramesUnused ||
+        frame_tick - superseded_activity_frame > MinFramesUnused + 1) {
+        return;
+    }
+    superseded_ids.clear();
+    lru_cache.ForEachItemBelow(frame_tick - MinFramesUnused, [this](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (image.overlapping_images.empty()) {
+            return false;
+        }
+        switch (ClassifySuperseded(slot_images, image)) {
+        case Supersession::Clean:
+        case Supersession::Rewritten:
+            superseded_ids.push_back(image_id);
+            break;
+        case Supersession::Unproven:
+            ++superseded_unproven;
+            break;
+        case Supersession::None:
+            break;
+        }
+        return false;
+    });
+    for (const ImageId image_id : superseded_ids) {
+        Image& image = slot_images[image_id];
+        ++(image.IsSafeGpuCopy() ? superseded_rewritten_deletes : superseded_clean_deletes);
+        // Not marked stale (MarkStale): the covering images hold the bytes, and marking their
+        // pages would let an image made over them skip its upload without being filled.
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    }
+}
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector() {
@@ -540,6 +596,15 @@ void TextureCache<P>::TickFrame() {
                  "for buffer-written pages; {} MiB of pages marked stale",
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
+        if (SupersededImagesEnabled()) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: superseded images deleted {} ({} held GPU "
+                     "data rewritten by newer images); GPU-written candidates without that proof, "
+                     "summed over frames: {}",
+                     superseded_clean_deletes + superseded_rewritten_deletes,
+                     superseded_rewritten_deletes, superseded_unproven);
+            superseded_clean_deletes = superseded_rewritten_deletes = superseded_unproven = 0;
+        }
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
@@ -557,6 +622,7 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
+    DeleteSupersededImages();
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
@@ -1022,6 +1088,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        if (is_clear && SupersededImagesEnabled()) {
+            NoteWholeClears();
+        }
         return;
     }
 
@@ -1040,6 +1109,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
     PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+    if (is_clear && SupersededImagesEnabled()) {
+        NoteWholeClears();
+    }
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -3117,6 +3189,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    if (!join_bad_overlap_ids.empty() && SupersededImagesEnabled()) {
+        superseded_activity_frame = frame_tick;
+    }
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
@@ -4400,6 +4475,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    if (SupersededImagesEnabled()) {
+        image.last_use_frame = frame_tick;
+    }
 }
 
 template <class P>
@@ -4584,6 +4662,102 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     // Make sure the clear covers all texels in the subresource
     return scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_x >= size.width &&
            scissor.max_y >= size.height;
+}
+
+template <class P>
+bool TextureCache<P>::ClearCovers(u32 width, u32 height) const {
+    // From Lichii (#817, used by #1314). Stricter than IsFullClear, which is left unchanged: it
+    // also checks the render area and the lower-left window origin.
+    const auto& regs = maxwell3d->regs;
+    // The render area is the surface clip's size.
+    if (regs.surface_clip.width < width || regs.surface_clip.height < height) {
+        return false;
+    }
+    if (regs.clear_control.use_scissor == 0) {
+        return true;
+    }
+    // With a lower-left window origin, the clear's scissor is flipped around the surface clip's
+    // height (GetScissorState).
+    const auto& scissor = regs.scissor_test[0];
+    const bool lower_left =
+        regs.window_origin.mode != Tegra::Engines::Maxwell3D::Regs::WindowOrigin::Mode::UpperLeft;
+    const s32 clip_height = static_cast<s32>(regs.surface_clip.height.Value());
+    const s32 min_y = static_cast<s32>(scissor.min_y.Value());
+    const s32 max_y = static_cast<s32>(scissor.max_y.Value());
+    const s32 top = lower_left ? clip_height - max_y : min_y;
+    const s32 bottom = lower_left ? clip_height - min_y : max_y;
+    return scissor.min_x == 0 && top <= 0 && scissor.max_x >= width &&
+           bottom >= static_cast<s32>(height);
+}
+
+template <class P>
+bool TextureCache<P>::ClearOverwritesWhole(const ImageInfo& new_info, GPUVAddr gpu_addr) const {
+    // Lichii's check for a new target a clear overwrites whole (#817), which this core does not
+    // have; here only NoteWholeClears calls it, during a clear.
+    if (new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
+        new_info.resources.layers != 1 || new_info.num_samples != 1) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& surface = regs.clear_surface;
+    if (surface.layer != 0) {
+        return false;
+    }
+    const u32 width = new_info.size.width;
+    const u32 height = new_info.size.height;
+    if (!ClearCovers(width, height)) {
+        return false;
+    }
+    // The clear covers the framebuffer's render area, the smallest bound target.
+    for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+        const auto& rt = regs.rt[index];
+        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+            (rt.width < width || rt.height < height)) {
+            return false;
+        }
+    }
+    if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+        (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
+        return false;
+    }
+    const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+    const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
+    switch (VideoCore::Surface::GetFormatType(new_info.format)) {
+    case VideoCore::Surface::SurfaceType::ColorTexture: {
+        // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
+        const u32 index = surface.RT;
+        return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
+               index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+               regs.rt[index].Address() == gpu_addr;
+    }
+    case VideoCore::Surface::SurfaceType::Depth:
+        return is_depth_target && surface.Z;
+    case VideoCore::Surface::SurfaceType::Stencil:
+        return is_depth_target && full_stencil;
+    case VideoCore::Surface::SurfaceType::DepthStencil:
+        return is_depth_target && surface.Z && full_stencil;
+    default:
+        return false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteWholeClears() {
+    const auto note = [this](ImageViewId view_id) {
+        if (!PreparesImage(slot_image_views, view_id)) {
+            return;
+        }
+        Image& image = slot_images[slot_image_views[view_id].image_id];
+        if (ClearOverwritesWhole(image.info, image.gpu_addr) &&
+            slot_image_views[view_id].size == image.info.size) {
+            image.full_write_tick = image.modification_tick;
+            superseded_activity_frame = frame_tick;
+        }
+    };
+    for (const ImageViewId view_id : render_targets.color_buffer_ids) {
+        note(view_id);
+    }
+    note(render_targets.depth_buffer_id);
 }
 
 template <class P>
