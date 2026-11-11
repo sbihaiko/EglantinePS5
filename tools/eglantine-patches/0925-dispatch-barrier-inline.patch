@@ -1,0 +1,59 @@
+From f1462f628a83a850313cdf55b386dae1049f36eb Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 11:12:34 -0300
+Subject: [PATCH] vulkan: record a dispatch's barrier in the dispatch's own
+ command, with EDEN_NX2_DISPATCH_BARRIER_INLINE=1
+
+RasterizerVulkan::DispatchCompute records two commands per direct dispatch:
+the barrier that makes earlier writes visible to it, then the dispatch. Each
+recorded command costs the recording thread and the worker; Ocarina of Time
+makes 147 dispatches a frame. With the switch the barrier is recorded at the
+start of the dispatch's command: the same barrier and stages, the same
+Vulkan command order, and it still runs when the pipeline is not bound.
+
+This tree records nothing between the two (no upscaler replacement or
+effects marking here, which Lichii keeps on the two-command path), and its
+indirect dispatch records no such barrier at all, so only the direct path
+changes. FPS unmeasured upstream.
+
+Off by default; with the switch unset the recorded commands are unchanged.
+Port of Lichii #1246.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_rasterizer.cpp          | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 151bfea..a6c3b56 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1490,9 +1490,23 @@ void RasterizerVulkan::DispatchCompute() {
+         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+     };
+-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                               0, READ_BARRIER); });
++    // EDEN_NX2_DISPATCH_BARRIER_INLINE=1 (Lichii #1246): the barrier is recorded at the start of
++    // the dispatch's own command, one recorded command a dispatch instead of two (Ocarina of
++    // Time: 147 a frame). Same barrier, same order, and it still runs when the pipeline is not
++    // bound.
++    static const bool barrier_inline = [] {
++        const char* const value = std::getenv("EDEN_NX2_DISPATCH_BARRIER_INLINE");
++        return value != nullptr && value[0] != '0';
++    }();
++    if (!barrier_inline) {
++        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   0, READ_BARRIER); });
++    }
+     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
++        if (barrier_inline) {
++            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, READ_BARRIER);
++        }
+         if (!pipeline->IsBound()) {
+             return;
+         }
+-- 
+2.53.0
+
