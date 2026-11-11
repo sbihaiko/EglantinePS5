@@ -21,6 +21,12 @@
 
 namespace Shader::Backend::SPIRV {
 
+/// EDEN_NX2_AMD_SHADER_FIXES=1: the shader fixes of mja00/Lichii for AMD (c418e4f477, 5e8d409f81,
+/// 913ba475da): 8 and 16-byte storage accesses go word by word where the binding alignment (4 on
+/// RADV) makes the vector view inexact, and min, max and clamp take the NaN-defined forms. Read
+/// once; shaders are translated at every boot, so env.txt is enough.
+[[nodiscard]] bool AmdShaderFixes();
+
 static std::bitset<8> clip_distance_written;
 
 using Sirit::Id;

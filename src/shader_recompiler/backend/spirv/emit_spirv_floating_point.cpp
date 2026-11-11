@@ -17,7 +17,13 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
+// EDEN_NX2_AMD_SHADER_FIXES=1 (mja00/Lichii 913ba475da): Maxwell's FMNMX and .SAT return the
+// non-NaN operand (NaN saturates to 0). FMin, FMax and FClamp leave NaN undefined and AMD's
+// compiler passes it through, so the NaN-defined N forms are used instead.
 Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
+    if (AmdShaderFixes()) {
+        return ctx.OpNMin(type, ctx.OpNMax(type, value, zero), one);
+    }
     if (ctx.profile.has_broken_spirv_clamp) {
         return ctx.OpFMin(type, ctx.OpFMax(type, value, zero), one);
     } else {
@@ -85,19 +91,19 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 }
 
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F32[1], a, b);
+    return AmdShaderFixes() ? ctx.OpNMax(ctx.F32[1], a, b) : ctx.OpFMax(ctx.F32[1], a, b);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F64[1], a, b);
+    return AmdShaderFixes() ? ctx.OpNMax(ctx.F64[1], a, b) : ctx.OpFMax(ctx.F64[1], a, b);
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F32[1], a, b);
+    return AmdShaderFixes() ? ctx.OpNMin(ctx.F32[1], a, b) : ctx.OpFMin(ctx.F32[1], a, b);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F64[1], a, b);
+    return AmdShaderFixes() ? ctx.OpNMin(ctx.F64[1], a, b) : ctx.OpFMin(ctx.F64[1], a, b);
 }
 
 Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {

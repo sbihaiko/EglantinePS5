@@ -10,6 +10,8 @@
 #include <climits>
 #include <optional>
 #include <vector>
+#include <cstdlib>
+#include <span>
 
 #include <boost/container/static_vector.hpp>
 
@@ -23,6 +25,15 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
+
+bool AmdShaderFixes() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_AMD_SHADER_FIXES");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 namespace {
 enum class Operation {
     Increment,
