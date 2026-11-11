@@ -62,6 +62,12 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   Vampinity's base (viejunerd/Eglantine-PS5- #21, run H1, firmware 13.60, Handheld): walking 23.9
   to 25.2 FPS, walking 1% low 94 to 82 ms, present fence wait 13.9 to 6.5 ms. A host stress test
   (four submitters, 200,000 jobs, ThreadSanitizer) kept the order and found no race.
+  Here (8cc7018, base PS5, firmware 11.20, Docked, 2026-11-11; one session off, two on, same
+  route): 1-3 FPS more in most 5 s windows (house 19-20 against 17-19, after it 26 against 23-24,
+  Kokiri 34-38 against 36-37), but longer stalls (10 s and 6 s, then 4 s and 2 s, against two of
+  1.4 s off), each at a driver request for 512 MiB that came back nearly empty while the app packed
+  guest memory. The second session ended at 240 s with the system's crash screen and no crash
+  file of the app. Left off until the memory pressure is understood.
 
 - **Batched submissions.** In run11 the back GPU thread made 850-1,540 queue submissions a
   second, one per fence and per command list end, and the driver spent 135-220 ms a second in
