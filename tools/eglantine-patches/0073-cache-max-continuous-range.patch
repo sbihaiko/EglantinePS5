@@ -1,0 +1,110 @@
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 2867d3f143..1937c7334a 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -6,6 +6,10 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <cstdio>
++#include <chrono>
++#include <array>
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
+@@ -615,6 +619,49 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
+ }
+ 
+ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
++    // Native storage buffers ask this on every bind, for up to 8 MiB and for pointer-table pools
++    // up to the end of their mapping (Ocarina's light probe pools, ~150 MiB, read at a different
++    // entry by each draw): walking the pages took ~40 us a time. Keep, per thread and until the
++    // page table changes, the intervals walks found to be one device range; a query inside one
++    // is answered from it. An interval is closed when its walk stopped at a discontinuity.
++    struct Interval {
++        GPUVAddr begin;
++        GPUVAddr end;
++        bool closed;
++    };
++    struct Cache {
++        size_t owner;
++        u64 serial;
++        std::array<Interval, 128> intervals;
++        size_t count;
++        size_t next;
++    };
++    thread_local Cache cache{};
++    const u64 serial = map_serial.load(std::memory_order_acquire);
++    if (cache.owner != unique_identifier + 1 || cache.serial != serial) {
++        cache.owner = unique_identifier + 1;
++        cache.serial = serial;
++        cache.count = 0;
++        cache.next = 0;
++    }
++    for (size_t i = 0; i < cache.count; ++i) {
++        const Interval& interval = cache.intervals[i];
++        if (gpu_addr >= interval.begin && gpu_addr < interval.end &&
++            (interval.closed || size <= interval.end - gpu_addr)) {
++            return (std::min<size_t>)(size, interval.end - gpu_addr);
++        }
++    }
++    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
++    if (result != 0) {
++        Interval& slot = cache.intervals[cache.next];
++        slot = {gpu_addr, gpu_addr + result, result < size};
++        cache.next = (cache.next + 1) % cache.intervals.size();
++        cache.count = (std::min)(cache.count + 1, cache.intervals.size());
++    }
++    return result;
++}
++
++size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
+     std::optional<DAddr> old_page_addr{};
+     size_t range_so_far = 0;
+     bool result{false};
+@@ -655,8 +702,29 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+ }
+ 
+ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr, size_t max_size) const {
+-    std::unique_lock<std::mutex> lock(guard);
+-    return kind_map.GetContinuousSizeFrom(gpu_addr);
++    // Native storage buffers ask this on every bind (Ocarina's light probe pools, ~150 MiB, about
++    // 900 times a second at 40 us each): keep answers per thread until the page table changes, as
++    // MaxContinuousRange does. The kind map only changes in Map, MapSparse and Unmap.
++    struct Entry {
++        size_t owner;
++        GPUVAddr gpu_addr;
++        u64 serial;
++        size_t result;
++    };
++    thread_local std::array<Entry, 4096> cache{};
++    const u64 serial = map_serial.load(std::memory_order_acquire);
++    Entry& entry = cache[(gpu_addr * 0x9E3779B97F4A7C15ULL) >> 52];
++    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr &&
++        entry.serial == serial) {
++        return entry.result;
++    }
++    size_t result;
++    {
++        std::unique_lock<std::mutex> lock(guard);
++        result = kind_map.GetContinuousSizeFrom(gpu_addr);
++    }
++    entry = {unique_identifier + 1, gpu_addr, serial, result};
++    return result;
+ }
+ 
+ void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index a41a3f5eec..0fc6581493 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -195,6 +195,8 @@ private:
+     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
+     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
+ 
++    size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
++
+     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
+     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
+ 

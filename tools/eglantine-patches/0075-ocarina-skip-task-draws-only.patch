@@ -1,0 +1,77 @@
+diff --git a/src/video_core/oot_network.h b/src/video_core/oot_network.h
+index 290d9ad596..8506ab7d69 100644
+--- a/src/video_core/oot_network.h
++++ b/src/video_core/oot_network.h
+@@ -70,21 +70,25 @@ inline bool BypassEnabled(u64 program_id) {
+ }
+ 
+ /// Task/mesh draws. The game culls its vegetation on the GPU: compute programs write per-type task
+-/// counts and instance records that its task and mesh programs read. Those compute programs do not
+-/// build on this core yet (their global atomics and bare storage pointers need upstream's native
+-/// storage buffer tracking), so the task program (1a55fa57a335b963) reads records nobody wrote and
+-/// the mesh draws come out as bright stretched triangles flickering across the scene. Until the
+-/// culling runs the draws are skipped, which is what happened while the task program was still
+-/// rejected by the lowering. EDEN_OOT_MESH_DRAWS=draw issues them (for work on the culling).
+-inline bool SkipMeshDraws(u64 program_id) {
++/// counts and instance records that its task and mesh programs read. With native storage buffer
++/// tracking the culling runs and the mesh-only pipelines draw the trees' leaves correctly, but the
++/// task program (1a55fa57a335b963, every task pipeline) still reads its instance records through
++/// pointers it loads from memory that the tracking does not bind for graphics stages yet, and its
++/// draws come out as bright stretched triangles flickering across the scene (a console bisect of
++/// the 37 task/mesh programs, rejecting halves, found only this one). Draws of pipelines with a
++/// task stage are skipped; mesh-only draws are issued. EDEN_OOT_MESH_DRAWS=draw issues every
++/// task/mesh draw (for work on the task program), =skip skips them all as before.
++inline bool SkipMeshDraw(u64 program_id, bool has_task_stage) {
+     if (program_id != ProgramId) {
+         return false;
+     }
+-    static const bool draw = [] {
++    static const int mode = [] {
+         const char* value = std::getenv("EDEN_OOT_MESH_DRAWS");
+-        return value != nullptr && std::strcmp(value, "draw") == 0;
++        if (value != nullptr && std::strcmp(value, "draw") == 0) return 1;
++        if (value != nullptr && std::strcmp(value, "skip") == 0) return 2;
++        return 0;
+     }();
+-    return !draw;
++    return mode == 2 || (mode == 0 && has_task_stage);
+ }
+ 
+ } // namespace VideoCommon::OotNetwork
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 6556edeb0c..80a2e3b731 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -108,6 +108,10 @@ public:
+     }
+ 
+     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
++    [[nodiscard]] bool HasTaskStage() const noexcept {
++        return stage_infos[0].is_task;
++    }
++
+     [[nodiscard]] bool IsMeshPipeline() const noexcept {
+         return stage_infos[0].is_task || stage_infos[0].is_mesh;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b2f5a4b911..7b43b2783c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -564,12 +564,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         report_failure("no VK_EXT_mesh_shader");
+         return;
+     }
+-    if (mesh_draw && VideoCommon::OotNetwork::SkipMeshDraws(Settings::GetCurrentProgramID())) {
+-        // Ocarina of Time's vegetation: its task programs read what compute programs that do not
+-        // build yet would have written (oot_network.h).
++    if (mesh_draw && VideoCommon::OotNetwork::SkipMeshDraw(Settings::GetCurrentProgramID(),
++                                                            pipeline->HasTaskStage())) {
++        // Ocarina of Time's vegetation: its task program reads instance records through pointers
++        // the storage buffer tracking does not bind for graphics stages yet (oot_network.h).
+         static bool logged = false;
+         if (!std::exchange(logged, true)) {
+-            LOG_INFO(Render_Vulkan, "Ocarina of Time: task/mesh draws are skipped (EDEN_OOT_MESH_DRAWS=draw issues them)");
++            LOG_INFO(Render_Vulkan, "Ocarina of Time: task draws are skipped (EDEN_OOT_MESH_DRAWS=draw issues them)");
+         }
+         return;
+     }
