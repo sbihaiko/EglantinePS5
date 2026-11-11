@@ -1,0 +1,34 @@
+From ec2066e45934eeb4838a3b3f277a94af0165a8c8 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Tue, 10 Nov 2026 21:57:26 -0300
+Subject: [PATCH] vk_scheduler: fence batching is off unless asked for
+
+On the PS5 it gave Ocarina of Time no frames and the run crashed on the front GPU
+thread after 158 s. EDEN_NX2_FENCE_FLUSH_US=500 turns it back on.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ src/video_core/renderer_vulkan/vk_scheduler.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index d806ea0082..b28b1d662a 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -88,9 +88,12 @@ bool Scheduler::DeferFlush() {
+     // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
+     // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
+     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
++    // Off unless EDEN_NX2_FENCE_FLUSH_US is set: on the PS5, Ocarina of Time gained nothing
++    // (submit costs ~2 ms a second here) and crashed in BufferCacheRuntime::CopyBuffer on the
++    // front thread after 158 s with it on.
+     static const s64 interval_us = [] {
+         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
+-        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
++        return value == nullptr ? s64{0} : static_cast<s64>(std::atoll(value));
+     }();
+     if (interval_us <= 0 || !VideoCommon::GpuSplit::IsBackThread() ||
+         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
+-- 
+2.53.0
+

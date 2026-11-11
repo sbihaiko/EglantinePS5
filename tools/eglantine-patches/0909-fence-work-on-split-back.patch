@@ -1,0 +1,181 @@
+From 367eb3917ef59aa810dfea5c8fc71385f6bdccfe Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Tue, 10 Nov 2026 22:09:12 -0300
+Subject: [PATCH] video_core: run the front's fence releases and macro DMA
+ flushes on the split's back
+
+Port of the fence part of Lichii e3d8e9c605 (#70). A front that drained the back and then
+called ReleaseFences, SignalFence or a macro DMA read flush recorded into the scheduler while
+the back's idle hook (Scheduler::FlushDeferred) could swap the chunk: run12 crashed in
+BufferCacheRuntime::CopyBuffer under ReleaseFences on the front. GpuSplit::Run defers the call
+to the back and drains; waits count as 'drain: fence release' and 'drain: macro flush'.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/dma_pusher.cpp         | 15 +++++++++------
+ src/video_core/engines/maxwell_3d.cpp |  6 +++++-
+ src/video_core/engines/puller.cpp     | 20 ++++++++++++++------
+ src/video_core/gpu_split.h            | 13 +++++++++++++
+ src/video_core/nx2_profile.h          |  3 +++
+ 5 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index d51ccb449d..4b6c9cf5b0 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -546,12 +546,15 @@ bool DmaPusher::Step() {
+     }
+ 
+     if (signal_sync) {
+-        VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainSync);
+-        rasterizer->SignalFence([this]() {
+-            std::scoped_lock lk(sync_mutex);
+-            synced = true;
+-            sync_cv.notify_all();
+-        });
++        VideoCommon::GpuSplit::Get().Run(
++            [this] {
++                rasterizer->SignalFence([this]() {
++                    std::scoped_lock lk(sync_mutex);
++                    synced = true;
++                    sync_cv.notify_all();
++                });
++            },
++            VideoCommon::Nx2Profile::Zone::DrainSync);
+     }
+ 
+     return true;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 924cfdeb40..6ce3165e8e 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1378,7 +1378,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     constexpr auto flush_caches = VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache;
+     const bool dirty = drain && memory_manager.IsMemoryDirty(source, read_bytes, flush_caches);
+     if (dirty) {
+-        memory_manager.FlushRegion(source, read_bytes, flush_caches);
++        split.Run(
++            [memory = &memory_manager, source, read_bytes, flush_caches] {
++                memory->FlushRegion(source, read_bytes, flush_caches);
++            },
++            VideoCommon::Nx2Profile::Zone::DrainMacroFlush);
+     }
+     if (trust && *trust >= 0) {
+         bool changed = dirty;
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 0918ce96ce..c498ed0c7e 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -74,6 +74,14 @@ void DrainBack() {
+     VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainPuller);
+ }
+ 
++// The fence manager records into the scheduler and downloads GPU data over the CPU's writes:
++// the back's state, which a drained back still uses from its idle hook (it submits).
++void ReleaseFencesOnBack(DmaPusher& dma_pusher) {
++    VideoCommon::GpuSplit::Get().Run(
++        [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
++        VideoCommon::Nx2Profile::Zone::DrainFenceRelease);
++}
++
+ // A semaphore acquire: what the CPU (or another channel) wrote before the release it waits for
+ // can change what the next draws resolve to (texture handles, headers), so they don't take the
+ // fast draw delta path. With the split the break runs on the back in order (an empty deferred
+@@ -439,7 +447,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+             waiters.Add(this, *device, acquire.value, acquire.operation);
+         }
+-        dma_pusher.rasterizer->ReleaseFences();
++        ReleaseFencesOnBack(dma_pusher);
+         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+             pending_acquire = acquire;
+             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+@@ -473,19 +481,19 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+                 regs.acquire_active = true;
+                 regs.acquire_mode = false;
+                 if (word != regs.acquire_value) {
+-                    dma_pusher.rasterizer->ReleaseFences();
++                    ReleaseFencesOnBack(dma_pusher);
+                     continue;
+                 }
+             } else if (op == GpuSemaphoreOperation::AcquireGequal) {
+                 regs.acquire_active = true;
+                 regs.acquire_mode = true;
+                 if (word < regs.acquire_value) {
+-                    dma_pusher.rasterizer->ReleaseFences();
++                    ReleaseFencesOnBack(dma_pusher);
+                     continue;
+                 }
+             } else if (op == GpuSemaphoreOperation::AcquireMask) {
+                 if (word && regs.semaphore_sequence == 0) {
+-                    dma_pusher.rasterizer->ReleaseFences();
++                    ReleaseFencesOnBack(dma_pusher);
+                     continue;
+                 }
+             } else {
+@@ -513,7 +521,7 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+     while (word != value) {
+         regs.acquire_active = true;
+         regs.acquire_value = value;
+-        dma_pusher.rasterizer->ReleaseFences();
++        ReleaseFencesOnBack(dma_pusher);
+         word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
+         // TODO(kemathe73) figure out how to do the acquire_timeout
+         regs.acquire_mode = false;
+@@ -551,7 +559,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+     }
+     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+     DrainBack();
+-    dma_pusher.rasterizer->ReleaseFences();
++    ReleaseFencesOnBack(dma_pusher);
+     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+     const bool ready = met(word);
+     if (!ready) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index e4ef40903b..b4e7d434ad 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -132,6 +132,19 @@ public:
+     }
+     void DeferFunction(std::function<void()>&& func, u64 flags = 0);
+ 
++    /// Front: runs `func` on the back and waits for it. For work on back-owned state (the
++    /// scheduler, the caches) that the front needs done before it goes on: a drained back still
++    /// submits from its idle hook (Scheduler::FlushDeferred), so the front must not record itself.
++    template <typename Func>
++    void Run(const Func& func, Nx2Profile::Zone zone = Nx2Profile::Zone::SplitDrain) {
++        if (IsBackThread() || !Active()) {
++            func();
++            return;
++        }
++        Defer(func);
++        Drain(zone);
++    }
++
+     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
+     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
+     static inline bool check_owner{};
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index 3fc9ad490c..56adc5e804 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -61,6 +61,8 @@ enum class Zone : u32 {
+     DrainPuller,  ///< Front waits for the back: a puller method that needs its result
+     DrainCpuRead, ///< Front waits for the back: a CPU read of GPU-written memory
+     DrainList,    ///< Front waits for the back: a command list on a GPU-written page
++    DrainFenceRelease, ///< Front waits for the back to release fences (GpuSplit::Run)
++    DrainMacroFlush,   ///< Front waits for the back to flush a macro DMA read (GpuSplit::Run)
+     Count,
+ };
+ 
+@@ -74,6 +76,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
+     "fence skipped", "method", "split drain", "split wait", "submit", "GPU wait",
+     "split full", "drain: macro parameters", "drain: sync fence", "drain: DMA read",
+     "drain: command end", "drain: puller", "drain: CPU read", "drain: list",
++    "drain: fence release", "drain: macro flush",
+ };
+ 
+ inline bool Enabled() {
+-- 
+2.53.0
+

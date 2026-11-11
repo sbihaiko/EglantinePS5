@@ -1,0 +1,196 @@
+From 9eda8a6538b3f23dbfbbc519189e2f488a4efac8 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Tue, 10 Nov 2026 21:56:55 -0300
+Subject: [PATCH] profile: name what the split front waits for
+
+The split drain zone lumped every wait of the front GPU thread together. It now
+separates a full ring from each reason the front drains the back, so the profile
+shows which one forces thousands of waits a second.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ src/video_core/dma_pusher.cpp         |  6 +++---
+ src/video_core/engines/maxwell_3d.cpp |  2 +-
+ src/video_core/engines/puller.cpp     |  2 +-
+ src/video_core/gpu.cpp                |  2 +-
+ src/video_core/gpu_split.cpp          |  8 ++++----
+ src/video_core/gpu_split.h            |  3 ++-
+ src/video_core/gpu_thread.cpp         |  2 +-
+ src/video_core/nx2_profile.h          | 10 ++++++++++
+ 8 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 4c253dbf05..d51ccb449d 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -434,7 +434,7 @@ bool DmaPusher::Step() {
+                                              return memory_manager.GpuToCpuAddress(page);
+                                          }))) {
+                     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+-                        split.Drain();
++                        split.Drain(VideoCommon::Nx2Profile::Zone::DrainMacroParameters);
+                     }
+                     const GPUVAddr address = dma_state.dma_get;
+                     const size_t bytes = words * sizeof(u32);
+@@ -453,7 +453,7 @@ bool DmaPusher::Step() {
+                 } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                     // The caches behind IsMemoryDirty belong to the split's back thread.
+                     if (g_nx2_ampere.load(std::memory_order_relaxed)) {
+-                        split.Drain();
++                        split.Drain(VideoCommon::Nx2Profile::Zone::DrainMacroParameters);
+                         engine_state->current_dirty = memory_manager.IsMemoryDirty(
+                             dma_state.dma_get, words * sizeof(u32));
+                     } else {
+@@ -546,7 +546,7 @@ bool DmaPusher::Step() {
+     }
+ 
+     if (signal_sync) {
+-        VideoCommon::GpuSplit::Get().Drain();
++        VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainSync);
+         rasterizer->SignalFence([this]() {
+             std::scoped_lock lk(sync_mutex);
+             synced = true;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 1761883a8e..924cfdeb40 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1367,7 +1367,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+         }
+     }
+     if (drain) {
+-        split.Drain();
++        split.Drain(VideoCommon::Nx2Profile::Zone::DrainDmaRead);
+     }
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 63317547c1..0918ce96ce 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -71,7 +71,7 @@ void OnBack(const Func& func) {
+ }
+ 
+ void DrainBack() {
+-    VideoCommon::GpuSplit::Get().Drain();
++    VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainPuller);
+ }
+ 
+ // A semaphore acquire: what the CPU (or another channel) wrote before the release it waits for
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 9b4945987b..362a6a9a4e 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -249,7 +249,7 @@ struct GPU::Impl {
+             if (split.Active()) {
+                 VideoCore::RasterizerDownloadArea area{};
+                 split.Defer([this, addr, size, &area] { area = OnCPURead(addr, size); });
+-                split.Drain();
++                split.Drain(VideoCommon::Nx2Profile::Zone::DrainCpuRead);
+                 return area;
+             }
+         }
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index a4cc811c26..06040779a7 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -184,7 +184,7 @@ void GpuSplit::WaitForSpace(size_t words) {
+         return;
+     }
+     Publish();
+-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitFull};
+     for (u32 spins = 0;; ++spins) {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (write_position + words - consumed_cache <= RingWords) {
+@@ -289,7 +289,7 @@ bool GpuSplit::WritePending(u64 key) {
+     return PendingRelease(key) || PendingPosition(key) || PendingLowerBound(key, 0);
+ }
+ 
+-void GpuSplit::Drain() {
++void GpuSplit::Drain(Nx2Profile::Zone zone) {
+     sync_pending = false;
+     CloseRegs();
+     consumed_cache = consumed.load(std::memory_order_acquire);
+@@ -297,7 +297,7 @@ void GpuSplit::Drain() {
+         return;
+     }
+     Publish();
+-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    Nx2Profile::Scope scope{zone};
+     for (u32 spins = 0;; ++spins) {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (consumed_cache == write_position) {
+@@ -322,7 +322,7 @@ void GpuSplit::DrainToLastWriter() {
+         return value != nullptr && value[0] == '1';
+     }();
+     if (!to_writer) {
+-        Drain();
++        Drain(Nx2Profile::Zone::DrainList);
+         return;
+     }
+     DrainTo(last_writer_position);
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 08db318e89..e4ef40903b 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -15,6 +15,7 @@
+ #include <vector>
+ 
+ #include "common/common_types.h"
++#include "video_core/nx2_profile.h"
+ 
+ namespace Core {
+ class System;
+@@ -193,7 +194,7 @@ public:
+     /// Makes what was sent visible to the back.
+     void Publish();
+     /// Waits until the back executed everything sent so far.
+-    void Drain();
++    void Drain(Nx2Profile::Zone zone = Nx2Profile::Zone::SplitDrain);
+     /// The entry just sent can write guest memory (a compute, copy or upload engine's method):
+     /// a command list on a GPU-written page waits for the back only up to here (DrainToLastWriter).
+     void NoteWriter() {
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index efa8c6b5ce..b83000c6e5 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -219,7 +219,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+             SignalCommand(state, next.fence, next.completion);
+         }
+         if (split.Active()) {
+-            split.Drain();
++            split.Drain(VideoCommon::Nx2Profile::Zone::DrainCommand);
+         }
+     });
+ }
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index da09be03c8..3fc9ad490c 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -53,6 +53,14 @@ enum class Zone : u32 {
+     SplitWait,    ///< Split GPU thread: the back waits for work
+     Submit,       ///< Scheduler::Flush: the chunk handed to the worker, a new context begun
+     GpuWait,      ///< Waiting for a GPU tick (Scheduler::Wait)
++    SplitFull,    ///< Split GPU thread: the front waits for room in the ring (the back is behind)
++    DrainMacroParameters, ///< Front waits for the back: macro parameters on a GPU-written page
++    DrainSync,    ///< Front waits for the back: a command list with a sync fence
++    DrainDmaRead, ///< Front waits for the back: a native macro reads guest memory
++    DrainCommand, ///< Front waits for the back: the end of a GPU thread command
++    DrainPuller,  ///< Front waits for the back: a puller method that needs its result
++    DrainCpuRead, ///< Front waits for the back: a CPU read of GPU-written memory
++    DrainList,    ///< Front waits for the back: a command list on a GPU-written page
+     Count,
+ };
+ 
+@@ -64,6 +72,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
+     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
+     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
+     "fence skipped", "method", "split drain", "split wait", "submit", "GPU wait",
++    "split full", "drain: macro parameters", "drain: sync fence", "drain: DMA read",
++    "drain: command end", "drain: puller", "drain: CPU read", "drain: list",
+ };
+ 
+ inline bool Enabled() {
+-- 
+2.53.0
+

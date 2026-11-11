@@ -11,8 +11,11 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0902-amd-shader-fixes` | `EDEN_NX2_AMD_SHADER_FIXES=1` | off | mja00/Lichii `c418e4f477`, `5e8d409f81`, `913ba475da`, by way of danueecitizen `0413-white-03` |
 | `0903-storage-size-word` | `EDEN_NX2_STORAGE_SIZE_WORD=0` turns it off | on | viejunerd `15cde68` (core patch 0082) |
 | `0904-texture-collector-own-bytes` | `EDEN_NX2_TC_OWN_BYTES=1` | off | ours |
-| `0905-batch-fence-submissions` | `EDEN_NX2_FENCE_FLUSH_US=0` turns it off (default 500) | on | Lichii `660e5f0039`, `313463cd27` (rdenno) |
+| `0905-batch-fence-submissions` | `EDEN_NX2_FENCE_FLUSH_US=500` turns it on (0908 made 0 the default) | off | Lichii `660e5f0039`, `313463cd27` (rdenno) |
 | `0906-profile-submit-and-gpu-wait` | `EDEN_NX2_GPU_PROFILE=1` | off | ours |
+| `0907-profile-split-drain-sites` | `EDEN_NX2_GPU_PROFILE=1` | off | ours |
+| `0908-fence-batching-off-by-default` | — | — | ours |
+| `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
   AMD writes undefined values (NaN) there, and bloom spreads them into white glow.
@@ -27,6 +30,17 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   through gameplay (up to 7,500 images created and 1,800 downloaded per 600 frames). With the
   switch the collector counts its own images; set `EDEN_NX2_TC_EXPECTED_MIB` and
   `EDEN_NX2_TC_CRITICAL_MIB` to match.
+
+- **Front waits by call site.** `split drain` used to lump every front wait together. With the
+  profile on, each wait now counts under its call site: `split full` (ring full), `drain: macro
+  parameters`, `drain: sync fence`, `drain: DMA read`, `drain: command end`, `drain: puller`,
+  `drain: CPU read`, `drain: list`, `drain: fence release` and `drain: macro flush`.
+- **Fence work on the split's back.** run12 crashed (SIGSEGV, front GPU thread, 158 s) in
+  `BufferCacheRuntime::CopyBuffer` under `ReleaseFences`: the front drained the back and then
+  recorded into the scheduler, while the back's idle hook (`Scheduler::FlushDeferred`) could swap
+  the chunk. `GpuSplit::Run` now sends the puller's fence releases, a GP entry's sync fence and
+  the macro DMA read flush to the back, and waits. Batching (0905) stays off until a run shows it
+  stable with this patch.
 
 - **Batched submissions.** In run11 the back GPU thread made 850-1,540 queue submissions a
   second, one per fence and per command list end, and the driver spent 135-220 ms a second in
