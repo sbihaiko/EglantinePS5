@@ -1490,9 +1490,23 @@ void RasterizerVulkan::DispatchCompute() {
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
     };
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               0, READ_BARRIER); });
+    // EDEN_NX2_DISPATCH_BARRIER_INLINE=1 (Lichii #1246): the barrier is recorded at the start of
+    // the dispatch's own command, one recorded command a dispatch instead of two (Ocarina of
+    // Time: 147 a frame). Same barrier, same order, and it still runs when the pipeline is not
+    // bound.
+    static const bool barrier_inline = [] {
+        const char* const value = std::getenv("EDEN_NX2_DISPATCH_BARRIER_INLINE");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (!barrier_inline) {
+        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   0, READ_BARRIER); });
+    }
     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+        if (barrier_inline) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, READ_BARRIER);
+        }
         if (!pipeline->IsBound()) {
             return;
         }
