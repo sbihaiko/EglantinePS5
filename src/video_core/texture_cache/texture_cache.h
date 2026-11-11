@@ -472,6 +472,12 @@ void TextureCache<P>::TickFrame() {
             format.first += bytes;
             ++format.second;
         }
+        // EDEN_NX2_TC_OWN_BYTES skips the device figure above. Read it here for the log: on the
+        // PS5 that query is also what makes the driver print its split (RADV_PS5_MEMORY_REPORT=1).
+        if (own_bytes && runtime.CanReportMemoryUsage()) {
+            LOG_INFO(HW_GPU, "Texture cache: device figure {} MiB (the collector counts its own images)",
+                     runtime.GetDeviceMemoryUsage() >> 20);
+        }
         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
                  image_bytes >> 20);

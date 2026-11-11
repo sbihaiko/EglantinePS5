@@ -21,6 +21,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/readback_dependency_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -186,6 +187,7 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
+            VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::GpuWait};
             master_semaphore->Wait(tick);
         }
         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {

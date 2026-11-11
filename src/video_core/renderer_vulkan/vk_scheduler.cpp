@@ -74,6 +74,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Submit};
     // Deferred work goes with this submission (DeferFlush).
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
@@ -132,7 +133,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
-    SubmitExecution(signal_semaphore, wait_semaphore);
+    {
+        VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Submit};
+        SubmitExecution(signal_semaphore, wait_semaphore);
+    }
     Wait(presubmit_tick);
     AllocateNewContext();
 }
