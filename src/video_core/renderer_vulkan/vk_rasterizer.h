@@ -200,6 +200,10 @@ private:
     void UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    /// Fragment output components (4 bits per render target) of the draw being prepared, and those
+    /// the dynamic color write mask was last recorded with
+    u32 draw_color_output_mask{~0U};
+    u32 last_color_output_mask{~0U};
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 

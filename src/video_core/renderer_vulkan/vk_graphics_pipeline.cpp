@@ -351,6 +351,23 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    // The guest leaves render target components the fragment shader doesn't output untouched,
+    // while Vulkan writes undefined values to them (AMD writes whatever its export registers
+    // hold), so they are masked out. In Ocarina of Time a depth-only visibility draw with RT0
+    // still bound left NaN and saturated pixels that the bloom spread into halos (Lichii #353).
+    // EDEN_NX2_COLOR_OUTPUT_MASK=0 writes every component as before.
+    static const bool mask_outputs = [] {
+        const char* const value = std::getenv("EDEN_NX2_COLOR_OUTPUT_MASK");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (mask_outputs) {
+        for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+            color_output_mask |= u32{stage_infos[NUM_STAGES - 1].frag_color_components[rt]}
+                                 << (rt * 4);
+        }
+    } else {
+        color_output_mask = ~0U;
+    }
     const auto any_written = [](const auto& descriptors) {
         return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
     };
@@ -1305,6 +1322,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
+        write_mask &= ColorOutputMask(index);
         cb_attachments.push_back({
             .blendEnable = blend.enable != 0,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
