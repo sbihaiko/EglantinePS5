@@ -31,9 +31,19 @@ sudo install -D -m 0644 "$key" /etc/apt/keyrings/apt.llvm.org.asc
 rm -f "$key"
 echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" |
     sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
+# Ubuntu's packages, from archive.ubuntu.com and security.ubuntu.com by name
+# instead of the runner's apt-mirrors.txt. On the hosted runners that file points
+# at azure.archive.ubuntu.com, which failed to resolve on 2026-11-11.
+for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+    [[ -f $f ]] || continue
+    sudo sed -i -E \
+        -e 's|URIs: *mirror\+file:/etc/apt/apt-mirrors\.txt|URIs: http://archive.ubuntu.com/ubuntu|' \
+        -e 's|https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+        -e 's|https?://[a-z0-9.-]*security\.ubuntu\.com/ubuntu|http://security.ubuntu.com/ubuntu|g' "$f"
+done
 # The runner's DNS and its mirrors flake: one window of a few minutes used to
 # fail this step after 15 minutes of a 200 kB/s fetch. Retry the whole sequence.
-apt_opts=(-o Acquire::Retries=10 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60)
+apt_opts=(-o Acquire::Retries=10 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 -o Acquire::ForceIPv4=true)
 for attempt in 1 2 3 4; do
     if sudo apt-get update "${apt_opts[@]}" &&
         # shellcheck disable=SC2046 # one package name per word
