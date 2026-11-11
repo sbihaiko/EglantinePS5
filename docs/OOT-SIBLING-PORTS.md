@@ -18,7 +18,6 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
 | `0910-count-only-counters` | `EDEN_NX2_COUNTERS=1` (`EDEN_NX2_FAST_DRAW_PROBE` picks the probed methods) | off | ours |
 | `0911-nan-guard-and-invariant-position` | `EDEN_NX2_NAN_GUARD=1`, `EDEN_NX2_POSITION_INVARIANT=1` | off | notquiteog/Dragoon `395547c` (Shakoquo/Hookshot `f04461bc9`) |
-| `0912-routed-global-atomics` | `EDEN_NX2_GLOBAL_ATOMICS=1` | off | the fork's own earlier `0065-ocarina-global-reduction` (SPIR-V part) |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
@@ -63,6 +62,12 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   up: `EDEN_NX2_POSITION_INVARIANT=1` decorates `gl_Position` Invariant. GrowingBlackBeans
   measured both with the colour output masks (viejunerd/Eglantine-PS5- #21): flashes from a few
   per walk to nearly none, no FPS cost. The first boot after a change builds the new pipelines.
+
+- **On this branch (`pr99-test`): the parent's PR #99 and #100 (core 0070, 0072-0078).** 0070
+  tracks storage buffers natively and routes global atomics, so 0912 is gone; it also reads 8 and
+  16-byte storage accesses word by word whenever the binding alignment is below their size, so
+  0902 keeps only its float min/max and memory parts. 0903 still applies. The parent measured
+  OoT at ~25 FPS in Link's house with #99 (from ~40) and #100 taking back part of that.
 
 - **Routed global atomics.** In every Ocarina session 8 compute pipelines fail at load with
   `SPIR-V Instruction EmitGlobalAtomicIAdd32 is not implemented`, right after `Storage buffer failed
