@@ -49,6 +49,9 @@ python3 "$root/tools/patch-radv-trim.py"
 # Mihawk PS5_Mesa f5610fe270: freed buffers kept until the GPU has run what was submitted before
 # (RADV_PS5_RETIRE=1; off by default). After the trim: a held buffer leaves its list.
 python3 "$root/tools/patch-radv-retire.py"
+# Log lines to match a GPU fault address against frees, pieces, sparse binds, replaced queue
+# buffers and trims (RADV_PS5_FREE_LOG=1; off by default).
+python3 "$root/tools/patch-radv-free-log.py"
 python3 "$root/tools/patch-radv-gs-compute.py"
 # PlayTendoh's submit thread, by way of Vampinity (RADV_PS5_SUBMIT_THREAD=1; off by default).
 python3 "$root/tools/patch-radv-submit-thread.py"
@@ -68,6 +71,8 @@ python3 "$root/tools/patch-radv-trim.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_MEMORY_TRIM_SHA256"
 python3 "$root/tools/patch-radv-retire.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_RETIRE_SHA256"
+python3 "$root/tools/patch-radv-free-log.py" --digest \
+    > "$vulkan/.deps/native/radv-release/EDEN_FREE_LOG_SHA256"
 python3 "$root/tools/patch-radv-gs-compute.py" --digest \
     > "$vulkan/.deps/native/radv-release/EDEN_GS_COMPUTE_SHA256"
 python3 "$root/tools/patch-radv-submit-thread.py" --digest \

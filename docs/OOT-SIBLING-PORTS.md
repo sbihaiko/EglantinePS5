@@ -26,6 +26,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0918-tc-square-depth-unscaled` | `EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1` | off | Lichii #1314, commit 3 |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 | driver: `tools/patch-radv-retire.py` | `RADV_PS5_RETIRE=1` | off | mihawk-99/PS5_Mesa `f5610fe270` |
+| driver: `tools/patch-radv-free-log.py` | `RADV_PS5_FREE_LOG=1` (`RADV_PS5_FREE_LOG_LINES`, default 200 lines per kind per 10 s): `radv/ps5 free-log` lines for frees and allocations of 16 MiB or more, pieces, sparse binds, replaced queue buffers and trimmed granules; lifts the trim and pieces line caps | off | ours |
 | app: `headless/heap_arenas.inc` (`eden_heap_trim`) | `EDEN_PS5_HEAP_NO_GIVEBACK=1` (the heap never gives pieces or arenas back; large blocks of their own still go back when freed) | off | ours |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
