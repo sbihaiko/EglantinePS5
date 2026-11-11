@@ -633,6 +633,8 @@ private:
     std::vector<ImageId>* prepare_log{}; ///< LogPrepares
     bool prepare_log_dry{};
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

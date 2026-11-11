@@ -144,6 +144,16 @@ namespace {
     }();
     return enabled;
 }
+
+// EDEN_NX2_TC_PADDED_SQUARE=1: a depth target padded to whole GOBs is looked up as the square it
+// is (FindDepthBuffer; Lichii #1314).
+[[nodiscard]] inline bool PaddedSquareDepthEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_PADDED_SQUARE");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
 } // namespace
 
 template <class P>
@@ -945,7 +955,10 @@ bool TextureCache<P>::RescaleRenderTargets() {
             }
             check_rescale(color_buffer_id, tmp_color_images[index]);
         }
-        if (flags[Dirty::ZetaBuffer] || force) {
+        // The surface clip, which a padded depth target's size depends on, has no flag of its
+        // own (it marks only RenderTargets), so look the target up again while it is padded.
+        // depth_target_padded stays false without EDEN_NX2_TC_PADDED_SQUARE.
+        if (flags[Dirty::ZetaBuffer] || force || depth_target_padded) {
             flags[Dirty::ZetaBuffer] = false;
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
@@ -3402,6 +3415,7 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
 template <class P>
 ImageViewId TextureCache<P>::FindDepthBuffer() {
     const auto& regs = maxwell3d->regs;
+    depth_target_padded = false;
     if (!regs.zeta_enable) {
         return ImageViewId{};
     }
@@ -3409,7 +3423,21 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // EDEN_NX2_TC_PADDED_SQUARE=1 (Lichii #1314): Ocarina of Time draws its local shadow maps into
+    // D32_FLOAT depth targets padded to whole GOBs (800x793) and samples them as the square
+    // textures they are (793x793) at the same address. Image lookups compare sizes strictly, so
+    // each shadow map was two images and a copy between them, for every new size while the camera
+    // moves. The padding is not part of the image: the surface clip bounds rendering, so a clip
+    // inside the square never reaches it, and one image then serves both. A clip that reaches the
+    // padding keeps the size the game gave.
+    if (PaddedSquareDepthEnabled()) {
+        depth_target_padded = IsPaddedSquare(info);
+        const u32 clip_right = regs.surface_clip.x.Value() + regs.surface_clip.width.Value();
+        if (depth_target_padded && clip_right <= info.size.height) {
+            info.size.width = info.size.height;
+        }
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 
