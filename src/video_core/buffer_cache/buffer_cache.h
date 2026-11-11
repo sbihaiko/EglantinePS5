@@ -2528,10 +2528,33 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
                                         packed_size != 0 &&
                                         packed_size <= memory_layout_size;
-        if (next_qword_is_size) {
+        // A word past 256 MiB after the pointer is another parameter, not a size: Ocarina of Time's
+        // Kokiri Forest load has the float 1.0 (0x3F800000) there inside a mapping larger than
+        // that, and the 1 GiB buffer it asked for ended the session out of device memory
+        // (viejunerd/Eglantine-PS5- 15cde68). Such a binding is a bare pointer: up to 8 MiB,
+        // stopping where the mapping does. EDEN_NX2_STORAGE_SIZE_WORD=0 restores the old reading.
+        static const bool reject_implausible = [] {
+            const char* const value = std::getenv("EDEN_NX2_STORAGE_SIZE_WORD");
+            return value == nullptr || value[0] != '0';
+        }();
+        constexpr u32 MaxStorageSizeWord = static_cast<u32>(256_MiB);
+        if (next_qword_is_size && (!reject_implausible || packed_size <= MaxStorageSizeWord)) {
             return packed_size;
         }
-        return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+        const u32 fallback = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+        if (next_qword_is_size) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(HW_GPU,
+                            "Storage buffer size word {:#x} at {:#x} is not a size: bound as a "
+                            "bare pointer",
+                            packed_size, ssbo_addr + 8);
+                std::fprintf(stderr, "EDEN_SSBO_SIZE_WORD word=%#x at=%#llx bound_as_pointer=1\n",
+                             packed_size, static_cast<unsigned long long>(ssbo_addr + 8));
+            }
+            return static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, fallback));
+        }
+        return fallback;
     }();
     if ((native_pointer || table_pointer) && size != 0) {
         // Stop where the mapping or its device range does: the binding is one device range.
