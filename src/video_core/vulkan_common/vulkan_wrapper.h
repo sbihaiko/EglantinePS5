@@ -233,6 +233,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdDrawIndirectCount vkCmdDrawIndirectCount{};
     PFN_vkCmdDrawIndexedIndirectCount vkCmdDrawIndexedIndirectCount{};
     PFN_vkCmdDrawIndirectByteCountEXT vkCmdDrawIndirectByteCountEXT{};
+    PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT{};
     PFN_vkCmdEndConditionalRenderingEXT vkCmdEndConditionalRenderingEXT{};
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
@@ -684,6 +685,7 @@ public:
 
 class Image {
 public:
+    VkDeviceSize AllocationBytesProbe() const noexcept;
     explicit Image(VkImage handle_, VkImageUsageFlags usage_, VkDevice owner_,
                    VmaAllocator allocator_, VmaAllocation allocation_,
                    const DeviceDispatch& dld_) noexcept
@@ -737,6 +739,15 @@ public:
         return usage;
     }
 
+    /// Where the image's memory lies: the block (0 when the image has no memory or a block of
+    /// its own), the block's size and the image's part of it.
+    struct MemoryBlock {
+        u64 block;
+        u64 block_size;
+        u64 size;
+    };
+    [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
+
 private:
     void Release() const noexcept;
 
@@ -770,7 +781,7 @@ public:
     Buffer(Buffer&& rhs) noexcept
         : handle{std::exchange(rhs.handle, VkBuffer{})}, owner{rhs.owner}, allocator{rhs.allocator},
           allocation{rhs.allocation}, mapped{rhs.mapped}, location{rhs.location},
-          is_coherent{rhs.is_coherent}, dld{rhs.dld} {}
+          is_coherent{rhs.is_coherent}, readback_mapping{rhs.readback_mapping}, dld{rhs.dld} {}
 
     Buffer& operator=(Buffer&& rhs) noexcept {
         Release();
@@ -781,6 +792,7 @@ public:
         mapped = rhs.mapped;
         location = rhs.location;
         is_coherent = rhs.is_coherent;
+        readback_mapping = rhs.readback_mapping;
         dld = rhs.dld;
         return *this;
     }
@@ -821,6 +833,10 @@ public:
         return is_coherent;
     }
 
+    // Ordinary VMA allocations only. Caller excludes sparse buffers and waits
+    // for GPU writes before accessing the returned persistent mapping.
+    std::span<const u8> TryMapForReadback(size_t size);
+
     void Flush() const;
 
     void Invalidate() const;
@@ -841,6 +857,7 @@ private:
     std::span<u8> mapped = {};
     MemoryLocation location{};
     bool is_coherent = false;
+    bool readback_mapping = false;
     const DeviceDispatch* dld = nullptr;
 };
 
@@ -1318,6 +1335,10 @@ public:
     void DrawIndexedIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
                              u32 stride) const noexcept {
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
+    }
+
+    void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {
+        dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
     }
 
     void DrawIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset, VkBuffer count_buffer,

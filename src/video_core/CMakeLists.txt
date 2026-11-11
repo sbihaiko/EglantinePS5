@@ -108,6 +108,8 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_fast_draw.cpp
+    nx2_fast_draw.h
     nx2_profile.h
     present.h
     pte_kind.h
@@ -238,6 +240,8 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    shader_handle_program.h
+    oot_network.h
     shader_notify.cpp
     shader_notify.h
     smaa_area_tex.h
@@ -262,7 +266,9 @@ add_library(video_core STATIC
     texture_cache/image_view_info.cpp
     texture_cache/image_view_info.h
     texture_cache/render_targets.h
+    texture_cache/sampled_views.h
     texture_cache/samples_helper.h
+    texture_cache/stale_pages.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
     texture_cache/texture_cache_base.h

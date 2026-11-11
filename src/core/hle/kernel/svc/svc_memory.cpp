@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/hle/kernel/svc/svc_memory_stats.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
@@ -79,6 +80,7 @@ Result MapUnmapMemorySanityChecks(const KProcessPageTable& manager, u64 dst_addr
 } // namespace
 
 Result SetMemoryPermission(Core::System& system, u64 address, u64 size, MemoryPermission perm) {
+    MemoryStats::Note(MemoryStats::SetMemoryPermission, size, true);
     LOG_DEBUG(Kernel_SVC, "called, address={:#016x}, size={:#x}, perm={:#08x}", address, size,
               perm);
 
@@ -100,6 +102,7 @@ Result SetMemoryPermission(Core::System& system, u64 address, u64 size, MemoryPe
 }
 
 Result SetMemoryAttribute(Core::System& system, u64 address, u64 size, u32 mask, u32 attr) {
+    MemoryStats::Note(MemoryStats::SetMemoryAttribute, size, true);
     LOG_DEBUG(Kernel_SVC,
               "called, address={:#016x}, size={:#x}, mask={:#08x}, attribute={:#08x}", address,
               size, mask, attr);
@@ -132,6 +135,7 @@ Result SetMemoryAttribute(Core::System& system, u64 address, u64 size, u32 mask,
 
 /// Maps a memory range into a different range.
 Result MapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
+    MemoryStats::Note(MemoryStats::MapMemory, size, true);
     LOG_TRACE(Kernel_SVC, "called, dst_addr={:#x}, src_addr={:#x}, size={:#x}", dst_addr,
               src_addr, size);
 
@@ -147,6 +151,7 @@ Result MapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
 
 /// Unmaps a region that was previously mapped with svcMapMemory
 Result UnmapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
+    MemoryStats::Note(MemoryStats::UnmapMemory, size, true);
     LOG_TRACE(Kernel_SVC, "called, dst_addr={:#x}, src_addr={:#x}, size={:#x}", dst_addr,
               src_addr, size);
 

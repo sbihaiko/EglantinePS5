@@ -64,12 +64,12 @@ Id EmitImageAtomicUMax32(EmitContext& ctx, IR::Inst* inst, const IR::Value& inde
 
 Id EmitImageAtomicInc32(EmitContext&, IR::Inst*, const IR::Value&, Id, Id) {
     // TODO: This is not yet implemented
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitImageAtomicDec32(EmitContext&, IR::Inst*, const IR::Value&, Id, Id) {
     // TODO: This is not yet implemented
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitImageAtomicAnd32(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
@@ -93,91 +93,91 @@ Id EmitImageAtomicExchange32(EmitContext& ctx, IR::Inst* inst, const IR::Value& 
 }
 
 Id EmitBindlessImageAtomicIAdd32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicSMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicUMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicSMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicUMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicInc32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicDec32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicAnd32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicOr32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicXor32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBindlessImageAtomicExchange32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicIAdd32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicSMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicUMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicSMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicUMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicInc32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicDec32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicAnd32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicOr32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicXor32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitBoundImageAtomicExchange32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 } // namespace Shader::Backend::SPIRV

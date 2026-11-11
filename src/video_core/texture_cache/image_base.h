@@ -56,6 +56,11 @@ enum class ImageFlagBits : u32 {
     /// A large array over Switch 2 sparse blocks: unbacked, each layer gets device memory when
     /// something is written to it (Image::BindLayers) and only those layers are uploaded.
     SparseLayers = 1 << 22,
+    /// A large single image over Switch 2 sparse blocks: unbacked, each host sparse block gets
+    /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
+    /// the parts written are uploaded.
+    SparseTiles = 1 << 23,
+    PartialDownload = 1 << 24, ///< CPU backing contains only requested GPU-written bytes.
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -113,6 +118,10 @@ struct ImageBase {
     /// Large layered images uploaded by layer: one bit per layer written since the last upload
     /// while CpuModified. Empty while CpuModified means the whole image.
     std::vector<u64> dirty_layers;
+    /// SparseTiles images: the guest byte ranges (offset, size) written since the last upload while
+    /// CpuModified. Empty while CpuModified means all of it that can hold data.
+    std::vector<std::pair<u64, u64>> dirty_ranges;
+    std::vector<LevelRect> pending_sparse_uploads;
     u64 scale_tick = 0;
     bool has_scaled = false;
 
@@ -125,6 +134,18 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    /// An alias may be newer than this image (TextureCache::SynchronizeAliases walks the aliases
+    /// only then): set when an alias is modified, synchronized or linked, or a copy was deferred.
+    bool alias_maybe_newer = true;
+    /// Its pages are marked GPU written (Tegra::Nx2MarkImageGpuWritten).
+    bool nx2_pages_marked = false;
+    /// TextureCache::overlap_epoch when MarkModification last resolved this image's overlaps.
+    u64 overlap_resolved_epoch = 0;
+    /// Feedback copy coalescing (TextureCache::SynchronizeAliases): the bound colour target this
+    /// image was last copied from, and the guest texture barrier count and target set then.
+    ImageId feedback_source{};
+    u64 feedback_barrier_epoch = ~u64{0};
+    u64 feedback_rt_serial = ~u64{0};
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

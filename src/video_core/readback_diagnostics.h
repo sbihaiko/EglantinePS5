@@ -48,12 +48,21 @@ struct Measurement {
 
 struct ThreadData {
     std::array<Measurement, static_cast<size_t>(Event::Count)> events{};
+    // Actual submission requirements: bit 0 texture, bit 1 buffer, bit 2 query.
+    std::array<u64, 8> fence_masks{};
+    u64 skipped_empty_fences{};
     std::chrono::steady_clock::time_point begin{};
     size_t depth{};
     bool report_due{};
 };
 
 inline thread_local ThreadData data;
+
+inline void CountFence(u8 required, bool skipped = false) {
+    if (!Enabled()) return;
+    if (skipped) ++data.skipped_empty_fences;
+    else ++data.fence_masks[required & 7];
+}
 
 class Scope {
 public:
@@ -97,6 +106,10 @@ public:
                                        value.calls, value.bytes, value.samples, value.sampled_ns);
             }
         }
+        for (size_t mask = 0; mask < data.fence_masks.size(); ++mask) {
+            if (data.fence_masks[mask]) summary += fmt::format(" | fence_mask={} count={}", mask, data.fence_masks[mask]);
+        }
+        summary += fmt::format(" | skipped_empty_fences={}", data.skipped_empty_fences);
         LOG_INFO(HW_GPU, "ReadbackDiag window_ns={}{}",
                  std::chrono::duration_cast<std::chrono::nanoseconds>(now - data.begin).count(),
                  summary);

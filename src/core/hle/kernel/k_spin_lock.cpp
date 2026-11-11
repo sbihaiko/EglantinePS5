@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "core/hle/kernel/k_spin_lock.h"
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -30,7 +32,15 @@ void KSpinLock::Lock() {
                                         std::memory_order_relaxed)) {
         return;
     }
-    for (int spin = 0; spin < SpinCount; ++spin) {
+    // The scheduler lock is contended by six guest cores handing work to each other ~14,000
+    // times a second at Mario Kart World's title; the atomic wait below polls the clock before
+    // it sleeps (2.7% of the guest cores' time on the console). EDEN_PS5_KSPIN=<pauses> (2048)
+    // spins longer first; 128 restores the old count.
+    static const int spin_count = [] {
+        const char* value = std::getenv("EDEN_PS5_KSPIN");
+        return value != nullptr ? std::atoi(value) : 2048;
+    }();
+    for (int spin = 0; spin < spin_count; ++spin) {
         Pause();
         if (m_state.load(std::memory_order_relaxed) == 0) {
             expected = 0;

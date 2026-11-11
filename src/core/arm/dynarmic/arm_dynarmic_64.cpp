@@ -16,6 +16,7 @@
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
+#include "video_core/readback_dependency_diagnostics.h"
 
 namespace Core {
 
@@ -385,12 +386,40 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
+namespace {
+// Saved JIT state can identify a block boundary rather than the exact load PC.
+void CaptureReadbackGuestContext(void* object, VideoCommon::ReadbackDependencyDiagnostics::Record& r) {
+    auto& jit = *static_cast<Dynarmic::A64::Jit*>(object);
+    r.guest_pc = jit.GetPC();
+    r.guest_lr = jit.GetRegister(30);
+    r.guest_sp = jit.GetSP();
+    r.guest_x0 = jit.GetRegister(0);
+    r.guest_x1 = jit.GetRegister(1);
+    r.guest_x2 = jit.GetRegister(2);
+    r.guest_x3 = jit.GetRegister(3);
+    r.guest_x19 = jit.GetRegister(19);
+    r.guest_x20 = jit.GetRegister(20);
+    r.guest_x21 = jit.GetRegister(21);
+    r.guest_x22 = jit.GetRegister(22);
+    r.guest_x23 = jit.GetRegister(23);
+    r.guest_x24 = jit.GetRegister(24);
+}
+}
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    // Install once per JIT run, not on every memory callback. The provider is
+    // invoked only for scalar reads accepted by the bounded armed trace.
+    VideoCommon::ReadbackDependencyDiagnostics::GuestContextScope guest_context{
+        &*m_jit, CaptureReadbackGuestContext};
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Run());
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
+    // Install once per JIT run, not on every memory callback. The provider is
+    // invoked only for scalar reads accepted by the bounded armed trace.
+    VideoCommon::ReadbackDependencyDiagnostics::GuestContextScope guest_context{
+        &*m_jit, CaptureReadbackGuestContext};
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Step());
 }

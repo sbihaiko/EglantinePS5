@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/hle/kernel/svc/svc_memory_stats.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
@@ -61,6 +62,7 @@ Result SetProcessMemoryPermission(Core::System& system, Handle process_handle, u
 
 Result MapProcessMemory(Core::System& system, u64 dst_address, Handle process_handle,
                         u64 src_address, u64 size) {
+    MemoryStats::Note(MemoryStats::MapProcessMemory, size, true);
     LOG_TRACE(Kernel_SVC,
               "called, dst_address={:#x}, process_handle={:#x}, src_address={:#x}, size={:#x}",
               dst_address, process_handle, src_address, size);

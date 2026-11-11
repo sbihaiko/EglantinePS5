@@ -139,7 +139,7 @@ public:
         if (it == stored_bitset.end()) {
             return end();
         }
-        const u32 word_index = static_cast<u32>(std::distance(it, stored_bitset.begin()));
+        const u32 word_index = static_cast<u32>(std::distance(stored_bitset.begin(), it));
         const SlotId first_id{word_index * 64 + static_cast<u32>(std::countr_zero(*it))};
         return Iterator(this, first_id);
     }

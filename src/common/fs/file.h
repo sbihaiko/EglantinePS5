@@ -17,6 +17,10 @@
 
 namespace Common::FS {
 
+/// Writes the IOFiles open now, by folder (most first), as one EDEN_OPEN_FILES line.
+void ReportOpenFiles(std::FILE* out);
+
+
 enum class SeekOrigin {
     SetOrigin,       // Seeks from the start of the file.
     CurrentPosition, // Seeks from the current file pointer position.

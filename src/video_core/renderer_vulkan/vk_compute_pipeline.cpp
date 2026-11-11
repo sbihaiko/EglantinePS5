@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -12,6 +16,7 @@
 
 #include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/nir_handoff.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -19,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -96,7 +102,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .requiredSubgroupSize = GuestWarpSize,
         };
         VkPipelineCreateFlags flags{};
-        if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+        // EDEN_NX2_PIPELINE_STATS=1: the driver's statistics of every large compute pipeline in the log
+        // (NX2_PIPELINE_STATS), to compare shader lowerings by the GPU code they become.
+        static const bool log_statistics = std::getenv("EDEN_NX2_PIPELINE_STATS") != nullptr;
+        if (device.IsKhrPipelineExecutablePropertiesEnabled() &&
+            (Settings::values.renderer_debug.GetValue() || log_statistics)) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         }
         if (uses_descriptor_buffer) {
@@ -124,7 +134,19 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineIndex = 0,
         };
         try {
+            const auto create_start = std::chrono::steady_clock::now();
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            // A module that carried NIR (nir_handoff.h): the driver compiled its own copy.
+            if (const auto detach = NirHandoff::detach.load(std::memory_order_acquire)) {
+                detach(reinterpret_cast<void*>(*spv_module));
+            }
+            if (static const bool compile_times = std::getenv("EDEN_NX2_COMPILE_TIMES") != nullptr;
+                compile_times) {
+                LOG_WARNING(Render_Vulkan, "NX2_COMPILE_TIME hash={:016x} driver_us={}", shader_hash,
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - create_start)
+                                .count());
+            }
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
@@ -146,6 +168,25 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
+        }
+        if (log_statistics && device.IsKhrPipelineExecutablePropertiesEnabled()) {
+            const auto statistics{device.GetLogical().GetPipelineExecutableStatisticsKHR(*pipeline, 0)};
+            u64 instructions{};
+            std::string line;
+            for (const auto& statistic : statistics) {
+                u64 value{};
+                switch (statistic.format) {
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: value = statistic.value.u64; break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: value = static_cast<u64>(statistic.value.i64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: value = static_cast<u64>(statistic.value.f64); break;
+                default: break;
+                }
+                if (std::string_view{statistic.name} == "Instructions") instructions = value;
+                line += fmt::format(" {}={}", statistic.name, value);
+            }
+            if (instructions >= 5000 || std::getenv("EDEN_NX2_PIPELINE_STATS_ALL") != nullptr) {
+                LOG_WARNING(Render_Vulkan, "NX2_PIPELINE_STATS compute hash={:016x}{}", shader_hash, line);
+            }
         }
         std::scoped_lock lock{build_mutex};
         is_built = true;
@@ -172,7 +213,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written);
+                                              desc.is_written, desc.indirect_offset,
+                                              desc.write_extent);
         ++ssbo_index;
     }
 
@@ -185,6 +227,20 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
     const auto read_handle{[&](const auto& desc, u32 index) {
+        if (desc.handle_program != ~0U) {
+            // Read by the shader from a storage buffer: computed for this dispatch.
+            return TexturePair(VideoCommon::EvaluateTextureHandle(
+                                   info, desc.handle_program, gpu_memory,
+                                   [&](u32 cbuf) -> GPUVAddr {
+                                       return cbuf < cbufs.size() &&
+                                                      ((qmd.const_buffer_enable_mask >> cbuf) &
+                                                       1) != 0
+                                                  ? cbufs[cbuf].Address()
+                                                  : GPUVAddr{};
+                                   },
+                                   device.GetStorageBufferAlignment()),
+                               via_header_index);
+        }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
         const u32 index_offset{index << desc.size_shift};
         const u32 offset{desc.cbuf_offset + index_offset};

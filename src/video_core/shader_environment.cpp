@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -177,6 +179,57 @@ u32 GenericEnvironment::TranslateProgramAddress(u32 address) const {
     if (native_source_size || Shader::Ampere::HasNativeAddressMap(code))
         throw Shader::RuntimeError("Invalid native indirect branch address {:#x}", address);
     return address;
+}
+
+// Whether a constant buffer value of a native (Switch 2) program is a storage buffer pointer is
+// answered from the GPU's mappings when the program is translated. The answers are kept beside the
+// constant buffer values the translation read (keys no constant buffer has), so that a pipeline
+// cache record translates the same way without the guest's memory.
+static constexpr u64 MakePointerKey(u32 index, u32 offset) {
+    return (u64{1} << 62) | (static_cast<u64>(index) << 32) | offset;
+}
+
+static constexpr u64 MakeIndirectPointerKey(u32 index, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (static_cast<u64>(indirect & 0x3fffff) << 40) |
+           (static_cast<u64>(index) << 32) | offset;
+}
+
+bool GenericEnvironment::IsNativeProgram() const {
+    return native_source_size != 0 || lowered_native != nullptr ||
+           Shader::Ampere::HasNativeAddressMap(code);
+}
+
+bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    const u64 key = MakePointerKey(index, offset);
+    if (const auto it = cbuf_values.find(key); it != cbuf_values.end()) {
+        return it->second != 0;
+    }
+    const u64 address =
+        u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
+    const bool mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+                        gpu_memory->IsFullyMappedRange(address, 1);
+    cbuf_values.insert_or_assign(key, mapped ? 1U : 0U);
+    return mapped;
+}
+
+bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    const u64 key = MakeIndirectPointerKey(index, offset, indirect);
+    if (const auto it = cbuf_values.find(key); it != cbuf_values.end()) {
+        return it->second != 0;
+    }
+    bool mapped = false;
+    if (IsCbufStorageBufferPointer(index, offset)) {
+        const u64 holder =
+            u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
+        if (gpu_memory->IsWithinGPUAddressRange(holder + indirect) &&
+            gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
+            const u64 address = gpu_memory->Read<u64>(holder + indirect);
+            mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+                     gpu_memory->IsFullyMappedRange(address, 1);
+        }
+    }
+    cbuf_values.insert_or_assign(key, mapped ? 1U : 0U);
+    return mapped;
 }
 
 std::optional<u64> GenericEnvironment::Analyze() {
@@ -454,6 +507,24 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         reject_list.find(fmt::format(",{:x},", program_base)) != std::string::npos) {
         throw Shader::RuntimeError("Native shader at {:#x} rejected by EDEN_NX2_REJECT", program_base);
     }
+    // EDEN_NX2_REJECT_KEYS=<file>: treat the programs whose native key (16 hex digits a line) is
+    // listed as rejected. Keys are the same in every session, unlike addresses: for finding which
+    // program draws something by halving a list.
+    if (static const std::unordered_set<u64> reject_keys = [] {
+            std::unordered_set<u64> keys;
+            if (const char* path = std::getenv("EDEN_NX2_REJECT_KEYS")) {
+                std::ifstream file{path};
+                for (std::string line; std::getline(file, line);) {
+                    if (!line.empty()) keys.insert(std::strtoull(line.c_str(), nullptr, 16));
+                }
+                std::fprintf(stderr, "EDEN_NX2_REJECT_KEYS %zu keys\n", keys.size());
+            }
+            return keys;
+        }();
+        !reject_keys.empty() && reject_keys.contains(Shader::Ampere::NativeProgramKey(native))) {
+        throw Shader::RuntimeError("Native shader at {:#x} rejected by EDEN_NX2_REJECT_KEYS",
+                                   program_base);
+    }
     // EDEN_NX2_SHADER_DUMP=<dir>: keep every captured native program (named by its key) so the
     // lowering can be tested offline against all of a game's shaders.
     const auto dump_mapped = [&](const std::filesystem::path& path) {
@@ -476,8 +547,14 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         return offset;
     };
+    // EDEN_NX2_SHADER_DUMP_ALL=1: every captured program, not only those the lowering refused (the
+    // Ampere lowering's coverage and cost are measured offline against a game's whole set).
+    static const bool dump_all = [] {
+        const char* value = std::getenv("EDEN_NX2_SHADER_DUMP_ALL");
+        return value != nullptr && value[0] == '1';
+    }();
     if (static const char* const dump_directory = std::getenv("EDEN_NX2_SHADER_DUMP");
-        dump_directory != nullptr) {
+        dump_directory != nullptr && (!lowered || dump_all)) {
         const auto folder = std::filesystem::path{dump_directory};
         const auto path = folder / fmt::format("{:016x}-{}-{:x}.bin", Shader::Ampere::NativeProgramKey(native),
                                                source_header_size == 0 ? "cs" : "gfx", program_base);
@@ -552,6 +629,9 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             words[1], words[2], words[3]);
     }
     auto result = std::make_shared<LoweredNativeCode>();
+    result->native_program_key = Shader::Ampere::NativeProgramKey(native);
+    result->uses_hmma = std::any_of(native.begin(), native.end(),
+                                    [](const auto& instruction) { return (instruction.words[0] & 0xfff) == 0x23c; });
     result->texture_bound = lowered.required_texture_buffer;
     result->surface_bound = lowered.required_surface_buffer;
     result->source_size = native_header_size + lowered.source_size;
@@ -584,6 +664,13 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
+    const auto& regs{maxwell3d->regs};
+    const bool native{maxwell3d->GetNativeMacroEngine().native_turing};
+    // Task and mesh programs: the task in the vertex slot, its mesh program in the tessellation
+    // slot (without a task, the mesh program is in the vertex slot).
+    const bool mesh_slot{native && regs.IsMeshEnabled() &&
+                         (program == Maxwell::ShaderType::VertexB ||
+                          program == Maxwell::ShaderType::Tessellation)};
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
     switch (program) {
     case Maxwell::ShaderType::VertexA:
@@ -614,9 +701,22 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         ASSERT_MSG(false, "Invalid program={}", program);
         break;
     }
+    if (mesh_slot) {
+        const bool has_task{regs.IsShaderConfigEnabled(Maxwell::ShaderType::Tessellation)};
+        stage = program == Maxwell::ShaderType::VertexB && has_task ? Shader::Stage::Task
+                                                                    : Shader::Stage::Mesh;
+        mesh_registers = {regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
+                          regs.reg_array[Maxwell::MeshInitShader]};
+        if (stage == Shader::Stage::Mesh && regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
+            const auto& geometry{regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
+            const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
+                                   geometry.reserved[1]};
+            gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
+        }
+    }
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Geometry &&
-            program != Maxwell::ShaderType::Pixel) {
+            program != Maxwell::ShaderType::Pixel && !mesh_slot) {
             if (std::getenv("EDEN_NX2_SHADER_DUMP")) {
                 InitializeNativeCode(nullptr);
             }
@@ -998,6 +1098,28 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
         throw Shader::LogicError("Out of bounds address {}", address);
     }
     return code[(address - read_lowest) / sizeof(u64)];
+}
+
+bool FileEnvironment::IsNativeProgram() const {
+    return Shader::Ampere::HasNativeAddressMap(code);
+}
+
+// A record made before these answers were kept has none: its translation is given up (the
+// pipeline is built when the game uses it), as for any other value it lacks.
+bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    const auto it{cbuf_values.find(MakePointerKey(index, offset))};
+    if (it == cbuf_values.end()) {
+        throw Shader::LogicError("Uncached storage buffer pointer classification");
+    }
+    return it->second != 0;
+}
+
+bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    const auto it{cbuf_values.find(MakeIndirectPointerKey(index, offset, indirect))};
+    if (it == cbuf_values.end()) {
+        throw Shader::LogicError("Uncached storage buffer pointer classification");
+    }
+    return it->second != 0;
 }
 
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {

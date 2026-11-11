@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <variant>
 #include <boost/container/static_vector.hpp>
 
@@ -18,9 +19,14 @@ namespace Vulkan {
 
 UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
                                              bool supports_descriptor_buffer_)
-    : device{device_}, frame_payload_size{frame_payload_size_},
+    : device{device_},
+#ifdef PS5_NATIVE
+      frame_payload_size{std::min<size_t>(frame_payload_size_, 0x10000)},
+#else
+      frame_payload_size{frame_payload_size_},
+#endif
       supports_descriptor_buffer{supports_descriptor_buffer_},
-      payload(frame_payload_size_ * FRAMES_IN_FLIGHT)
+      payload(frame_payload_size * FRAMES_IN_FLIGHT)
 {
     payload_start = payload.data();
     payload_cursor = payload.data();
@@ -41,6 +47,20 @@ void UpdateDescriptorQueue::Acquire(Scheduler& scheduler, size_t required_entrie
     use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
     static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
     const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
+#ifdef PS5_NATIVE
+    if (reserve >= frame_payload_size) {
+        // The worker may still hold pointers into any of the eight frame slices.
+        // Drain those reads before reallocating; keep large shader reservations valid.
+        scheduler.WaitWorker();
+        ASSERT_MSG(reserve < payload.max_size() / FRAMES_IN_FLIGHT,
+                   "Descriptor reservation {} exceeds allocation limits", reserve);
+        frame_payload_size = reserve + 1;
+        payload.resize(frame_payload_size * FRAMES_IN_FLIGHT);
+        frame_index = 0;
+        payload_start = payload.data();
+        payload_cursor = payload_start;
+    }
+#endif
     ASSERT_MSG(reserve < frame_payload_size, "Descriptor reservation {} >= frame capacity {}",
                reserve, frame_payload_size);
     const size_t used = static_cast<size_t>(std::distance(payload_start, payload_cursor));

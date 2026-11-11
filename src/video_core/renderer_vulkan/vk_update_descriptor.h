@@ -115,7 +115,7 @@ public:
 
 private:
     const Device& device;
-    const size_t frame_payload_size;
+    size_t frame_payload_size;
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
     size_t frame_index{0};

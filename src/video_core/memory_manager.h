@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -139,6 +140,22 @@ public:
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
         GPUVAddr gpu_addr, std::size_t size) const;
 
+    /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
+    /// end of the address space.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
+        GPUVAddr gpu_addr, std::size_t size) const;
+
+    /// Changes whenever Map, MapSparse or Unmap runs on this address space (fast draw).
+    [[nodiscard]] u64 MapSerial() const {
+        return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
+    /// a host pointer GetPointer returned is only good while it stays the same (texture memo).
+    [[nodiscard]] u64 HostPointerSerial() const {
+        return MapSerial() + memory.MappingGeneration();
+    }
+
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
                  PTEKind kind = PTEKind::INVALID, bool is_big_pages = true);
     GPUVAddr MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages = true);
@@ -179,6 +196,8 @@ private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
 
+    size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
+
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
@@ -199,6 +218,15 @@ private:
         boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result) const;
 
     std::atomic<GPUVAddr> native_syncpoint_shim{};
+    /// Bumped before and after every Map, MapSparse and Unmap (MapSerial).
+    std::atomic<u64> map_serial{1};
+    /// The address ranges of the last page table changes, by the serial each one produced, so a
+    /// cache of page table answers drops only what a change can have touched.
+    mutable std::mutex map_log_guard;
+    std::array<std::pair<GPUVAddr, GPUVAddr>, 64> map_log{};
+    void NoteMapChange(GPUVAddr gpu_addr, std::size_t size);
+    /// Whether a change since `since_serial` touches [begin, end] (or is no longer in the log).
+    bool MapChangedSince(u64 since_serial, u64 now_serial, GPUVAddr begin, GPUVAddr end) const;
     Core::System& system;
     MaxwellDeviceMemoryManager& memory;
 

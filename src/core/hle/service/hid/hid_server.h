@@ -191,8 +191,8 @@ private:
                                     ClientAppletResourceUserId aruid);
     void SendNx2VibrationValue(HLERequestContext& ctx);
     // Switch 2 sends vibration every frame with 214 (pointer buffers of device handles and
-    // values, like 206); Eden doesn't emulate vibration, so accept and drop it.
-    Result SendNx2VibrationValues();
+    // values, like 206): played through the same per-device path as 206.
+    void SendNx2VibrationValues(HLERequestContext& ctx);
     Result ActivateConsoleSixAxisSensor(ClientAppletResourceUserId aruid);
     Result StartConsoleSixAxisSensor(Core::HID::ConsoleSixAxisSensorHandle console_sixaxis_handle,
                                      ClientAppletResourceUserId aruid);

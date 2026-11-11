@@ -24,6 +24,8 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/oot_network.h"
+#include "common/scope_exit.h"
 #include "video_core/native_query_trace.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -546,8 +548,14 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    in_native_dispatch = true;
+    SCOPE_EXIT {
+        in_native_dispatch = false;
+    };
     try {
         rasterizer->DispatchCompute();
+    } catch (const VideoCommon::OotNetwork::DispatchReplaced&) {
+        return true;
     } catch (const Shader::Exception& error) {
         static std::unordered_set<std::string> logged;
         if (logged.insert(error.what()).second) {
@@ -585,6 +593,108 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
                  static_cast<u32>(tic.g_type.Value()), static_cast<u32>(tic.b_type.Value()),
                  static_cast<u32>(tic.a_type.Value()));
     }
+}
+
+std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) const {
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < offset + 4 ||
+        !memory_manager.IsFullyMappedRange(cbuf_address + offset, 4)) {
+        return std::nullopt;
+    }
+    const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+    if (tic_index > regs.tic.limit ||
+        !memory_manager.IsFullyMappedRange(regs.tic.Address() +
+                                               u64{tic_index} * sizeof(Texture::TICEntry),
+                                           sizeof(Texture::TICEntry))) {
+        return std::nullopt;
+    }
+    return GetTICEntry(tic_index);
+}
+
+bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key, bool uses_hmma) {
+    using namespace VideoCommon::OotNetwork;
+    if (!BypassEnabled(program_id)) {
+        return false;
+    }
+    if (std::getenv("EDEN_OOT_NETWORK_TRACE")) {
+        // Each compute program once: its key, tensor use, grid and the images constant buffer 0
+        // names (to re-derive the output pass after a game update).
+        static std::mutex trace_mutex;
+        static std::unordered_set<u64> traced;
+        std::scoped_lock lock{trace_mutex};
+        if (traced.insert(native_key).second) {
+            const auto& cbuf = launch_description.const_buffer_config[0];
+            std::string handles;
+            for (u32 offset = 0; offset + 4 <= std::min<u32>(cbuf.size.Value(), 0x800); offset += 4) {
+                if (const auto tic = ConstBuffer0Image(offset);
+                    tic && tic->Address() != 0 && tic->Width() >= 64 && tic->Height() >= 64) {
+                    handles += fmt::format(" @{:#x}={:#x}/{}x{}/f{:#x}", offset, tic->Address(), tic->Width(),
+                                           tic->Height(), static_cast<u32>(tic->format.Value()));
+                }
+            }
+            std::fprintf(stderr, "OOT_TRACE program %016llx hmma %d grid %ux%ux%u:%s\n",
+                         static_cast<unsigned long long>(native_key), static_cast<int>(uses_hmma),
+                         static_cast<unsigned>(launch_description.grid_dim_x.Value()),
+                         static_cast<unsigned>(launch_description.grid_dim_y.Value()),
+                         static_cast<unsigned>(launch_description.grid_dim_z.Value()), handles.c_str());
+        }
+    }
+    if (native_key != OutputProgramKey) {
+        // A pass of the network: skipped while the output pass is being replaced. Other tensor
+        // programs (gameplay has one) are not the network's and run.
+        return uses_hmma && IsNetworkPass(native_key) &&
+               output_replaced.load(std::memory_order_relaxed);
+    }
+    const auto input = ConstBuffer0Image(TonemappedHandleOffset);
+    const auto output = ConstBuffer0Image(OutputHandleOffset);
+    if (!input || !output || input->format != Texture::TextureFormat::A8B8G8R8 ||
+        output->format != input->format || input->Address() == 0 || output->Address() == 0 ||
+        input->Address() == output->Address() || !input->IsBlockLinear() || !output->IsBlockLinear() ||
+        output->Width() < input->Width() || output->Height() < input->Height()) {
+        output_replaced.store(false, std::memory_order_relaxed);
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            LOG_WARNING(HW_GPU, "Ocarina of Time: unexpected anti-aliasing images; the game's network runs");
+        }
+        return false;
+    }
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::A8B8G8R8_UNORM;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    const Fermi2D::Config config{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Bilinear,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = static_cast<s32>(output->Width()),
+        .dst_y1 = static_cast<s32>(output->Height()),
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = static_cast<s32>(input->Width()),
+        .src_y1 = static_cast<s32>(input->Height()),
+    };
+    const bool copied = rasterizer->AccelerateSurfaceCopy(surface(*input), surface(*output), config);
+    output_replaced.store(copied, std::memory_order_relaxed);
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(HW_GPU, "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} {}x{} -> {:#x} {}x{}",
+                 copied ? "upscale of the tonemapped image" : "upscale failed", input->Address(),
+                 input->Width(), input->Height(), output->Address(), output->Width(), output->Height());
+    }
+    return copied;
 }
 
 std::atomic<u32> g_nx2_trace_draws_after_upscale{};
@@ -775,6 +885,79 @@ struct KeplerCompute::FrontState {
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
 };
 
+namespace {
+// The front's copy of the QMD scheduling (one for every channel, as the back's).
+NativeQmdScheduler& FrontQmdScheduler() {
+    static NativeQmdScheduler scheduler = [] {
+        NativeQmdScheduler own;
+        own.UseOwnTable();
+        return own;
+    }();
+    return scheduler;
+}
+} // Anonymous namespace
+
+// Split GPU thread: the front runs the QMD scheduling the back will run (the same scheduler on
+// the same QMDs, in a copy of its own, dispatching nothing) to learn which semaphores the back's
+// QMD releases will write, and where in what it was sent (GpuSplit::NotePending). An acquire on
+// one meets the value the front's copy read (NoteRelease, NoteAdd, NoteLowerBound) or, failing
+// that, waits only for the back to get that far, not for it to run everything (Drain). The front
+// reads each QMD when its copy runs it, as the back does (the SDK patches payloads while a QMD
+// waits). Called after the method is sent. As ProcessNativeMethod's 0x107 (inline QMD) and
+// 0xae-0xb0 (QMD control).
+void KeplerCompute::FrontQmd(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 argument) {
+    if (method != 0x107 && method != 0xae && method != 0xaf && method != 0xb0) {
+        return;
+    }
+    using Descriptor = NativeQmdScheduler::Descriptor;
+    std::optional<Descriptor> inline_qmd;
+    GPUVAddr qmd_address{};
+    u32 action = argument;
+    if (method == 0x107) {
+        qmd_address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+        if (!(fs.registers[0xa7] & (1U << 24)) && (fs.registers[0xcc] & (1U << 12))) {
+            return;
+        }
+        if (!memory_manager.IsFullyMappedRange(qmd_address, 256)) {
+            return;
+        }
+        inline_qmd.emplace();
+        std::copy_n(fs.registers.begin() + 0xc8, inline_qmd->size(), inline_qmd->begin());
+        action = 3;
+    } else {
+        qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
+        if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+            (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
+            return;
+        }
+    }
+    const u64 space = u64{memory_manager.GetID()} << 48;
+    static_cast<void>(FrontQmdScheduler().Signal(
+        qmd_address, action,
+        [&](u64 address, Descriptor& descriptor) {
+            if (inline_qmd && address == qmd_address) {
+                descriptor = *inline_qmd;
+                return true;
+            }
+            if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
+            memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+            return true;
+        },
+        [&](u64 address, u32 payload, u32 flags) {
+            if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+            split.NotePending(space | address);
+            if (flags & (1U << 26)) {
+                split.NoteAdd(space | address, payload);
+            } else if (flags & (1U << 19)) {
+                split.NoteLowerBound(space | address, payload);
+            } else {
+                split.NoteRelease(space | address, payload);
+            }
+            return true;
+        },
+        [](const Descriptor&) { return true; }));
+}
+
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
         // Copy the back's state and take the macros over while it is idle.
@@ -862,6 +1045,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    FrontQmd(split, fs, method, argument);
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -880,6 +1064,11 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    if (method < fs.registers.size()) {
+        for (u32 i = 0; i < amount; ++i) {
+            FrontQmd(split, fs, method, base_start[i]);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -908,6 +1097,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             }
             FrontApply(fs, address, value);
             split.MacroWrite(this, address, value);
+            FrontQmd(split, fs, address, value);
             return true;
         });
     if (!result.success) {

@@ -15,6 +15,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/readback_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -60,7 +61,7 @@ size_t BytesPerIndex(VkIndexType index_type) {
 }
 
 vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
-                        VkDeviceSize sparse_alignment) {
+                        VkDeviceSize sparse_alignment, MemoryUsage usage = MemoryUsage::DeviceLocal) {
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -89,7 +90,7 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
-    return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+    return memory_allocator.CreateBuffer(buffer_ci, usage);
 }
 } // Anonymous namespace
 
@@ -110,16 +111,57 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
                bool sparse_compatible_)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
       scheduler{&runtime.scheduler},
-      buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
-                          runtime.SparseAlignmentFor(sparse_compatible_))},
       tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
+    readback_runtime = &runtime;
+    const bool wanted = runtime.mapped_readback_policy.Wants(CpuAddr(), SizeBytes(), sparse_compatible);
+    readback_lease = runtime.mapped_readback_policy.Reserve(CpuAddr(), SizeBytes(), sparse_compatible);
+    if (readback_lease) {
+        try {
+            buffer = CreateBuffer(*device, runtime.memory_allocator, SizeBytes(), 1, MemoryUsage::Download);
+            const auto properties = device->GetPhysical().GetMemoryProperties().memoryProperties;
+            const auto flags = properties.memoryTypes[buffer.Location().memory_type].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)
+                readback_mapping = buffer.TryMapForReadback(SizeBytes());
+        } catch (const vk::Exception& error) {
+            if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) throw;
+        }
+    }
+    if (readback_mapping.empty()) {
+        buffer = {};
+        readback_lease.reset();
+        readback_promotion_failed = wanted;
+        buffer = CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
+                              runtime.SparseAlignmentFor(sparse_compatible));
+    } else {
+        // Register before initialization/copy commands so a mapped allocation never
+        // infers a producer from writes that preceded its tracking lifetime.
+        readback_writes = runtime.readback_writers.Register(Handle(), SizeBytes(), false);
+        scheduler->EnableHostReadbackVisibility();
+        std::fprintf(stderr, "MKW_MAPPED_BUFFER base=%llx size=%llu type=%u pool=%llu\n",
+            static_cast<unsigned long long>(CpuAddr()), static_cast<unsigned long long>(SizeBytes()),
+            buffer.Location().memory_type, static_cast<unsigned long long>(runtime.mapped_readback_policy.Used()));
+    }
+
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
     }
     if (device->IsBufferDeviceAddressSupported()) {
         device_address = device->GetLogical().GetBufferDeviceAddress(*buffer);
     }
+}
+
+std::optional<VideoCommon::ReadbackRangeTracker::Ticket> Buffer::ReadbackProducer(u64 offset, u64 size) const {
+    if (!readback_runtime || !readback_runtime->ReadbackTrackingEnabled()) return std::nullopt;
+    if (!readback_writes) {
+        // Admit buffers that are actually read repeatedly, not the first 256 GPU
+        // allocations. Prior writes stay unknown until a new writer is recorded.
+        if (readback_requests < 2) ++readback_requests;
+        if (readback_requests < 2) return std::nullopt;
+        readback_writes = readback_runtime->readback_writers.Register(Handle(), SizeBytes(), sparse_compatible);
+    }
+    return readback_writes ? readback_writes->Lookup(offset, size) : std::nullopt;
 }
 
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
@@ -360,6 +402,14 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
       staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
+      mapped_readback_policy([] {
+          const char* value = std::getenv("EDEN_PS5_MAPPED_READBACK");
+          return value && std::strcmp(value, "1") == 0;
+      }()),
+      readback_writers([] {
+          const char* value = std::getenv("EDEN_PS5_READBACK_PRODUCERS");
+          return value && std::strcmp(value, "1") == 0;
+      }()),
       multi_range_buffers(device_) {
     const VkDriverIdKHR driver_id = device.GetDriverID();
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
@@ -375,6 +425,122 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
+}
+
+namespace {
+class MappedVisibilityPass final : public ComputePass {
+    static constexpr std::array<VkDescriptorSetLayoutBinding, 2> Bindings{{
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}}};
+    static constexpr VkDescriptorUpdateTemplateEntry Update{
+        0, 0, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, sizeof(DescriptorUpdateEntry)};
+    static constexpr DescriptorBankInfo Bank{.storage_buffers = 2, .score = 2};
+public:
+    MappedVisibilityPass(const Device& dev, Scheduler& sched, DescriptorPool& pool)
+        : ComputePass(dev, sched, pool, Bindings, Update, Bank, {}, VULKAN_UINT8_COMP_SPV) {}
+    void Run(Scheduler& sched, ComputePassDescriptorQueue& queue,
+             VkBuffer input, VkBuffer output, u64 offset, u32 count) {
+        queue.Acquire(sched, 2);
+        queue.AddBuffer(input, 0, count);
+        queue.AddBuffer(output, offset, count * sizeof(u16));
+        const void* descriptors = queue.UpdateData();
+        sched.RequestOutsideRenderPassOperationContext();
+        sched.Record([this, descriptors, count](vk::CommandBuffer cmd) {
+            const VkMemoryBarrier input_ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, input_ready);
+            const VkDescriptorSet set = descriptor_allocator.Commit();
+            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
+            cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+            cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+            cmd.Dispatch((count + 1023) / 1024, 1, 1);
+        });
+    }
+};
+}
+
+// Diagnostic visibility test; no guest RAM is imported or remapped.
+void BufferCacheRuntime::ProbeMappedReadback(DescriptorPool& pool, ComputePassDescriptorQueue& queue) {
+    const char* option = std::getenv("EDEN_PS5_MAPPED_READBACK_PROBE");
+    if (!option || std::strcmp(option, "1") != 0) return;
+    MappedVisibilityPass compute{device, scheduler, pool};
+    u64 checked{}, failures{}, buffers{}, skipped{};
+    for (const u64 bytes : {65536ULL, 2097152ULL}) {
+        auto source = CreateBuffer(device, memory_allocator, bytes, 1);
+        auto later = CreateBuffer(device, memory_allocator, bytes, 1);
+        auto mapped = source.TryMapForReadback(bytes);
+        const auto props = device.GetPhysical().GetMemoryProperties().memoryProperties;
+        std::printf("MKW_MAPPED_ALLOCATION default_type=%u flags=%u mapped=%zu\n",
+            source.Location().memory_type, props.memoryTypes[source.Location().memory_type].propertyFlags,
+            mapped.size());
+        if (mapped.empty()) {
+            source = CreateBuffer(device, memory_allocator, bytes, 1, MemoryUsage::Download);
+            mapped = source.TryMapForReadback(bytes);
+            std::printf("MKW_MAPPED_ALLOCATION host_type=%u flags=%u mapped=%zu\n",
+                source.Location().memory_type, props.memoryTypes[source.Location().memory_type].propertyFlags,
+                mapped.size());
+        }
+        if (mapped.empty()) { ++skipped; continue; }
+        ++buffers;
+        std::vector<u32> expected(bytes / sizeof(u32), 0);
+        ClearBuffer(*source, 0, bytes, 0);
+        scheduler.Finish();
+        for (u32 pass = 0; pass < 16; ++pass) {
+            // Prime CPU cache lines with the previous completed contents.
+            u64 warm{};
+            for (u64 at = 0; at < bytes; at += 64)
+                warm += *reinterpret_cast<const volatile u32*>(mapped.data() + at);
+            const u64 offset = (pass % 4) * (bytes / 4);
+            const u64 length = bytes / 4;
+            const bool shader = (pass & 1) != 0;
+            const u32 value = pass + 1;
+            const u32 pattern = shader ? (value | (value << 16)) : (0xa5a50000U ^ (pass * 0x10203U));
+            if (shader) {
+                ClearBuffer(*later, 0, length / 2, value * 0x01010101U);
+                compute.Run(scheduler, queue, *later, *source, offset, static_cast<u32>(length / 2));
+            } else {
+                ClearBuffer(*source, static_cast<u32>(offset), length, pattern);
+            }
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                      VK_PIPELINE_STAGE_HOST_BIT, 0, barrier);
+            });
+            const u64 producer = scheduler.Flush();
+            // Keep later unrelated work in the next submission. Waiting for the
+            // producer must not submit this newer command buffer.
+            const u64 later_tick = scheduler.CurrentTick();
+            ClearBuffer(*later, 0, 65536, pattern ^ 0xffffffffU);
+            scheduler.Wait(producer);
+            if (scheduler.CurrentTick() != later_tick) ++failures;
+            std::fill_n(expected.begin() + offset / 4, length / 4, pattern);
+            for (u64 word = 0; word < bytes / 4; ++word) {
+                const u32 actual = reinterpret_cast<const volatile u32*>(mapped.data())[word];
+                failures += actual != expected[word];
+                ++checked;
+            }
+            // Independent staging comparison is validation overhead only.
+            auto staging = DownloadStagingBuffer(bytes);
+            const VideoCommon::BufferCopy copy{0, staging.offset, bytes};
+            CopyBuffer(staging.buffer, *source, std::span{&copy, 1}, true);
+            scheduler.Finish();
+            for (u64 word = 0; word < bytes / 4; ++word) {
+                u32 actual{};
+                std::memcpy(&actual, staging.mapped_span.data() + word * 4, 4);
+                failures += actual != expected[word];
+                ++checked;
+            }
+            std::printf("MKW_MAPPED_PROBE size=%llu pass=%u shader=%u producer=%llu later=%llu warm=%llu failures=%llu\n",
+                static_cast<unsigned long long>(bytes), pass, unsigned(shader),
+                static_cast<unsigned long long>(producer), static_cast<unsigned long long>(later_tick),
+                static_cast<unsigned long long>(warm), static_cast<unsigned long long>(failures));
+        }
+    }
+    std::printf("MKW_MAPPED_PROBE_RESULT buffers=%llu skipped=%llu checked=%llu failures=%llu\n",
+        static_cast<unsigned long long>(buffers), static_cast<unsigned long long>(skipped),
+        static_cast<unsigned long long>(checked), static_cast<unsigned long long>(failures));
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
@@ -420,6 +586,7 @@ u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
 }
 
 void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
+    readback_writers.Prune();
     for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
         if (scheduler.IsFree(it->LastUsageTick())) {
             it->ResetUsageTracking();
@@ -455,6 +622,57 @@ bool BufferCacheRuntime::BindSmallUniformReusing(
     guest_descriptor_queue.AddBuffer(slot.ref.buffer, slot.ref.device_address,
                                     static_cast<u32>(slot.ref.offset), size);
     return true;
+}
+
+extern "C" unsigned eden_mapped_readback_mode() __attribute__((weak));
+extern "C" void eden_mapped_readback_result(u64, u64, u64) __attribute__((weak));
+extern "C" void eden_mapped_readback_reject(unsigned) __attribute__((weak));
+
+unsigned BufferCacheRuntime::MappedReadbackMode() const {
+    return mapped_readback_failed || !eden_mapped_readback_mode ? 0 : eden_mapped_readback_mode();
+}
+
+bool BufferCacheRuntime::NeedsReadbackPromotion(const Buffer& buffer) {
+    if (buffer.IsSparseCompatible() || buffer.readback_promotion_failed ||
+        !buffer.readback_mapping.empty() || buffer.readback_requests < 2 ||
+        !ReadbackTrackingEnabled()) return false;
+    return mapped_readback_policy.Prefer(buffer.CpuAddr(), buffer.SizeBytes());
+}
+
+std::span<const u8> BufferCacheRuntime::TryMappedReadback(
+    const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) {
+    const auto reject = [](unsigned reason) -> std::span<const u8> {
+        if (eden_mapped_readback_reject) eden_mapped_readback_reject(reason);
+        return {};
+    };
+    if (!MappedReadbackMode()) return {};
+    if (buffer.IsSparseCompatible() || buffer.readback_mapping.empty() ||
+        !buffer.readback_writes || copies.empty()) return reject(0);
+    if (buffer.readback_writes->external_writer) return reject(1);
+    for (const auto& copy : copies) {
+        const auto ticket = buffer.readback_writes->Lookup(copy.src_offset, copy.size);
+        if (!ticket) return reject(2);
+        if (!scheduler.IsFree(ticket->producer)) return reject(3);
+    }
+    // No wait or submission here: all known producers are already complete. The
+    // GPU/cache owner prevents recording a newer writer during immediate copying.
+    return buffer.readback_mapping;
+}
+
+void BufferCacheRuntime::ValidateMappedReadback(std::span<const u8> expected,
+                                               std::span<const u8> actual) {
+    const bool mismatch = expected.size() != actual.size() ||
+                          !std::equal(expected.begin(), expected.end(), actual.begin());
+    mapped_readback_failed |= mismatch;
+    if (eden_mapped_readback_result) eden_mapped_readback_result(0, expected.size(), mismatch);
+}
+
+void BufferCacheRuntime::RecordDirectReadback(u64 bytes) {
+    if (eden_mapped_readback_result) eden_mapped_readback_result(bytes, 0, 0);
+}
+
+void BufferCacheRuntime::CompleteReadbackWriteBatch() {
+    readback_writers.CompleteBatch(scheduler.CurrentTick());
 }
 
 u64 BufferCacheRuntime::CurrentTick() {
@@ -514,6 +732,8 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });
+        for (const auto& copy : copies)
+            readback_writers.TransferWrite(dst_buffer, copy.dst_offset, copy.size, scheduler.CurrentTick(), true);
         return;
     }
 
@@ -529,6 +749,9 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, WRITE_BARRIER);
         }
     });
+    for (const auto& copy : copies)
+        readback_writers.TransferWrite(dst_buffer, copy.dst_offset, copy.size, scheduler.CurrentTick(), false);
+
 }
 
 void BufferCacheRuntime::PreCopyBarrier() {
@@ -584,6 +807,8 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                0, WRITE_BARRIER);
     });
+    readback_writers.TransferWrite(dest_buffer, offset, size, scheduler.CurrentTick(), false);
+
 }
 
 bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {

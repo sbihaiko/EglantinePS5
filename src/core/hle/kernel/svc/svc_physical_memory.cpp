@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/hle/kernel/svc/svc_memory_stats.h"
 #include <cstdlib>
 
 #include "core/core.h"
@@ -14,6 +15,7 @@ namespace Kernel::Svc {
 
 /// Set the process heap to a given Size. It can both extend and shrink the heap.
 Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
+    MemoryStats::Note(MemoryStats::SetHeapSize, size, true);
     LOG_TRACE(Kernel_SVC, "called, heap_size={:#x}", size);
 
     auto& process = GetCurrentProcess(system.Kernel());
@@ -29,11 +31,18 @@ Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
 
     // We succeeded.
     *out_address = GetInteger(address);
+    MemoryStats::LastHeapSize().store(size, std::memory_order_relaxed);
+    if (size > MemoryStats::LargestHeapSize().load(std::memory_order_relaxed)) {
+        MemoryStats::LargestHeapSize().store(size, std::memory_order_relaxed);
+        LOG_INFO(Kernel_SVC, "SetHeapSize: the heap grows to {} MiB at {:#x}", size >> 20,
+                 GetInteger(address));
+    }
     R_SUCCEED();
 }
 
 /// Maps memory at a desired address
 Result MapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
+    MemoryStats::Note(MemoryStats::MapPhysicalMemory, size, true);
     LOG_DEBUG(Kernel_SVC, "called, addr={:#016x}, size={:#x}", addr, size);
 
     if (!Common::IsAligned(addr, Core::Memory::YUZU_PAGESIZE)) {
@@ -83,6 +92,7 @@ Result MapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
 
 /// Unmaps memory previously mapped via MapPhysicalMemory
 Result UnmapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
+    MemoryStats::Note(MemoryStats::UnmapPhysicalMemory, size, true);
     LOG_DEBUG(Kernel_SVC, "called, addr={:#016x}, size={:#x}", addr, size);
 
     if (!Common::IsAligned(addr, Core::Memory::YUZU_PAGESIZE)) {

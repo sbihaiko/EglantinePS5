@@ -5,10 +5,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/join_whole_copy.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/fibers.cpp
+    common/host_command_completion.cpp
+    common/host_command_queue.cpp
     common/host_memory.cpp
     common/host_memory_fallback.cpp
     common/param_package.cpp
@@ -29,32 +32,26 @@ add_executable(tests
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
     video_core/memory_budget.cpp
+    video_core/nx2_layer_upload.cpp
+    video_core/gob_copy.cpp
+    video_core/partial_download.cpp
+    video_core/query_region_visit.cpp
     video_core/astc_recompression_override.cpp
     video_core/nx2_video_configuration.cpp
     video_core/nx2_decoder_image.cpp
     video_core/nx2_present.cpp
     video_core/nx2_gpu_mappings.cpp
     video_core/nx2_sparse_mappings.cpp
+    video_core/nx2_image_written_pages.cpp
     video_core/nx2_sparse_region.cpp
     video_core/nx2_command_sync.cpp
     video_core/nx2_command_ranges.cpp
     video_core/physical_alias.cpp
     video_core/ampere_returns.cpp
+    video_core/ampere_call_noinc_loop_exit.cpp
+    video_core/ampere_pokopia_compute.cpp
     video_core/ampere_f2i.cpp
-    video_core/compute_storage_buffers.cpp
-    video_core/cooperative_matrix.cpp
-    video_core/ampere_kirby.cpp
-    video_core/ampere_geometry.cpp
-    video_core/ampere_geometry_lowering.cpp
-    video_core/ampere_geometry_exit.cpp
-    video_core/ampere_uniform_lea.cpp
-    video_core/ampere_integer_multiply.cpp
-    video_core/ampere_program_override.cpp
-    video_core/x8d24_conversion.cpp
-    video_core/ampere_bindless_tex.cpp
-    video_core/ampere_sured.cpp
-    video_core/ampere_release_guards.cpp
-    video_core/ampere_release_f2i.cpp
+    video_core/stale_pages.cpp
     input_common/calibration_configuration_job.cpp
 )
 

@@ -245,6 +245,9 @@ public:
     std::array<ParsedEntry, 64> parsed_entries{};
     size_t parsed_entry_count{};
     std::vector<ParkedMethod> parked_methods;
+    /// Entries of a new channel still read only after the split's back ran the last queued
+    /// writer (see Step).
+    u32 unsynced_first_entries = 8;
     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};

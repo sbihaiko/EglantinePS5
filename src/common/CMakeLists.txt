@@ -68,6 +68,7 @@ add_library(
     hex_util.cpp
     hex_util.h
     host_memory.cpp
+    host_command_queue.h
     host_memory.h
     input.h
     intrusive_red_black_tree.h

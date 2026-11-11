@@ -12,6 +12,8 @@
 
 #include "common/common_types.h"
 
+extern "C" bool eden_mapping_window_enabled() __attribute__((weak));
+
 namespace Service::Nvidia::Devices {
 
 class Nx2GpuMappingTable {
@@ -72,23 +74,25 @@ public:
                 return {};
             }
         }
-        const auto before = Effective();
+        const bool window = !eden_mapping_window_enabled || eden_mapping_window_enabled();
+        const auto before = window ? EffectiveWindow(gpu, size) : Effective();
         Trim(gpu, size);
         const auto position = std::upper_bound(mappings.begin(), mappings.end(), gpu,
                                                [](u64 address, const Range& range) {
             return address < range.gpu;
         });
         mappings.insert(position, {gpu, cpu, size});
-        return {true, 0, Difference(before)};
+        return {true, 0, Difference(before, gpu, size, window)};
     }
 
     Update Unmap(u64 gpu, u64 size) {
         if (!Valid(gpu, size)) {
             return {};
         }
-        const auto before = Effective();
+        const bool window = !eden_mapping_window_enabled || eden_mapping_window_enabled();
+        const auto before = window ? EffectiveWindow(gpu, size) : Effective();
         Trim(gpu, size);
-        return {true, 0, Difference(before)};
+        return {true, 0, Difference(before, gpu, size, window)};
     }
 
     Update Acquire(u64 address, u64 size) {
@@ -100,19 +104,22 @@ public:
                 return {};
             }
         }
-        const auto before = Effective();
+        const bool window = !eden_mapping_window_enabled || eden_mapping_window_enabled();
+        const auto before = window ? EffectiveWindow(address, size) : Effective();
         const u64 id = next_lease++;
         leases.emplace(id, Range{address, address, size});
-        return {true, id, Difference(before)};
+        return {true, id, Difference(before, address, size, window)};
     }
 
     Update Release(u64 id) {
         if (!leases.contains(id)) {
             return {};
         }
-        const auto before = Effective();
+        const auto region = leases.at(id);
+        const bool window = !eden_mapping_window_enabled || eden_mapping_window_enabled();
+        const auto before = window ? EffectiveWindow(region.gpu, region.size) : Effective();
         leases.erase(id);
-        return {true, 0, Difference(before)};
+        return {true, 0, Difference(before, region.gpu, region.size, window)};
     }
 
     bool UsesBacking(u64 cpu, u64 size) const {
@@ -201,8 +208,33 @@ private:
         return std::nullopt;
     }
 
-    std::vector<Change> Difference(const std::vector<Range>& before) const {
-        const auto after = Effective();
+    // A single mutation cannot change an effective mapping outside its input range.
+    std::vector<Range> EffectiveWindow(u64 gpu, u64 size) const {
+        const u64 end = gpu + size;
+        std::vector<u64> boundaries{gpu, end};
+        const auto add = [&](const Range& range) {
+            if (!Overlaps(gpu, size, range.gpu, range.size)) return;
+            boundaries.push_back(std::max(gpu, range.gpu));
+            boundaries.push_back(std::min(end, range.gpu + range.size));
+        };
+        for (const auto& range : mappings) add(range);
+        for (const auto& [id, range] : leases) add(range);
+        Sort(boundaries);
+        std::vector<Range> result;
+        for (size_t i = 1; i < boundaries.size(); ++i) {
+            const auto start = boundaries[i-1];
+            if (const auto cpu = Lookup(start)) {
+                const auto span = boundaries[i]-start;
+                if (!result.empty() && result.back().gpu+result.back().size==start &&
+                    result.back().cpu+result.back().size==*cpu) result.back().size+=span;
+                else result.push_back({start,*cpu,span});
+            }
+        }
+        return result;
+    }
+
+    std::vector<Change> Difference(const std::vector<Range>& before, u64 gpu, u64 size, bool window) const {
+        const auto after = window ? EffectiveWindow(gpu, size) : Effective();
         std::vector<u64> boundaries;
         for (const auto* ranges : {&before, &after}) {
             for (const auto& range : *ranges) {

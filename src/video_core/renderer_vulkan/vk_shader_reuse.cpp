@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/assert.h"
@@ -39,6 +40,10 @@ u32 TranslationReads::Ask(Shader::Environment& env, Query query, u32 arg0, u32 a
     }
     case Query::HasHLEMacroState:
         return env.HasHLEMacroState() ? 1 : 0;
+    case Query::StorageBufferPointer:
+        return env.IsCbufStorageBufferPointer(arg0, arg1) ? 1 : 0;
+    case Query::IndirectStorageBufferPointer:
+        return env.IsCbufIndirectStorageBufferPointer(arg0 & 0xff, arg1, arg0 >> 8) ? 1 : 0;
     }
     UNREACHABLE_MSG("Unknown environment query {}", static_cast<u32>(query));
 }
@@ -49,6 +54,11 @@ TranslationReads::Properties TranslationReads::PropertiesOf(const Shader::Enviro
     // Only geometry programs read the passthrough mask, and only theirs is in the disk cache.
     if (env.ShaderStage() == Shader::Stage::Geometry) {
         result.gp_passthrough_mask = env.GpPassthroughMask();
+    }
+    if (env.ShaderStage() == Shader::Stage::Task || env.ShaderStage() == Shader::Stage::Mesh) {
+        result.mesh_registers = env.MeshRegisters();
+        std::memcpy(result.mesh_primitive_header.data(), &env.MeshPrimitiveHeader(),
+                    sizeof(result.mesh_primitive_header));
     }
     result.workgroup_size = env.WorkgroupSize();
     result.stage = env.ShaderStage();
@@ -91,6 +101,8 @@ RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_) : inner{
     // Shader::Environment's own accessors read these members.
     sph = inner->SPH();
     gp_passthrough_mask = inner->GpPassthroughMask();
+    mesh_registers = inner->MeshRegisters();
+    mesh_primitive_header = inner->MeshPrimitiveHeader();
     stage = inner->ShaderStage();
     start_address = inner->StartAddress();
     is_proprietary_driver = inner->IsProprietaryDriver();
@@ -109,6 +121,25 @@ u32 RecordingEnvironment::TranslateProgramAddress(u32 address) const {
 
 u32 RecordingEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     return AskAndRecord(TranslationReads::Query::CbufValue, cbuf_index, cbuf_offset);
+}
+
+// Whether the program is native and its key are the program's, like its code: not recorded.
+bool RecordingEnvironment::IsNativeProgram() const {
+    return inner->IsNativeProgram();
+}
+
+u64 RecordingEnvironment::NativeProgramKey() const {
+    return inner->NativeProgramKey();
+}
+
+bool RecordingEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    return AskAndRecord(TranslationReads::Query::StorageBufferPointer, index, offset) != 0;
+}
+
+bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                              u32 indirect) {
+    return AskAndRecord(TranslationReads::Query::IndirectStorageBufferPointer,
+                        (index & 0xff) | (indirect << 8), offset) != 0;
 }
 
 Shader::TextureType RecordingEnvironment::ReadTextureType(u32 raw_handle) {
@@ -234,8 +265,27 @@ void ShaderReuseCache::Add(const ShaderTranslationKey& key,
     const bool known{std::ranges::any_of(variants, [&shaders](const auto& variant) {
         return variant->reads == shaders->reads;
     })};
-    if (!known) {
-        variants.push_back(std::move(shaders));
+    if (known) {
+        return;
+    }
+    if (variants.empty()) {
+        order.push_back(key);
+    }
+    total_bytes += shaders->code_bytes;
+    variants.push_back(std::move(shaders));
+    static const size_t budget = [] {
+        const char* value = std::getenv("EDEN_NX2_SHADER_REUSE_MIB");
+        return static_cast<size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 32) << 20;
+    }();
+    while (total_bytes > budget && order.size() > 1) {
+        const ShaderTranslationKey oldest{order.front()};
+        order.pop_front();
+        if (const auto it{entries.find(oldest)}; it != entries.end()) {
+            for (const auto& variant : it->second) {
+                total_bytes -= (std::min)(total_bytes, variant->code_bytes);
+            }
+            entries.erase(it);
+        }
     }
 }
 

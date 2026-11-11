@@ -83,16 +83,18 @@ size_t KSystemControl::Init::GetRealMemorySize() {
 
 // Initialization.
 size_t KSystemControl::Init::GetIntendedMemorySize() {
+    // A Switch 2 program keeps its graphics server region whatever layout it runs with.
+    const size_t graphics_server = Settings::CurrentProgramIsSwitch2() ? KSystemControl::Nx2GraphicsServerMemorySize : 0;
     switch (GetMemorySizeForInit()) {
     case Smc::MemorySize_4GB:
     default: // All invalid modes should go to 4GB.
-        return 4_GiB;
+        return 4_GiB + graphics_server;
     case Smc::MemorySize_6GB:
-        return 6_GiB;
+        return 6_GiB + graphics_server;
     case Smc::MemorySize_8GB:
-        return 8_GiB;
+        return 8_GiB + graphics_server;
     case Smc::MemorySize_10GB:
-        return 10_GiB;
+        return 10_GiB + graphics_server;
     case Smc::MemorySize_12GB:
         return 12_GiB + KSystemControl::Nx2GraphicsServerMemorySize;
     }

@@ -57,6 +57,12 @@ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
 
 class KeplerCompute final : public EngineInterface {
 public:
+    /// Ocarina of Time with its anti-aliasing bypass on (oot_network.h): true when this dispatch
+    /// of the game's network is skipped, or its output pass replaced by a copy of the tonemapped
+    /// image. Only during a native dispatch.
+    bool BypassOotNetwork(u64 program_id, u64 native_key, bool uses_hmma = false);
+    bool InNativeDispatch() const { return in_native_dispatch; }
+
     explicit KeplerCompute(MemoryManager& memory_manager);
     ~KeplerCompute();
 
@@ -257,6 +263,7 @@ private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontQmd(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
@@ -266,6 +273,8 @@ private:
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
+    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     bool UpscaleInsteadOfNativeProgram();
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
@@ -310,6 +319,7 @@ private:
     };
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
+    bool in_native_dispatch = false;
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

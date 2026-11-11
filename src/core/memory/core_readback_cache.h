@@ -20,6 +20,23 @@ public:
         return enabled;
     }
 
+    struct ReadRange { DAddr address; u64 size; };
+    // A certificate covers a physical page, so establish that page with one ordered read.
+    // Mapping/owner validation is independent of the CPU JIT's fastmem access mode.
+    static ReadRange OrderedRange(HostReadbackCache::Page page, size_t aliases,
+                                 DAddr address, u64 size) {
+        const u64 offset = address & YUZU_PAGEMASK;
+        if (page.owner == nullptr || page.owner_instance == 0 || page.host_page == nullptr ||
+            aliases != 1 || page.device_page == 0 ||
+            (page.device_page & YUZU_PAGEMASK) != 0 ||
+            page.device_page > ~u64{0} - YUZU_PAGESIZE ||
+            address < page.device_page || address - page.device_page != offset ||
+            !HostReadbackCache::FitsInPage(offset, size)) {
+            return {address, size};
+        }
+        return {page.device_page, YUZU_PAGESIZE};
+    }
+
     bool CanReuse(HostReadbackCache::Page page, size_t aliases, u64 generation,
                   u64 offset, size_t size) {
         if (page.owner == nullptr || aliases != 1 || generation == 0 ||

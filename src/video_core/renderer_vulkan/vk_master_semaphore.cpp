@@ -1,3 +1,6 @@
+#include <atomic>
+#include "common/cpu_features.h"
+#include "video_core/nx2_loading_probe.h"
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -13,6 +16,15 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+std::atomic<u64> mkw_master_wait_ns{}, mkw_master_wait_calls{};
+struct MkwMasterTimer {
+    std::chrono::nanoseconds start = Common::g_wall_clock.GetTimeNS();
+    ~MkwMasterTimer() {
+        mkw_master_wait_ns.fetch_add((Common::g_wall_clock.GetTimeNS() - start).count(), std::memory_order_relaxed);
+        mkw_master_wait_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+};
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
@@ -77,6 +89,7 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(u64 tick) {
+    MkwMasterTimer mkw_timer;
     if (!semaphore) {
         // Fast check: already reached the requested tick?
         if (gpu_tick.load(std::memory_order_acquire) >= tick) {
@@ -104,21 +117,23 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    VideoCommon::LoadingProbe::wait.Mark("timeline wait", tick);
     while (!semaphore.Wait(tick)) {
     }
 
+    VideoCommon::LoadingProbe::wait.Mark("timeline wait done", tick);
     Refresh();
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
-    if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
-    } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
-    }
+    VideoCommon::LoadingProbe::queue.Mark("queue submit", host_tick);
+    const VkResult result = semaphore
+        ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick)
+        : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+    VideoCommon::LoadingProbe::queue.Mark("queue submit done", host_tick);
+    return result;
 }
 
 static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |

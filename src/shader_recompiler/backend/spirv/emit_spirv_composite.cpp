@@ -115,27 +115,27 @@ Id EmitCompositeInsertF32x4(EmitContext& ctx, Id composite, Id object, u32 index
 }
 
 void EmitCompositeConstructF64x2(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitCompositeConstructF64x3(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitCompositeConstructF64x4(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitCompositeExtractF64x2(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitCompositeExtractF64x3(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitCompositeExtractF64x4(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitCompositeInsertF64x2(EmitContext& ctx, Id composite, Id object, u32 index) {

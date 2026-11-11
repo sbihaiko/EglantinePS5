@@ -143,6 +143,15 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
            Shader::NumDescriptors(info.image_descriptors);
 }
 
+// ALL_GRAPHICS is the legacy vertex/tessellation/geometry/fragment mask. Task and mesh
+// programs use the same rescaling/render-area push constants, when those stages are enabled.
+inline VkShaderStageFlags GraphicsPushConstantStages(const Device& device) {
+    return VK_SHADER_STAGE_ALL_GRAPHICS |
+           (device.IsExtMeshShaderSupported()
+                ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT
+                : 0U);
+}
+
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
@@ -248,7 +257,7 @@ public:
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
-                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
+                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : GraphicsPushConstantStages(*device)),
             .offset = 0,
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),

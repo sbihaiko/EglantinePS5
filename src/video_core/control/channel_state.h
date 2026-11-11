@@ -62,6 +62,9 @@ struct ChannelState {
     s32 bind_id = -1;
     u64 program_id = 0;
     bool initialized = false;
+    /// With the GPU thread split, the caches' per-channel state is set up by the GPU thread
+    /// (in order with the split's back), when it binds the channel.
+    bool rasterizer_pending = false;
 };
 
 } // namespace Control

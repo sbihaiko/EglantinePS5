@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
+#include <cstdio>
+#include <mutex>
+#include <unistd.h>
 #include <array>
 #include <bit>
 #include <limits>
@@ -20,13 +24,34 @@
 #include "common/logging.h"
 #include <ranges>
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/readback_diagnostics.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 
+// The guest memory service (PS5 port) gives memory back on demand: it packs guest memory the game
+// has not written for a while. Absent elsewhere. Returns the bytes it gave back.
+extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noexcept;
+
 namespace Vulkan {
+namespace {
+// Out of device memory: asks for memory back (`bytes` and a 64 MiB block more) and tries again, up
+// to three times. The pool the console shares with the guest's memory fills with cold guest
+// memory that can be packed; before this, the first failure ended the app.
+template <typename Create>
+VkResult RecoverDeviceMemory(VkResult result, VkDeviceSize bytes, Create&& create) {
+    for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && attempt < 3; ++attempt) {
+        if (&eden_memory_recover == nullptr ||
+            eden_memory_recover(static_cast<std::size_t>(bytes) + (std::size_t{64} << 20)) == 0)
+            break;
+        result = create();
+    }
+    return result;
+}
+} // namespace
+
 namespace {
 
 // Helpers translating MemoryUsage to flags/usage
@@ -206,6 +231,46 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
+void MemoryAllocator::DestroySparsePools() {
+    for (VmaPool& pool : sparse_pools) {
+        if (pool != VK_NULL_HANDLE) {
+            vmaDestroyPool(allocator, pool);
+            pool = VK_NULL_HANDLE;
+        }
+    }
+}
+
+VmaPool MemoryAllocator::SparsePool(u32 memory_type) const {
+    // Sparse image memory (tiles, layers, tails: ~1,400 pieces of 64 KiB and up in a race of
+    // title 1, Mario Kart World) gets blocks of its own. Mixed into the images' blocks, the pieces
+    // freed as tiles came and went kept those blocks alive: 553 MiB of them stood unused.
+    // EDEN_VMA_SPARSE_POOL=0 leaves it in the default pools.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_VMA_SPARSE_POOL");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || memory_type >= sparse_pools.size()) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lock{sparse_pool_mutex};
+    if (sparse_pools[memory_type] == VK_NULL_HANDLE) {
+        const VmaPoolCreateInfo pool_ci{
+            .memoryTypeIndex = memory_type,
+            .flags = 0,
+            .blockSize = VkDeviceSize{16} << 20,
+            .minBlockCount = 0,
+            .maxBlockCount = 0,
+            .priority = 0.f,
+            .minAllocationAlignment = 0,
+            .pMemoryAllocateNext = nullptr,
+        };
+        if (vmaCreatePool(allocator, &pool_ci, &sparse_pools[memory_type]) != VK_SUCCESS) {
+            sparse_pools[memory_type] = VK_NULL_HANDLE;
+        }
+    }
+    return sparse_pools[memory_type];
+}
+
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
@@ -229,7 +294,8 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // They take the unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28) && ci.samples == VK_SAMPLE_COUNT_1_BIT &&
-                      device.IsSparseResidencyImageSupported(ci.imageType);
+                      device.IsSparseResidencyImageSupported(ci.imageType) &&
+                      device.CanUseUnbackedSparseImages();
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -246,6 +312,10 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        const u64 estimate = texels * 8; // the request is not known before a failure; 8 bytes a texel
+        result = RecoverDeviceMemory(result, estimate, [&] {
+            return vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        });
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
@@ -258,6 +328,46 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                         ci.arrayLayers, static_cast<u32>(ci.format));
             return sparse;
+        }
+    }
+    // Temporary per-process allocation evidence, kept across the crash handler's restart.
+    if (VideoCommon::ReadbackDiagnostics::Enabled() &&
+        (result != VK_SUCCESS || alloc_info.size >= (8ULL << 20))) {
+        static std::mutex probe_mutex;
+        static unsigned probe_rows{};
+        std::lock_guard probe_lock{probe_mutex};
+        if (result != VK_SUCCESS || probe_rows < 8192) {
+            ++probe_rows;
+            VkMemoryRequirements requirements{};
+            if (result == VK_SUCCESS) {
+                requirements.size = alloc_info.size;
+            } else {
+                VkImage probe_image{};
+                const auto& dispatch = device.GetDispatchLoader();
+                if (dispatch.vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe_image) == VK_SUCCESS) {
+                    dispatch.vkGetImageMemoryRequirements(*device.GetLogical(), probe_image, &requirements);
+                    dispatch.vkDestroyImage(*device.GetLogical(), probe_image, nullptr);
+                }
+            }
+            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+            vmaGetHeapBudgets(allocator, budgets.data());
+            VmaTotalStatistics statistics{};
+            vmaCalculateStatistics(allocator, &statistics);
+            char path[160];
+            std::snprintf(path, sizeof(path), "/data/eglantineps5/logs/mkw-image-alloc-%d.tsv", getpid());
+            if (std::FILE* file = std::fopen(path, "a")) {
+                std::fprintf(file, "row=%u result=%d size=%ux%ux%u levels=%u layers=%u format=%u samples=%u usage=%x flags=%x requested=%llu alignment=%llu types=%x vma_blocks=%llu vma_allocated=%llu heap0_usage=%llu heap0_budget=%llu\n",
+                    probe_rows, static_cast<int>(result), ci.extent.width, ci.extent.height,
+                    ci.extent.depth, ci.mipLevels, ci.arrayLayers, static_cast<unsigned>(ci.format),
+                    static_cast<unsigned>(ci.samples), ci.usage, ci.flags,
+                    static_cast<unsigned long long>(requirements.size),
+                    static_cast<unsigned long long>(requirements.alignment), requirements.memoryTypeBits,
+                    static_cast<unsigned long long>(statistics.total.statistics.blockBytes),
+                    static_cast<unsigned long long>(statistics.total.statistics.allocationBytes),
+                    static_cast<unsigned long long>(budgets[0].usage),
+                    static_cast<unsigned long long>(budgets[0].budget));
+                std::fclose(file);
+            }
         }
     }
     if (result != VK_SUCCESS) {
@@ -282,7 +392,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci) const {
-    if (ci.samples != VK_SAMPLE_COUNT_1_BIT ||
+    if (!device.CanUseUnbackedSparseImages() || ci.samples != VK_SAMPLE_COUNT_1_BIT ||
         !device.IsSparseResidencyImageSupported(ci.imageType)) {
         return vk::Image{};
     }
@@ -312,6 +422,22 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     };
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
+    // From the sparse pool of the memory type the default pools would use; a piece the pool cannot
+    // hold (larger than its blocks, or no memory left) comes from the default pools as before.
+    u32 memory_type = 0;
+    if (vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
+        VK_SUCCESS) {
+        if (const VmaPool pool = SparsePool(memory_type); pool != VK_NULL_HANDLE) {
+            VmaAllocationCreateInfo pooled_ci = alloc_ci;
+            pooled_ci.pool = pool;
+            if (vmaAllocateMemory(allocator, &requirements, &pooled_ci, &allocation, &info) ==
+                VK_SUCCESS) {
+                memory = info.deviceMemory;
+                offset = info.offset;
+                return allocation;
+            }
+        }
+    }
     if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
@@ -356,6 +482,19 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         host_ci.preferredFlags = 0;
         host_ci.memoryTypeBits = 0;
         result = vmaCreateBuffer(allocator, &ci, &host_ci, &handle, &allocation, &alloc_info);
+        result = RecoverDeviceMemory(result, ci.size, [&] {
+            return vmaCreateBuffer(allocator, &ci, &host_ci, &handle, &allocation, &alloc_info);
+        });
+    }
+    if (VideoCommon::ReadbackDiagnostics::Enabled() &&
+        (ci.size >= (64ULL << 20) || result != VK_SUCCESS)) {
+        char path[160];
+        std::snprintf(path, sizeof(path), "/data/eglantineps5/logs/mkw-buffer-alloc-%d.tsv", getpid());
+        if (std::FILE* file = std::fopen(path, "a")) {
+            std::fprintf(file, "result=%d size=%llu memory_usage=%u flags=%x\n", int(result),
+                         static_cast<unsigned long long>(ci.size), unsigned(usage), ci.usage);
+            std::fclose(file);
+        }
     }
     vk::Check(result);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
@@ -460,6 +599,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
             ci3.preferredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             res = vmaAllocateMemory(allocator, &reqs, &ci3, &a, &info);
         }
+        res = RecoverDeviceMemory(res, reqs.size, [&] { return vmaAllocateMemory(allocator, &reqs, &ci2, &a, &info); });
     }
 
     vk::Check(res);

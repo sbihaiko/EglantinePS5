@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "tests/video_core/ampere_high_uniforms.h"
 
 namespace {
 using Shader::Ampere::Instruction;
@@ -116,10 +117,13 @@ TEST_CASE("Ampere unflushed truncating F2I rejects reserved fields and modes",
     invalid = RegisterTruncation;
     invalid[0].words = {0x00027d05, 5, 0x0020f000, 0x000e3000};
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
-    for (const u32 source : {28U, 62U, 64U}) {
-        invalid = RegisterTruncation;
-        invalid[0].words = {0x00027d05, source, 0x0820f000, 0x000e3000};
-        REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+    invalid = RegisterTruncation;
+    invalid[0].words = {0x00027d05, 64, 0x0820f000, 0x000e3000};
+    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+    for (const u32 source : {28U, 62U}) { // once unmapped: mirrored below R216
+        auto mirrored = RegisterTruncation;
+        mirrored[0].words = {0x00027d05, source, 0x0820f000, 0x000e3000};
+        RequireHighUniformMirror(mirrored, source);
     }
 }
 

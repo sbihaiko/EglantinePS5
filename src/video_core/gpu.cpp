@@ -41,6 +41,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -81,6 +82,12 @@ struct GPU::Impl {
         if (bound_channel != channel_id) {
             auto it = channels.find(channel_id);
             ASSERT(it != channels.end());
+            // A channel set up while the GPU thread was split: its caches' state now, on the
+            // thread that binds it (the split's back, in order with its draws).
+            if (it->second->rasterizer_pending) {
+                it->second->rasterizer_pending = false;
+                renderer->ReadRasterizer()->InitializeChannel(*it->second);
+            }
             bound_channel = channel_id;
             current_channel = it->second.get();
             renderer->ReadRasterizer()->BindChannel(*current_channel);
@@ -94,8 +101,18 @@ struct GPU::Impl {
     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
         to_init.Init(system, program_id);
         to_init.BindRasterizer(renderer->ReadRasterizer());
+        // The caches' per-channel state (channel lists, address-space page tables) belongs to
+        // the split's back thread while it runs: set up from here (a guest thread) it changed
+        // under the back's draws, which then crashed at startup on a null image in a barrier or
+        // on garbage commands (Bananza: 5 of 10 starts with the split, 0 of 9 without). The GPU
+        // thread that binds the channel finishes it (BindChannel).
+        if (VideoCommon::GpuSplit::Get().Active()) {
+            to_init.rasterizer_pending = true;
+            return;
+        }
         renderer->ReadRasterizer()->InitializeChannel(to_init);
     }
+
 
     void InitAddressSpace(Tegra::MemoryManager& memory_manager) {
         memory_manager.BindRasterizer(renderer->ReadRasterizer());
@@ -130,6 +147,7 @@ struct GPU::Impl {
     /// Signal the ending of command list.
     void OnCommandListEnd() {
         renderer->ReadRasterizer()->ReleaseFences(false);
+        renderer->ReadRasterizer()->TickWithoutPresent();
         Settings::UpdateGPUAccuracy();
     }
 
@@ -166,6 +184,7 @@ struct GPU::Impl {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
             sync_request_mutex.lock();
@@ -573,6 +592,10 @@ VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
 
 u64 GPU::ReadbackGeneration() const {
     return impl->gpu_thread.ReadbackGeneration();
+}
+
+std::optional<u32> GPU::ReadPublishedSemaphore(DAddr addr, const void* pointer) {
+    return impl->renderer->ReadRasterizer()->ReadPublishedSemaphore(addr, pointer);
 }
 
 void GPU::InvalidateReadbackCache() {

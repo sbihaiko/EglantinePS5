@@ -46,9 +46,10 @@ TEST_CASE("A new session forgets the pages the previous one wrote",
     }
 }
 
-TEST_CASE("Command synchronization drains a page's first queued GPU write before checking it",
+TEST_CASE("Command synchronization drains and flushes only a list on a page the GPU wrote",
           "[video_core][nx2_command_sync]") {
     Tegra::Nx2ClearGpuWrittenPages();
+    Tegra::Nx2MarkGpuWritten(8 * Page, sizeof(u32));
     u32 host_word = 0;
     u32 gpu_word = 0;
     bool drained = false;
@@ -57,12 +58,8 @@ TEST_CASE("Command synchronization drains a page's first queued GPU write before
         [&] {
             drained = true;
             gpu_word = 42;
-            Tegra::Nx2MarkGpuWritten(8 * Page, sizeof(u32));
         },
-        [&](GPUVAddr page) {
-            REQUIRE(drained);
-            return std::optional{page};
-        },
+        [](GPUVAddr page) { return std::optional{page}; },
         [&] {
             REQUIRE(drained);
             flushed = true;
@@ -72,7 +69,7 @@ TEST_CASE("Command synchronization drains a page's first queued GPU write before
     REQUIRE(host_word == 42);
 }
 
-TEST_CASE("Command synchronization skips clean-page flushes but still drains queued work",
+TEST_CASE("Command synchronization neither drains nor flushes a clean command page",
           "[video_core][nx2_command_sync]") {
     Tegra::Nx2ClearGpuWrittenPages();
     u32 drains = 0;
@@ -82,5 +79,5 @@ TEST_CASE("Command synchronization skips clean-page flushes but still drains que
             [](GPUVAddr page) { return std::optional{page}; },
             [] { FAIL("A clean command page must not be flushed"); });
     }
-    REQUIRE(drains == 1);
+    REQUIRE(drains == 0);
 }

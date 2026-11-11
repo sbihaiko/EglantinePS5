@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "tests/video_core/ampere_high_uniforms.h"
 
 namespace {
 using Shader::Ampere::Instruction;
@@ -29,19 +30,76 @@ TEST_CASE("Ampere reciprocal accepts the captured uniform source form", "[video_
     const auto predicated = LowerToMaxwell(code);
     REQUIRE(static_cast<bool>(predicated));
     REQUIRE(((predicated.instructions.front() >> 16) & 15) == 1);
-    for (const u32 source : {28U, 62U, 64U, 0x80000008U}) {
+    for (const u32 source : {64U, 0x00400008U, 0x20000008U}) {
         auto invalid = code;
         invalid[0].words[1] = source;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+    }
+    for (const u32 source : {28U, 62U}) { // once unmapped: mirrored below R216
+        auto mirrored = code;
+        mirrored[0].words[1] = source;
+        RequireHighUniformMirror(mirrored, source);
+    }
+    // A negated source (bit 63) was rejected as unproved. Uniform ALU sources carry .ABS and .NEG
+    // in bits 62 and 63 like register sources (see operand() in the lowering), and five of Ocarina
+    // of Time's gameplay shaders take MUFU.RCP of -UR8: the modifier is applied to a scratch copy
+    // and the reciprocal reads that.
+    for (const u32 modifier : {0x80000000U, 0x40000000U, 0xc0000000U}) {
+        auto modified = code;
+        modified[0].words[0] = 0x00187d08;
+        modified[0].words[1] = 8 | modifier;
+        const auto lowered = LowerToMaxwell(modified);
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const u64 reciprocal = lowered.instructions[lowered.instructions.size() - 2];
+        REQUIRE((reciprocal >> 51) == (0x5080000000000000ULL >> 51));
+        const u32 source = static_cast<u32>((reciprocal >> 8) & 0xff);
+        REQUIRE(source >= 246); // a scratch copy, never UR8's mirror (R224) itself
+        const u64 negate = 0x0400000000070000ULL | source | (u64{source} << 8) |
+                           (u64{0x80000000U} << 20) | (2ULL << 53);
+        const u64 absolute = 0x0400000000070000ULL | source | (u64{source} << 8) |
+                             (u64{0x7fffffffU} << 20);
+        const auto has = [&](u64 word) {
+            return std::find(lowered.instructions.begin(), lowered.instructions.end(), word) !=
+                   lowered.instructions.end();
+        };
+        REQUIRE(has(negate) == ((modifier & 0x80000000U) != 0));
+        REQUIRE(has(absolute) == ((modifier & 0x40000000U) != 0));
     }
     for (const u32 mode : {0x08000000U, 0x08001400U, 0x08001200U, 0x08011000U}) {
         auto invalid = code;
         invalid[0].words[2] = mode;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     }
+    // A destination among the uniform mirrors (R220 is where UR4 lives) used to reject the
+    // program. The guest's R216-R245 now live in a second register bank (register_pressure.h):
+    // the program lowers, the reciprocal writes a borrowed low register and the copy back goes to
+    // the second bank, so UR4's mirror is never written.
     auto alias = code;
     alias[0].words[0] = 0x00dc1d08;
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(alias)));
+    const auto shadowed = LowerToMaxwell(alias);
+    REQUIRE(static_cast<bool>(shadowed));
+    bool reciprocal = false;
+    for (const u64 word : shadowed.instructions) {
+        if ((word >> 51) != (0x5080000000000000ULL >> 51)) continue;
+        reciprocal = true;
+        const u32 borrowed = static_cast<u32>(word & 0xff);
+        REQUIRE(borrowed < 216);
+        REQUIRE(std::find(shadowed.instructions.begin(), shadowed.instructions.end(),
+                          Shader::Ampere::NativeRegisterCopy(1, 220, 0, borrowed)) !=
+                shadowed.instructions.end());
+    }
+    REQUIRE(reciprocal);
+    // The same holds for a guest register among the lowering's scratch (R246-R254): Ocarina of
+    // Time's programs use R246-R249. The reciprocal never names it.
+    for (const u32 scratch : {246U, 250U, 254U}) {
+        alias[0].words[0] = 0x00001d08U | (scratch << 16);
+        const auto moved = LowerToMaxwell(alias);
+        REQUIRE(static_cast<bool>(moved));
+        for (const u64 word : moved.instructions) {
+            if ((word >> 51) == (0x5080000000000000ULL >> 51)) REQUIRE((word & 0xff) < 216);
+        }
+    }
 }
 
 TEST_CASE("Ampere clip-state operations remain explicitly unsupported", "[video_core][ampere]") {
@@ -65,8 +123,11 @@ TEST_CASE("Ampere floating comparisons accept uniform sources without losing FTZ
     REQUIRE(lowered.instructions.front() ==
             (0x5bb0000000070000ULL | 7ULL | (255ULL << 8) | (220ULL << 20) | (7ULL << 39) |
              (1ULL << 47) | (12ULL << 48)));
+    auto mirrored = code; // UR28, once unmapped: mirrored below R216
+    mirrored[0].words[1] = 28;
+    RequireHighUniformMirror(mirrored, 28);
     auto invalid = code;
-    invalid[0].words[1] = 28;
+    invalid[0].words[1] = 64;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     auto alias = code;
     alias[0].words[0] = 0xdc007c0b;
@@ -157,12 +218,20 @@ TEST_CASE("Ampere warp reductions reject unsupported modes and uniform destinati
         }};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
     }
-    for (const u32 destination : {28U, 63U}) {
+    {
         const std::array<Instruction, 2> code{{
-            {{0x030073c4U | (destination << 16), 0, 0x4000, 0x000ea200}},
+            {{0x030073c4U | (63U << 16), 0, 0x4000, 0x000ea200}},
             {{0x0000794d, 0, 0x03800000, 0}},
         }};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+    }
+    {
+        // UR28 as the destination, once unmapped: mirrored below R216.
+        const std::array<Instruction, 2> code{{
+            {{0x030073c4U | (28U << 16), 0, 0x4000, 0x000ea200}},
+            {{0x0000794d, 0, 0x03800000, 0}},
+        }};
+        RequireHighUniformMirror(code, 28);
     }
 }
 

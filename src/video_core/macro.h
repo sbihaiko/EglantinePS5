@@ -7,6 +7,8 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include "video_core/bananza_terrain_compat.h"
 #include "video_core/macro_memo.h"
 #include "video_core/macro_turing.h"
 
@@ -244,6 +246,7 @@ struct MacroEngine {
     }
     // Compiles the macro if its not in the cache, and executes the compiled macro
     void Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method, std::span<const u32> parameters);
+    void RecordBananzaTerrainDepthDraw(Engines::Maxwell3D& maxwell3d, u32 instances);
     void ReadNativeMemory(Engines::Maxwell3D& maxwell3d, u32 method, u32 address, u32 value);
     AnyCachedMacro Compile(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> code);
     struct CacheInfo {
@@ -266,6 +269,9 @@ struct MacroEngine {
     std::shared_ptr<TuringMacroJit> native_jit;
     MacroMemoPairs native_writes;
     u64 native_calls{};
+    BananzaTerrainDrawCompat bananza_terrain_compat;
+    std::optional<bool> bananza_terrain_enabled;
+    bool bananza_terrain_compat_logged{};
 
 };
 

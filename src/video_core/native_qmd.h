@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -26,6 +27,7 @@ public:
     template <typename Read, typename Release, typename Dispatch>
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
+        auto& states = own_states ? *own_states : NativeQmdScheduler::states;
         std::string_view error;
         std::array<Pending, 256> pending{};
         std::size_t count = 1;
@@ -135,5 +137,13 @@ private:
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
     static inline std::unordered_map<Address, State> states;
+public:
+    /// A table of its own instead of the shared one (the split GPU thread front's copy, which
+    /// must not count the back's dependencies twice).
+    void UseOwnTable() {
+        own_states = std::make_unique<std::unordered_map<Address, State>>();
+    }
+private:
+    std::unique_ptr<std::unordered_map<Address, State>> own_states;
 };
 } // namespace Tegra

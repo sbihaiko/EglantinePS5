@@ -1,3 +1,4 @@
+#include "video_core/nx2_loading_probe.h"
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -60,6 +61,9 @@ void Fermi2D::ConsumeSinkImpl(Core::System& system) {
 }
 
 void Fermi2D::Blit() {
+    VideoCommon::LoadingProbe::blit_src = regs.src.Address();
+    VideoCommon::LoadingProbe::blit_dst = regs.dst.Address();
+    VideoCommon::LoadingProbe::blit.Mark("fermi begin");
     if (static const u64 trace_destination = [] {
             const char* value = std::getenv("EDEN_NX2_TRACE_DST");
             return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
@@ -131,10 +135,14 @@ void Fermi2D::Blit() {
         config.src_x0 = 0;
     }
 
+    VideoCommon::LoadingProbe::blit.Mark("fermi flush caches");
     memory_manager.FlushCaching();
+    VideoCommon::LoadingProbe::blit.Mark("fermi accelerate");
     if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+        VideoCommon::LoadingProbe::blit.Mark("fermi software");
         sw_blitter->Blit(src, regs.dst, config);
     }
+    VideoCommon::LoadingProbe::blit.Mark("fermi done");
 }
 
 } // namespace Tegra::Engines

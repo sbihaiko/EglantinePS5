@@ -28,6 +28,7 @@
 #include "core/loader/nca.h"
 #include "core/loader/nro.h"
 #include "core/loader/nso.h"
+#include "core/loader/nup.h"
 #include "core/loader/nsp.h"
 #include "core/loader/xci.h"
 
@@ -126,7 +127,9 @@ bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
 } // namespace
 
 FileType IdentifyFile(FileSys::VirtualFile file) {
-    if (const auto nsp_type = IdentifyFileLoader<AppLoader_NSP>(file)) {
+    if (const auto nup_type = IdentifyFileLoader<AppLoader_Nup>(file)) {
+        return *nup_type;
+    } else if (const auto nsp_type = IdentifyFileLoader<AppLoader_NSP>(file)) {
         return *nsp_type;
     } else if (const auto xci_type = IdentifyFileLoader<AppLoader_XCI>(file)) {
         return *xci_type;
@@ -194,6 +197,8 @@ FileType GuessFromFilename(const std::string& name) {
         return FileType::NSZ;
     else if (extension == "kip")
         return FileType::KIP;
+    else if (extension == "nup")
+        return FileType::NUP;
     return FileType::Unknown;
 }
 
@@ -219,6 +224,8 @@ std::string GetFileTypeString(FileType type) {
         return "KIP";
     case FileType::DeconstructedRomDirectory:
         return "Directory";
+    case FileType::NUP:
+        return "NUP";
     case FileType::Error:
     case FileType::Unknown:
         break;
@@ -227,7 +234,7 @@ std::string GetFileTypeString(FileType type) {
     return "unknown";
 }
 
-constexpr std::array<const char*, 68> RESULT_MESSAGES{
+constexpr std::array<const char*, 69> RESULT_MESSAGES{
     "The operation completed successfully.",
     "The loader requested to load is already loaded.",
     "The operation is not implemented.",
@@ -296,6 +303,7 @@ constexpr std::array<const char*, 68> RESULT_MESSAGES{
     "The INI file contains more than the maximum allowable number of KIP files.",
     "Integrity verification could not be performed for this file.",
     "Integrity verification failed.",
+    "The NUP file is invalid or has no program.",
 };
 
 std::string GetResultStatusString(ResultStatus status) {
@@ -383,6 +391,10 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::V
     // NX deconstructed ROM directory.
     case FileType::DeconstructedRomDirectory:
         return std::make_unique<AppLoader_DeconstructedRomDirectory>(std::move(file));
+
+    // NUP container of an unencrypted dump (base, updates, DLC).
+    case FileType::NUP:
+        return std::make_unique<AppLoader_Nup>(std::move(file));
 
     default:
         return nullptr;

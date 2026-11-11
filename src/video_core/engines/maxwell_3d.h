@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -2541,6 +2542,19 @@ public:
             return IsShaderConfigEnabled(static_cast<std::size_t>(type));
         }
 
+        // Switch 2 (NVN) task and mesh pipelines (clc597.h): SET_MESH_CONTROL, SET_MESH_SHADER_A
+        // and _B, SET_MESH_INIT_SHADER. While mesh control is on, the vertex slot holds the task
+        // program (or the mesh program when there is no task), the tessellation slot the mesh
+        // program and the geometry slot a pass-through header naming the per-primitive outputs.
+        static constexpr std::size_t MeshControl = 0x114c / 4;
+        static constexpr std::size_t MeshShaderA = 0x1150 / 4;
+        static constexpr std::size_t MeshShaderB = 0x1154 / 4;
+        static constexpr std::size_t MeshInitShader = 0x1158 / 4;
+
+        bool IsMeshEnabled() const {
+            return (reg_array[MeshControl] & 1) != 0;
+        }
+
         struct ConstantBuffer {
             u32 size;
             u32 address_high;
@@ -3237,8 +3251,21 @@ public:
     /// Handles a write to the CB_BIND register.
     void ProcessCBBind(size_t stage_index);
 
+    /// Fast draw (nx2_fast_draw.h): registers that only parameterize the next draw, the next
+    /// constant buffer bind or the buffers a delta draw binds again, or that ProcessMethodCall
+    /// handles, so writing them doesn't end the delta chain.
+    static bool IsFastDrawParameter(u32 method);
+    /// Methods fast draw records as light changes (constant buffer data and binds).
+    static bool IsFastDrawDeltaMethod(u32 method);
+    /// A vertex stream's address, size or limit (not its stride or enable).
+    static bool IsFastDrawVertexBuffer(u32 method);
+    void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
+    /// A run of CB_DATA writes from the split GPU thread's front (GpuSplit::CbDataWrite): words
+    /// hold method (low 32 bits) and argument (high 32); as CallMethod for each, one memory write.
+    void ProcessCBDataBlock(const u64* words, u32 count);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
@@ -3252,6 +3279,14 @@ private:
 
     void ProcessDirtyRegisters(u32 method, u32 argument);
 
+public:
+    /// A register write a macro makes (MacroEngine::Execute): a state register (not in
+    /// execution_mask) takes a short path with CallMethod's effect (shadow RAM, the same-value
+    /// skip, dirty flags); anything else, and every write while profiling or tracing, takes
+    /// CallMethod itself.
+    void MacroWrite(Core::System& system, u32 method, u32 argument);
+
+private:
     void ConsumeSinkImpl(Core::System& system) override;
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
@@ -3308,6 +3343,10 @@ private:
     bool IsMethodExecutable(u32 method);
 
     MemoryManager& memory_manager;
+
+    /// Device memory of the texture and sampler header tables (NoteFastDrawConstantData).
+    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_header_spans;
+    VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_sampler_spans;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 

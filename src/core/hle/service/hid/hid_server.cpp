@@ -4,7 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -133,7 +136,7 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {211, C<&IHidServer::IsVibrationDeviceMounted>, "IsVibrationDeviceMounted"},
         {212, C<&IHidServer::SendVibrationValueInBool>, "SendVibrationValueInBool"},
         {213, &IHidServer::SendNx2VibrationValue, "SendNx2VibrationValue"},
-        {214, C<&IHidServer::SendNx2VibrationValues>, "SendNx2VibrationValues (guessed)"},
+        {214, &IHidServer::SendNx2VibrationValues, "SendNx2VibrationValues"},
         {300, C<&IHidServer::ActivateConsoleSixAxisSensor>, "ActivateConsoleSixAxisSensor"},
         {301, C<&IHidServer::StartConsoleSixAxisSensor>, "StartConsoleSixAxisSensor"},
         {302, C<&IHidServer::StopConsoleSixAxisSensor>, "StopConsoleSixAxisSensor"},
@@ -1087,9 +1090,54 @@ void IHidServer::SendNx2VibrationValue(HLERequestContext& ctx) {
     rb.Push(result);
 }
 
-Result IHidServer::SendNx2VibrationValues() {
-    LOG_DEBUG(Service_HID, "(STUBBED) called");
-    R_SUCCEED();
+void IHidServer::SendNx2VibrationValues(HLERequestContext& ctx) {
+    // Request layout (as ProsperoEden decodes it): u16 flags, then the applet resource user id
+    // at the next 8-byte boundary, then two pointer buffers holding the device handles and the
+    // values. The values are the Switch 1 HD rumble layout (213 reads the same struct), so they
+    // go through the same per-device path as 206 SendVibrationValues and reach the emulated
+    // controllers' vibration.
+    IPC::RequestParser rp{ctx};
+    const u16 flags = rp.Pop<u16>();
+    rp.Skip(1, false);
+    const u64 raw_aruid = rp.Pop<u64>();
+    // The kernel-supplied PID when the request carries one, as 213 uses; the raw field otherwise.
+    const u64 aruid = ctx.GetPID() != 0 ? ctx.GetPID() : raw_aruid;
+
+    // Copied out rather than reinterpreted: the guest buffers need not be aligned.
+    std::vector<Core::HID::VibrationDeviceHandle> handles;
+    std::vector<Core::HID::VibrationValue> values;
+    if (ctx.CanReadBuffer(0)) {
+        const auto bytes = ctx.ReadBuffer(0);
+        handles.resize(bytes.size() / sizeof(Core::HID::VibrationDeviceHandle));
+        std::memcpy(handles.data(), bytes.data(), handles.size() * sizeof(handles[0]));
+    }
+    if (ctx.CanReadBuffer(1)) {
+        const auto bytes = ctx.ReadBuffer(1);
+        values.resize(bytes.size() / sizeof(Core::HID::VibrationValue));
+        std::memcpy(values.data(), bytes.data(), values.size() * sizeof(values[0]));
+    }
+    LOG_DEBUG(Service_HID, "called, flags={:#x}, aruid={}, handles={}, values={}", flags, aruid,
+              handles.size(), values.size());
+
+    // This used to be an accept-and-drop stub, and titles (Mario Kart World sends a batch every
+    // 5 ms) run on that: a batch that cannot be played is dropped, never failed back to the game.
+    if (flags != 0 && flags != 2) {
+        LOG_DEBUG(Service_HID, "Unsupported vibration flags {:#x}, batch dropped", flags);
+    } else {
+        const std::size_t count = std::min(handles.size(), values.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            const Result result =
+                GetResourceManager()->SendVibrationValue(aruid, handles[i], values[i]);
+            if (result.IsError()) {
+                LOG_DEBUG(Service_HID, "Vibration value {} not sent, npad_type={}, npad_id={}, "
+                          "device_index={}, result={:#x}", i, handles[i].npad_type,
+                          handles[i].npad_id, handles[i].device_index, result.raw);
+            }
+        }
+    }
+
+    IPC::ResponseBuilder rb{ctx, 2};
+    rb.Push(ResultSuccess);
 }
 
 Result IHidServer::SendVibrationValueInBool(

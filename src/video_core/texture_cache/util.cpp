@@ -13,6 +13,7 @@
 #include <array>
 #include <cstring>
 #include <numeric>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -883,6 +884,14 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
             .image_extent = size,
         }};
     }
+    return UnswizzleBlockLinearImage(info, input, output, gpu_memory.UsesNativeTiling());
+}
+
+boost::container::small_vector<BufferImageCopy, 16> UnswizzleBlockLinearImage(
+    const ImageInfo& info, std::span<const u8> input, std::span<u8> output, bool native_tiling) {
+    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    const Extent2D tile_size = DefaultBlockSize(info.format);
+    const Extent3D size = info.size;
     const LevelInfo level_info = MakeLevelInfo(info);
     const s32 num_layers = info.resources.layers;
     const s32 num_levels = info.resources.levels;
@@ -922,7 +931,7 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
             const std::span<u8> dst = output.subspan(host_offset);
             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
             UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
-                             num_tiles.depth, block.height, block.depth, stride_alignment, gpu_memory.UsesNativeTiling());
+                             num_tiles.depth, block.height, block.depth, stride_alignment, native_tiling);
             guest_layer_offset += layer_stride;
             host_offset += host_bytes_per_layer;
         }
@@ -931,9 +940,10 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
     return copies;
 }
 
-boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(
-    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
-    std::span<const std::pair<u64, u64>> dirty_ranges, std::vector<u8>& output) {
+static boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRowsImpl(
+    const UploadReader& read, GPUVAddr gpu_addr, const ImageInfo& info,
+    std::span<const std::pair<u64, u64>> dirty_ranges, std::vector<u8>& output,
+    bool native_tiling) {
     boost::container::small_vector<BufferImageCopy, 16> copies;
     if (info.type != ImageType::e2D || info.size.depth != 1 || info.block.depth != 0 ||
         info.num_samples != 1 || dirty_ranges.empty()) {
@@ -1013,16 +1023,15 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(
                     const u32 run_tiles = (last - first) * gob_tiles;
                     const size_t guest_bytes = size_t{last - first} * block_bytes;
                     run.resize(guest_bytes);
-                    gpu_memory.ReadBlockUnsafe(gpu_addr + segment_begin + u64{band} * band_bytes +
-                                                   u64{first} * block_bytes,
-                                               run.data(), guest_bytes);
+                    read(gpu_addr + segment_begin + u64{band} * band_bytes +
+                             u64{first} * block_bytes, run);
                     const size_t host_offset = output.size();
                     const size_t host_bytes = (size_t{tile_rows} * run_tiles) << bpp_log2;
                     output.resize(host_offset + host_bytes);
                     Tegra::Texture::UnswizzleTexture(std::span<u8>{output}.subspan(host_offset, host_bytes),
                                                      run, 1U << bpp_log2, run_tiles, tile_rows, 1,
                                                      block.height, block.depth, run_alignment,
-                                                     gpu_memory.UsesNativeTiling());
+                                                     native_tiling);
                     const u32 x = first_tile * tile_size.width;
                     const u32 y = first_row * tile_size.height;
                     copies.push_back(BufferImageCopy{
@@ -1047,6 +1056,423 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(
         level_offset += level_sizes[level];
     }
     return copies;
+}
+
+boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+    std::span<const std::pair<u64, u64>> dirty_ranges, std::vector<u8>& output) {
+    return UnswizzleImageRowsImpl(
+        [&](GPUVAddr address, std::span<u8> bytes) {
+            gpu_memory.ReadBlockUnsafe(address, bytes.data(), bytes.size());
+        }, gpu_addr, info, dirty_ranges, output, gpu_memory.UsesNativeTiling());
+}
+
+bool StreamLayerUploads(const ImageInfo& info, GPUVAddr address, std::span<const u32> layers,
+                        size_t limit, const UploadReader& read, const UploadChunk& upload,
+                        bool native_tiling) {
+    if (info.type != ImageType::e2D || info.size.depth != 1 || info.block.depth != 0 ||
+        info.block.width != 0 || info.block.height > 5 || info.num_samples != 1 || info.size.width == 0 ||
+        info.size.height == 0 || info.resources.levels < 1 ||
+        info.resources.levels > static_cast<s32>(MAX_MIP_LEVELS) ||
+        info.resources.layers < 1 || info.tile_width_spacing > 7 || layers.empty() ||
+        std::ranges::any_of(layers, [&](u32 layer) {
+            return layer >= static_cast<u32>(info.resources.layers);
+        })) {
+        return false;
+    }
+    // Range edges can select a whole GOB block at each mip. Leave room for that rounding
+    // rather than rounding the staging allocation up to a second large buffer.
+    const size_t block_bytes = size_t{GOB_SIZE} << info.block.height;
+    if (limit / 2 < 2 * block_bytes * static_cast<size_t>(info.resources.levels)) {
+        return false;
+    }
+    const size_t chunk_bytes = (limit / 2) & ~(block_bytes - 1);
+    ImageInfo layer_info = info;
+    layer_info.resources.layers = 1;
+    const u64 layer_bytes = CalculateLayerSize(layer_info);
+    const u64 stride = info.layer_stride ? info.layer_stride : CalculateLayerStride(info);
+    if (stride < layer_bytes || address > (std::numeric_limits<u64>::max)() -
+                                             stride * (info.resources.layers - 1) - layer_bytes) {
+        return false;
+    }
+    // Validate every mip before an upload callback can modify the host image.
+    const auto layout = MakeLevelInfo(layer_info);
+    const auto sizes = CalculateLevelSizes(layout, info.resources.levels);
+    const auto tile_size = DefaultBlockSize(info.format);
+    const auto bpp = BytesPerBlockLog2(info.format);
+    const auto gob = GobSize(bpp, info.block.height, info.tile_width_spacing);
+    for (s32 level = 0; level < info.resources.levels; ++level) {
+        const auto tiles = AdjustTileSize(AdjustMipSize(info.size, level), tile_size);
+        const auto block = AdjustMipBlockSize(tiles, layout.block, level, layout.num_levels);
+        const u32 bands = Common::DivCeil(tiles.height, GOB_SIZE_Y << block.height);
+        const u32 row_bytes = Common::AlignUpLog2(
+                                  tiles.width, StrideAlignment(tiles, info.block, gob, bpp)) << bpp;
+        const u64 bytes = u64{bands} * Common::DivCeilLog2(row_bytes, GOB_SIZE_X_SHIFT) *
+                          (GOB_SIZE << block.height);
+        if (bands == 0 || bytes > sizes[level]) {
+            return false;
+        }
+    }
+    std::vector<u8> data;
+    for (u32 layer : layers) {
+        for (u64 offset = 0; offset < layer_bytes; offset += chunk_bytes) {
+            const std::array range{std::pair<u64, u64>{
+                offset, std::min(offset + chunk_bytes, layer_bytes)}};
+            data.clear();
+            auto copies = UnswizzleImageRowsImpl(read, address + u64{layer} * stride,
+                                                 layer_info, range, data, native_tiling);
+            if (copies.empty()) {
+                continue; // padding between mip levels
+            }
+            ASSERT(data.size() <= limit);
+            for (auto& copy : copies) {
+                copy.image_subresource.base_layer = static_cast<s32>(layer);
+            }
+            upload(data, copies);
+        }
+    }
+    return true;
+}
+
+namespace {
+// One level of a single-layer 2D block-linear image of 1x1-texel blocks, laid out as
+// UnswizzleImage reads it: rows of blocks, each block one GOB wide and 2^block_height GOBs tall.
+struct BlockLinearLevel {
+    u32 offset;         ///< Into the image
+    u32 width;          ///< Texels
+    u32 height;
+    u32 block_height;   ///< Log2 of the GOBs a block is tall
+    u32 block_texels;   ///< Texels across a block
+    u32 block_rows;     ///< Texel rows in a block
+    u32 block_bytes;
+    u32 blocks_per_row;
+};
+
+std::vector<BlockLinearLevel> BlockLinearLevels(const ImageInfo& info) {
+    const LevelInfo level_info = MakeLevelInfo(info);
+    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    const Extent2D gob = GobSize(bpp_log2, info.block.height, info.tile_width_spacing);
+    std::vector<BlockLinearLevel> levels;
+    u32 offset = 0;
+    for (s32 level = 0; level < info.resources.levels; ++level) {
+        const Extent3D level_size = AdjustMipSize(info.size, level);
+        const Extent3D num_tiles = AdjustTileSize(level_size, level_info.tile_size);
+        const Extent3D block =
+            AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+        const u32 stride_alignment = StrideAlignment(num_tiles, info.block, gob, bpp_log2);
+        const u32 stride = Common::AlignUpLog2(num_tiles.width, stride_alignment) << bpp_log2;
+        levels.push_back({
+            .offset = offset,
+            .width = level_size.width,
+            .height = level_size.height,
+            .block_height = block.height,
+            .block_texels = GOB_SIZE_X >> bpp_log2,
+            .block_rows = GOB_SIZE_Y << block.height,
+            .block_bytes = GOB_SIZE << block.height,
+            .blocks_per_row = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT),
+        });
+        offset += CalculateLevelSize(level_info, level);
+    }
+    return levels;
+}
+
+// Rows of blocks a rectangle covers, and its blocks across.
+struct RectBlocks {
+    u32 first_row;
+    u32 last_row;
+    u32 first_block;
+    u32 num_blocks;
+};
+
+RectBlocks BlocksOf(const BlockLinearLevel& level, const LevelRect& rect) {
+    const u32 first_block = rect.x / level.block_texels;
+    return {
+        .first_row = rect.y / level.block_rows,
+        .last_row = (rect.y + rect.height - 1) / level.block_rows,
+        .first_block = first_block,
+        .num_blocks = (std::min)(Common::DivCeil(rect.width, level.block_texels),
+                                 level.blocks_per_row - first_block),
+    };
+}
+
+u32 BlockRowTexelRows(const BlockLinearLevel& level, u32 row) {
+    return (std::min)(level.block_rows, level.height - row * level.block_rows);
+}
+} // Anonymous namespace
+
+std::vector<LevelRect> SparseTileRects(const ImageInfo& info,
+                                       std::span<const std::pair<u64, u64>> ranges, u32 tile_width,
+                                       u32 tile_height, s32 tail_level) {
+    std::vector<LevelRect> rects;
+    const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
+    const u64 image_end = CalculateLevelBytes(
+        CalculateLevelSizes(MakeLevelInfo(info), info.resources.levels), info.resources.levels);
+    for (s32 index = 0; index < static_cast<s32>(levels.size()); ++index) {
+        const BlockLinearLevel& level = levels[index];
+        const u64 level_end =
+            index + 1 < static_cast<s32>(levels.size()) ? levels[index + 1].offset : image_end;
+        const auto overlaps = [&](const std::pair<u64, u64>& range) {
+            return range.first < level_end && range.first + range.second > level.offset;
+        };
+        if (index >= tail_level) {
+            if (std::ranges::any_of(ranges, overlaps)) {
+                rects.push_back({index, 0, 0, level.width, level.height});
+            }
+            continue;
+        }
+        const u32 tiles_x = Common::DivCeil(level.width, tile_width);
+        const u32 tiles_y = Common::DivCeil(level.height, tile_height);
+        std::vector<bool> touched(size_t{tiles_x} * tiles_y);
+        for (const auto& range : ranges) {
+            if (!overlaps(range)) {
+                continue;
+            }
+            const u64 begin = (std::max<u64>)(range.first, level.offset) - level.offset;
+            const u64 end = (std::min<u64>)(range.first + range.second, level_end) - level.offset;
+            const u64 first = begin / level.block_bytes;
+            const u64 last = (end - 1) / level.block_bytes;
+            for (u64 row = first / level.blocks_per_row; row <= last / level.blocks_per_row; ++row) {
+                const u64 row_start = row * level.blocks_per_row;
+                const u64 low = (std::max)(first, row_start) - row_start;
+                const u64 high = (std::min)(last, row_start + level.blocks_per_row - 1) - row_start;
+                const u64 x0 = low * level.block_texels;
+                const u64 y0 = row * level.block_rows;
+                if (x0 >= level.width || y0 >= level.height) {
+                    continue;
+                }
+                const u64 x1 = (std::min<u64>)((high + 1) * level.block_texels, level.width);
+                const u64 y1 = (std::min<u64>)(y0 + level.block_rows, level.height);
+                for (u64 ty = y0 / tile_height; ty <= (y1 - 1) / tile_height; ++ty) {
+                    for (u64 tx = x0 / tile_width; tx <= (x1 - 1) / tile_width; ++tx) {
+                        touched[ty * tiles_x + tx] = true;
+                    }
+                }
+            }
+        }
+        for (u32 ty = 0; ty < tiles_y; ++ty) {
+            for (u32 tx = 0; tx < tiles_x;) {
+                if (!touched[size_t{ty} * tiles_x + tx]) {
+                    ++tx;
+                    continue;
+                }
+                const u32 first_tile = tx;
+                while (tx < tiles_x && touched[size_t{ty} * tiles_x + tx]) {
+                    ++tx;
+                }
+                const u32 x = first_tile * tile_width;
+                const u32 y = ty * tile_height;
+                rects.push_back({
+                    .level = index,
+                    .x = x,
+                    .y = y,
+                    .width = (std::min)(tx * tile_width, level.width) - x,
+                    .height = (std::min)(y + tile_height, level.height) - y,
+                });
+            }
+        }
+    }
+    return rects;
+}
+
+size_t UnswizzledRectsBytes(const ImageInfo& info, std::span<const LevelRect> rects) {
+    const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
+    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    size_t bytes = 0;
+    for (const LevelRect& rect : rects) {
+        const BlockLinearLevel& level = levels[rect.level];
+        const RectBlocks blocks = BlocksOf(level, rect);
+        for (u32 row = blocks.first_row; row <= blocks.last_row; ++row) {
+            bytes += (size_t{blocks.num_blocks * level.block_texels} << bpp_log2) *
+                     BlockRowTexelRows(level, row);
+        }
+    }
+    return bytes;
+}
+
+std::vector<BufferImageCopy> DownloadRowBands(const ImageInfo& info, size_t limit) {
+    if (info.type != ImageType::e2D || info.resources.levels != 1 ||
+        info.resources.layers != 1 || info.num_samples != 1 || info.size.depth != 1 ||
+        info.block.width != 0 || info.block.depth != 0 ||
+        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1 ||
+        GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) return {};
+    const auto level = BlockLinearLevels(info).front();
+    const size_t row = size_t{info.size.width} * BytesPerBlock(info.format);
+    const u32 rows = static_cast<u32>(limit / row / level.block_rows) * level.block_rows;
+    if (rows == 0) return {};
+    std::vector<BufferImageCopy> copies;
+    for (u32 y = 0; y < info.size.height; y += rows) {
+        const u32 height = (std::min)(rows, info.size.height - y);
+        copies.push_back(BufferImageCopy{
+            .buffer_offset = 0, .buffer_size = row * height,
+            .buffer_row_length = info.size.width, .buffer_image_height = height,
+            .image_subresource = {0, 0, 1},
+            .image_offset = {0, static_cast<s32>(y), 0},
+            .image_extent = {info.size.width, height, 1},
+        });
+    }
+    return copies;
+}
+
+std::pair<u64, size_t> RowBandGuestRange(const ImageInfo& info, const BufferImageCopy& copy) {
+    const auto level = BlockLinearLevels(info).front();
+    const size_t block_row = size_t{level.blocks_per_row} * level.block_bytes;
+    return {u64{static_cast<u32>(copy.image_offset.y) / level.block_rows} * block_row,
+            Common::DivCeil(copy.image_extent.height, level.block_rows) * block_row};
+}
+
+std::optional<std::vector<PartialDownloadBand>> PartialDownloadBands(
+    const ImageInfo& info, u64 offset, size_t size, size_t limit) {
+    if (!size || !info.size.width || !info.size.height ||
+        info.block.height > 5 || info.tile_width_spacing > 7) return std::nullopt;
+    // Reuse the same eligibility and layout as the bounded whole-image downloader.
+    if (DownloadRowBands(info, limit).empty()) return std::nullopt;
+    const u64 guest_bytes = CalculateGuestSizeInBytes(info);
+    if (offset >= guest_bytes || size > guest_bytes - offset ||
+        (offset == 0 && size == guest_bytes)) return std::nullopt;
+    const auto level = BlockLinearLevels(info).front();
+    const size_t gob_row_bytes = size_t{info.size.width} * BytesPerBlock(info.format) * level.block_rows;
+    if (gob_row_bytes > limit) return std::nullopt;
+    const auto copies = DownloadRowBands(info, gob_row_bytes);
+    std::vector<PartialDownloadBand> result;
+    for (const auto& copy : copies) {
+        const auto [begin, bytes] = RowBandGuestRange(info, copy);
+        if (bytes > limit || begin > guest_bytes || bytes > guest_bytes - begin)
+            return std::nullopt;
+        const u64 first = std::max(begin, offset);
+        const u64 last = std::min(begin + bytes, offset + size);
+        if (last > first) result.push_back({copy, begin, bytes, first, size_t(last - first)});
+    }
+    return result;
+}
+
+void SwizzleRowBand(const ImageInfo& info, const BufferImageCopy& copy,
+                    std::span<const u8> linear, std::span<u8> guest, bool native) {
+    const auto level = BlockLinearLevels(info).front();
+    const u32 bpp = BytesPerBlock(info.format);
+    const u32 stride = StrideAlignment(AdjustTileSize(info.size, DefaultBlockSize(info.format)),
+                                       info.block, BytesPerBlockLog2(info.format),
+                                       info.tile_width_spacing);
+    SwizzleTexture(guest, linear, bpp, info.size.width, copy.image_extent.height, 1,
+                   level.block_height, 0, stride, native);
+}
+
+std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memory,
+                                                 GPUVAddr gpu_addr, const ImageInfo& info,
+                                                 std::span<const LevelRect> rects,
+                                                 std::span<u8> output) {
+    return UnswizzleImageRects(
+        [&](GPUVAddr address, std::span<u8> bytes) {
+            gpu_memory.ReadBlockUnsafe(address, bytes.data(), bytes.size());
+        },
+        gpu_addr, info, rects, output, gpu_memory.UsesNativeTiling());
+}
+
+std::vector<BufferImageCopy> UnswizzleImageRects(
+    const std::function<void(GPUVAddr, std::span<u8>)>& read, GPUVAddr gpu_addr,
+    const ImageInfo& info, std::span<const LevelRect> rects, std::span<u8> output,
+    bool native_tiling) {
+    const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
+    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+    std::vector<BufferImageCopy> copies;
+    std::vector<u8> swizzled;
+    size_t output_offset = 0;
+    for (const LevelRect& rect : rects) {
+        const BlockLinearLevel& level = levels[rect.level];
+        const RectBlocks blocks = BlocksOf(level, rect);
+        const u32 width = blocks.num_blocks * level.block_texels;
+        const size_t row_bytes = size_t{blocks.num_blocks} * level.block_bytes;
+        for (u32 row = blocks.first_row; row <= blocks.last_row; ++row) {
+            // A row of whole blocks is laid out like an image of that width on its own.
+            const u32 texel_rows = BlockRowTexelRows(level, row);
+            const size_t bytes = (size_t{width} << bpp_log2) * texel_rows;
+            const GPUVAddr row_addr = gpu_addr + level.offset +
+                                      u64{row} * level.blocks_per_row * level.block_bytes +
+                                      u64{blocks.first_block} * level.block_bytes;
+            swizzled.assign(row_bytes, 0);
+            read(row_addr, swizzled);
+            UnswizzleTexture(output.subspan(output_offset, bytes), swizzled, 1U << bpp_log2, width,
+                             texel_rows, 1, level.block_height, 0, 0,
+                             native_tiling);
+            const u32 row_y = row * level.block_rows;
+            const u32 y0 = (std::max)(rect.y, row_y);
+            const u32 y1 = (std::min)(rect.y + rect.height, row_y + texel_rows);
+            copies.push_back(BufferImageCopy{
+                .buffer_offset = output_offset + ((size_t{y0 - row_y} * width) << bpp_log2),
+                .buffer_size = bytes,
+                .buffer_row_length = width,
+                .buffer_image_height = texel_rows,
+                .image_subresource =
+                    {
+                        .base_level = rect.level,
+                        .base_layer = 0,
+                        .num_layers = 1,
+                    },
+                .image_offset = {static_cast<s32>(rect.x), static_cast<s32>(y0), 0},
+                .image_extent = {rect.width, y1 - y0, 1},
+            });
+            output_offset += bytes;
+        }
+    }
+    return copies;
+}
+
+bool StreamRectUploads(const ImageInfo& info, GPUVAddr address,
+                       std::span<const LevelRect> rects, size_t limit,
+                       const UploadReader& read, const UploadChunk& upload,
+                       bool native_tiling) {
+    if (info.type != ImageType::e2D || info.size.depth != 1 || info.num_samples != 1 ||
+        info.resources.layers != 1 || info.resources.levels < 1 ||
+        info.resources.levels > static_cast<s32>(MAX_MIP_LEVELS) ||
+        !info.size.width || !info.size.height || info.block.width || info.block.depth ||
+        info.block.height > 5 || info.tile_width_spacing > 7 ||
+        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1 ||
+        GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) return false;
+    const auto levels = BlockLinearLevels(info);
+    // Plan the complete operation before producing uploads. Each piece covers at most one
+    // GOB row and a whole number of GOB columns (except the image's clipped right edge).
+    std::vector<LevelRect> pieces;
+    for (const auto& rect : rects) {
+        if (rect.level < 0 || static_cast<size_t>(rect.level) >= levels.size()) return false;
+        const auto& level = levels[rect.level];
+        if (!rect.width || !rect.height || rect.x >= level.width || rect.y >= level.height ||
+            rect.width > level.width - rect.x || rect.height > level.height - rect.y ||
+            rect.x % level.block_texels || limit < level.block_bytes) return false;
+        const u32 max_blocks = static_cast<u32>(std::min<size_t>(
+            limit / level.block_bytes, level.blocks_per_row));
+        if (!max_blocks) return false;
+        const auto blocks = BlocksOf(level, rect);
+        const u64 end = u64{level.offset} + u64{blocks.last_row} * level.blocks_per_row *
+                        level.block_bytes + u64{blocks.first_block + blocks.num_blocks} * level.block_bytes;
+        if (address > std::numeric_limits<u64>::max() - end) return false;
+        for (u32 row = blocks.first_row; row <= blocks.last_row; ++row) {
+            const u32 y0 = std::max(rect.y, row * level.block_rows);
+            const u32 y1 = std::min(rect.y + rect.height,
+                                    row * level.block_rows + BlockRowTexelRows(level, row));
+            for (u32 x = rect.x; x < rect.x + rect.width;) {
+                const u32 width = std::min(rect.x + rect.width - x,
+                                           max_blocks * level.block_texels);
+                pieces.push_back({rect.level, x, y0, width, y1 - y0});
+                x += width;
+            }
+        }
+    }
+    std::vector<u8> data;
+    for (size_t first = 0; first < pieces.size();) {
+        size_t last = first, bytes = 0;
+        while (last < pieces.size()) {
+            const size_t next = UnswizzledRectsBytes(info, std::span{pieces}.subspan(last, 1));
+            if (next > limit - bytes) break;
+            bytes += next;
+            ++last;
+        }
+        if (last == first) return false; // Preflight limits make this unreachable.
+        data.resize(bytes);
+        const auto copies = UnswizzleImageRects(read, address, info,
+            std::span{pieces}.subspan(first, last - first), data, native_tiling);
+        upload(data, copies);
+        first = last;
+    }
+    return true;
 }
 
 void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
@@ -1212,6 +1638,37 @@ Extent3D MipBlockSize(const ImageInfo& info, u32 level) {
     const Extent3D level_size = AdjustMipSize(info.size, level);
     const Extent3D num_tiles = AdjustTileSize(level_size, tile_size);
     return AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+}
+
+bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                           std::span<const ImageCopy> copies) {
+    constexpr ImageFlagBits excluded = ImageFlagBits::Rescaled | ImageFlagBits::TrimmedLevels |
+                                       ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse |
+                                       ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles;
+    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D ||
+        src.info.format != dst.info.format || src.info.astc_opaque != dst.info.astc_opaque ||
+        True((src.flags | dst.flags) & excluded)) {
+        return false;
+    }
+    // Alias copies count a compressed extent in blocks, but the backends copy it as texels, so
+    // such a copy writes only part of the image.
+    if (DefaultBlockWidth(dst.info.format) != 1 || DefaultBlockHeight(dst.info.format) != 1) {
+        return false;
+    }
+    for (s32 level = 0; level < dst.info.resources.levels; ++level) {
+        const Extent3D size = MipSize(dst.info.size, level);
+        const bool covered = std::ranges::any_of(copies, [&](const ImageCopy& copy) {
+            return copy.dst_subresource.base_level == level &&
+                   copy.dst_subresource.base_layer == 0 &&
+                   copy.dst_subresource.num_layers >= dst.info.resources.layers &&
+                   copy.dst_offset == Offset3D{} && copy.extent.width >= size.width &&
+                   copy.extent.height >= size.height;
+        });
+        if (!covered) {
+            return false;
+        }
+    }
+    return true;
 }
 
 boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {

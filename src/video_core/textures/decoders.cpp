@@ -41,9 +41,67 @@ void incrpdep(u32& value) {
     value = ((value | ~mask) + swizzled_incr) & mask;
 }
 
+// Traverse a whole 64-byte by 8-row GOB at a time. Linear-row traversal repeatedly
+// write-allocates partly filled cache lines across the entire tiled image.
+template <bool TO_LINEAR, bool NATIVE>
+void SwizzleGobs(std::span<u8> output, std::span<const u8> input, u32 width, u32 height,
+                 u32 depth, u32 block_height, u32 block_depth, u32 stride) {
+    const u32 pitch = width * 16;
+    const u32 block_size = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT) <<
+                           (GOB_SIZE_SHIFT + block_height + block_depth);
+    const u32 slice_size = Common::DivCeilLog2(height, block_height + GOB_SIZE_Y_SHIFT) * block_size;
+    const u32 block_height_mask = (1U << block_height) - 1;
+    const u32 block_depth_mask = (1U << block_depth) - 1;
+    const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
+    constexpr auto y_offsets = [] {
+        std::array<u32, 8> offsets{};
+        for (u32 y = 0; y < 8; ++y) offsets[y] = NativeGobOffset(pdep<SWIZZLE_Y_BITS>(y), NATIVE);
+        return offsets;
+    }();
+    constexpr u32 x1 = NativeGobOffset(pdep<SWIZZLE_X_BITS>(16), NATIVE);
+    constexpr u32 x2 = NativeGobOffset(pdep<SWIZZLE_X_BITS>(32), NATIVE);
+    constexpr u32 x3 = NativeGobOffset(pdep<SWIZZLE_X_BITS>(48), NATIVE);
+    for (u32 z = 0; z < depth; ++z) {
+        const u32 offset_z = (z >> block_depth) * slice_size +
+                            ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
+        for (u32 y = 0; y < height; y += 8) {
+            const u32 block_y = y >> GOB_SIZE_Y_SHIFT;
+            const u32 offset_y = (block_y >> block_height) * block_size +
+                                ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+            const u32 rows = std::min(8U, height - y);
+            for (u32 x = 0; x < width / 4; ++x) {
+                const u32 gob = offset_z + offset_y + (x << x_shift);
+                for (u32 row = 0; row < rows; ++row) {
+                    const u32 linear = (z * height + y + row) * pitch + x * 64;
+                    const u32 tiled = gob + y_offsets[row];
+                    if constexpr (TO_LINEAR) {
+                        std::memcpy(output.data() + tiled, input.data() + linear, 16);
+                        std::memcpy(output.data() + tiled + x1, input.data() + linear + 16, 16);
+                        std::memcpy(output.data() + tiled + x2, input.data() + linear + 32, 16);
+                        std::memcpy(output.data() + tiled + x3, input.data() + linear + 48, 16);
+                    } else {
+                        std::memcpy(output.data() + linear, input.data() + tiled, 16);
+                        std::memcpy(output.data() + linear + 16, input.data() + tiled + x1, 16);
+                        std::memcpy(output.data() + linear + 32, input.data() + tiled + x2, 16);
+                        std::memcpy(output.data() + linear + 48, input.data() + tiled + x3, 16);
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
 void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height, u32 depth,
                  u32 block_height, u32 block_depth, u32 stride, bool native_tiling) {
+    if constexpr (BYTES_PER_PIXEL == 16) {
+        if (width % 4 == 0) {
+            if (native_tiling) return SwizzleGobs<TO_LINEAR, true>(output, input, width, height,
+                depth, block_height, block_depth, stride);
+            return SwizzleGobs<TO_LINEAR, false>(output, input, width, height,
+                depth, block_height, block_depth, stride);
+        }
+    }
     // The origin of the transformation can be configured here, leave it as zero as the current API
     // doesn't expose it.
     static constexpr u32 origin_x = 0;

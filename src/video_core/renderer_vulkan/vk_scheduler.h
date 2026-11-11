@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -19,6 +20,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/readback_dependency_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -78,6 +80,16 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Changes whenever a render pass begins or ends (fast draw).
+    u64 RenderPassSerial() const {
+        return render_pass_serial;
+    }
+
+    /// The graphics pipeline bound in the current command buffer, if the scheduler knows it.
+    const GraphicsPipeline* BoundGraphicsPipeline() const {
+        return state.graphics_pipeline;
+    }
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
@@ -135,6 +147,8 @@ public:
         return true;
     }
 
+    void EnableHostReadbackVisibility() { host_readback_visibility = true; }
+
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore->CurrentTick();
@@ -152,6 +166,7 @@ public:
     /// be waiting for them).
     void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true) {
         if (tick > 0 && (may_flush || WaitForSubmission(tick))) {
+            VideoCommon::ReadbackDependencyDiagnostics::GpuWaitScope readback_wait{tick};
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
@@ -329,9 +344,11 @@ private:
     DeferredClear deferred_clear;
 
     std::unique_ptr<CommandChunk> chunk;
+    bool host_readback_visibility{};
     std::function<void()> on_submit;
 
     State state;
+    u64 render_pass_serial{}; ///< RenderPassSerial
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
@@ -344,6 +361,7 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    std::atomic<u32> queued_chunks{}; ///< Chunks in work_queue, for the worker's poll without the mutex
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

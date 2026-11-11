@@ -17,6 +17,7 @@
 
 #include <array>
 #include <compare>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -99,6 +100,12 @@ public:
         ViewportTransformState,
         ReplaceConstBuffer,
         HasHLEMacroState,
+        /// Native programs: whether a constant buffer value is a mapped storage buffer pointer
+        /// (arg0 = bank, arg1 = offset), and whether a pointer table entry is (arg0 = bank and the
+        /// entry's offset in the table from bit 8, arg1 = offset). The answers come from the GPU's
+        /// mappings, so two pipelines with the same constant buffer words may still differ.
+        StorageBufferPointer,
+        IndirectStorageBufferPointer,
     };
     /// GetReplaceConstBuffer's answer when there is no replacement.
     static constexpr u32 NoReplacement = ~0U;
@@ -127,6 +134,8 @@ private:
     struct Properties {
         std::array<u32, sizeof(Shader::ProgramHeader) / sizeof(u32)> sph;
         std::array<u32, 8> gp_passthrough_mask; ///< Geometry programs only.
+        std::array<u32, 3> mesh_registers; ///< Task and mesh programs only.
+        std::array<u32, sizeof(Shader::ProgramHeader) / sizeof(u32)> mesh_primitive_header;
         std::array<u32, 3> workgroup_size;
         Shader::Stage stage;
         u32 start_address;
@@ -160,6 +169,10 @@ public:
     u64 ReadInstruction(u32 address) override;
     u32 TranslateProgramAddress(u32 address) const override;
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+    bool IsNativeProgram() const override;
+    u64 NativeProgramKey() const override;
+    bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+    bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
     Shader::TextureType ReadTextureType(u32 raw_handle) override;
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) override;
     bool IsTexturePixelFormatInteger(u32 raw_handle) override;
@@ -189,6 +202,8 @@ struct ReusableShaders {
     std::array<Shader::Info, Maxwell::MaxShaderStage> infos;
     /// What translation asked each program's environment, in the order the environments come.
     boost::container::static_vector<TranslationReads, Maxwell::MaxShaderProgram> reads;
+    /// Bytes of SPIR-V behind the modules (the driver keeps a copy per module).
+    size_t code_bytes{};
 
     /// The stage infos as GraphicsPipeline takes them: null for stages without a module.
     [[nodiscard]] std::array<const Shader::Info*, Maxwell::MaxShaderStage> InfoPointers() const;
@@ -224,6 +239,12 @@ private:
 
     mutable std::mutex mutex;
     ::Common::unordered_map<ShaderTranslationKey, Variants, ShaderTranslationKeyHash> entries;
+    /// Keys oldest first, and the SPIR-V bytes their shaders hold: past the budget
+    /// (EDEN_NX2_SHADER_REUSE_MIB, 32 by default) the oldest keys go. Kept for every key, the modules
+    /// were Eden's largest heap holder on Mario Kart World (110 MiB, growing with each race); a key
+    /// that went is translated again if a pipeline needs it.
+    std::deque<ShaderTranslationKey> order;
+    size_t total_bytes{};
 };
 
 } // namespace Vulkan

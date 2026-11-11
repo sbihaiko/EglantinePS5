@@ -121,6 +121,11 @@ public:
     }
 
     /// Value of a release the GPU already processed whose write may still be in flight on the host.
+    /// Last completed semaphore payload, never an uncompleted queued release.
+    virtual std::optional<u32> ReadPublishedSemaphore(DAddr addr, const void* pointer) {
+        return std::nullopt;
+    }
+
     virtual std::optional<u32> PendingSemaphoreRelease(DAddr addr) {
         return std::nullopt;
     }
@@ -161,6 +166,9 @@ public:
 
     /// Notify rasterizer that a frame is about to finish
     virtual void TickFrame() = 0;
+
+    /// End of a command list: lets caches age while the game renders without presenting.
+    virtual void TickWithoutPresent() {}
 
     virtual bool AccelerateConditionalRendering() {
         return false;

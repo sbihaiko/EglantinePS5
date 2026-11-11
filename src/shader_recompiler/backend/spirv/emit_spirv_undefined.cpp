@@ -29,11 +29,11 @@ Id EmitUndefU1(EmitContext& ctx) {
 }
 
 Id EmitUndefU8(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitUndefU16(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitUndefU32(EmitContext& ctx) {
@@ -41,7 +41,7 @@ Id EmitUndefU32(EmitContext& ctx) {
 }
 
 Id EmitUndefU64(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 } // namespace Shader::Backend::SPIRV

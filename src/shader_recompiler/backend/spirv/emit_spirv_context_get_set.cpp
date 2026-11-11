@@ -522,35 +522,35 @@ void EmitSetFragDepth(EmitContext& ctx, Id value) {
 }
 
 void EmitGetZFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitGetSFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitGetCFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitGetOFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitSetZFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitSetSFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitSetCFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 void EmitSetOFlag(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+    throw NotImplementedException("SPIR-V Instruction {}", __func__);
 }
 
 Id EmitWorkgroupId(EmitContext& ctx) {
@@ -619,7 +619,7 @@ Id EmitRenderArea(EmitContext& ctx) {
         const Id pointer{ctx.OpAccessChain(pointer_type, ctx.render_area_push_constant, index)};
         return ctx.OpLoad(ctx.F32[4], pointer);
     } else {
-        throw NotImplementedException("SPIR-V Instruction");
+        throw NotImplementedException("SPIR-V Instruction {}", __func__);
     }
 }
 

@@ -21,6 +21,8 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
+#include "video_core/readback_write_tracker.h"
+#include "video_core/mapped_readback_policy.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -34,6 +36,7 @@ struct HostVertexBinding;
 class BufferCacheRuntime;
 
 class Buffer : public VideoCommon::BufferBase {
+    friend class BufferCacheRuntime;
 public:
     explicit Buffer(BufferCacheRuntime&, VideoCommon::NullBufferParams null_params);
     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
@@ -62,6 +65,9 @@ public:
     }
 
     void MarkUsage(u64 offset, u64 size) noexcept;
+    u64 ReadbackIdentity() const { return readback_writes ? readback_writes->identity : 0; }
+    std::optional<VideoCommon::ReadbackRangeTracker::Ticket> ReadbackProducer(u64 offset, u64 size) const;
+
 
     void ResetUsageTracking() noexcept {
         tracker.Reset();
@@ -85,13 +91,19 @@ private:
 
     const Device* device{};
     Scheduler* scheduler{};
+    std::shared_ptr<VideoCommon::MappedReadbackPolicy::Lease> readback_lease;
     vk::Buffer buffer;
+    std::span<const u8> readback_mapping;
+    bool readback_promotion_failed{};
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
     VkDeviceAddress device_address{};
     u64 last_usage_tick{};
     bool is_null{};
     bool sparse_compatible{};
+    BufferCacheRuntime* readback_runtime{};
+    mutable unsigned readback_requests{};
+    mutable std::shared_ptr<VideoCommon::ReadbackWriteTracker<VkBuffer>::State> readback_writes;
 };
 
 class QuadArrayIndexBuffer;
@@ -100,10 +112,14 @@ class QuadStripIndexBuffer;
 class BufferCacheRuntime {
     friend Buffer;
 
+
     using PrimitiveTopology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
     using IndexFormat = Tegra::Engines::Maxwell3D::Regs::IndexFormat;
 
 public:
+    // Called after RasterizerVulkan connects the scheduler query cache.
+    void ProbeMappedReadback(DescriptorPool& pool, ComputePassDescriptorQueue& queue);
+
     explicit BufferCacheRuntime(const Device& device_, MemoryAllocator& memory_manager_,
                                 Scheduler& scheduler_, StagingBufferPool& staging_pool_,
                                 GuestDescriptorQueue& guest_descriptor_queue,
@@ -113,6 +129,23 @@ public:
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
     u64 CurrentTick();
+    bool NeedsReadbackPromotion(const Buffer& buffer);
+    std::span<const u8> TryMappedReadback(const Buffer& buffer,
+                                        std::span<const VideoCommon::BufferCopy> copies);
+    unsigned MappedReadbackMode() const;
+    void ValidateMappedReadback(std::span<const u8> expected, std::span<const u8> actual);
+    void RecordDirectReadback(u64 bytes);
+
+    bool ReadbackTrackingEnabled() const { return readback_writers.Enabled(); }
+    void BeginReadbackWriteBatch() { readback_writers.BeginBatch(); }
+    void AbortReadbackWriteBatch() { readback_writers.AbortBatch(); }
+    void CompleteReadbackWriteBatch();
+    void NoteReadbackShaderWrite(const Buffer& buffer, u64 offset, u64 size) {
+        readback_writers.NoteShaderWrite(buffer.Handle(), offset, size);
+    }
+    void InvalidateReadback(const Buffer& buffer) { readback_writers.Invalidate(buffer.Handle()); }
+    void InvalidateAllReadback() { readback_writers.InvalidateAll(); }
+
 
     bool IsFree(u64 tick);
 
@@ -210,6 +243,7 @@ public:
     }
 
     void OnBufferDeleted(const Buffer& buffer) {
+        InvalidateReadback(buffer);
         multi_range_buffers.DropOwner(scheduler, buffer.Handle());
     }
 
@@ -270,6 +304,9 @@ private:
     std::unique_ptr<Uint8Pass> uint8_pass;
     QuadIndexedPass quad_index_pass;
 
+    VideoCommon::MappedReadbackPolicy mapped_readback_policy;
+    bool mapped_readback_failed{};
+    VideoCommon::ReadbackWriteTracker<VkBuffer> readback_writers;
     MultiRangeBufferCache multi_range_buffers;
     boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
     VkDeviceSize multi_range_total{};

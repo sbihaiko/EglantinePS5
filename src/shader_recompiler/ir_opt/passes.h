@@ -20,7 +20,11 @@ void ConditionalBarrierPass(IR::Program& program);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);
-void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info);
+void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+                                     const HostTranslateInfo& host_info);
+/// How many storage buffers a program may bind: MAX_SSBOS, or fewer if the device's per-stage or
+/// descriptor set limit is lower
+size_t StorageBufferLimit(const HostTranslateInfo& host_info);
 void IdentityRemovalPass(IR::Program& program);
 void LowerFp64ToFp32(IR::Program& program);
 void LowerFp16ToFp32(IR::Program& program);
@@ -39,6 +43,6 @@ bool HasBrokenPattern(const IR::Program& program);
 void VertexATransformPass(IR::Program& program);
 void VertexBTransformPass(IR::Program& program);
 void JoinTextureInfo(Info& base, Info& source);
-void JoinStorageInfo(Info& base, Info& source);
+void JoinStorageInfo(Info& base, Info& source, size_t limit);
 
 } // namespace Shader::Optimization

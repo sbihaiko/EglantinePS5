@@ -76,3 +76,40 @@ TEST_CASE("NX2 larger core cache rejects incomplete certificates",
         REQUIRE_FALSE(cache->CanReuse(page, 1, 11, 0, 4));
     }
 }
+
+TEST_CASE("Core ordered reads certify a mapped page without requiring a fastmem arena",
+          "[core][nx2][readback_cache]") {
+    std::array<u8, YUZU_PAGESIZE * 2> backing{};
+    const HostReadbackCache::Page page{&backing, backing.data(), 0x8000, 3, 1};
+    CoreReadbackCacheImpl<5> cache;
+    for (const u64 offset : {0ULL, 4ULL, 2048ULL, 4092ULL}) {
+        const auto request = cache.OrderedRange(page, 1, 0x8000 + offset, 4);
+        REQUIRE(request.address == 0x8000);
+        REQUIRE(request.size == YUZU_PAGESIZE);
+        const VideoCore::RasterizerDownloadArea completed{
+            request.address, request.address + request.size, false, 11};
+        REQUIRE(cache.Remember(page, completed, page, 1, 11));
+        REQUIRE(cache.CanReuse(page, 1, 11, offset, 4));
+        REQUIRE_FALSE(cache.CanReuse(page, 1, 12, offset, 4));
+    }
+    for (unsigned invalid = 0; invalid < 9; ++invalid) {
+        auto changed = page;
+        size_t aliases = 1;
+        DAddr address = 0x8004;
+        u64 bytes = 4;
+        switch (invalid) {
+        case 0: changed.owner = nullptr; break;
+        case 1: changed.owner_instance = 0; break;
+        case 2: changed.host_page = nullptr; break;
+        case 3: changed.device_page = 0; break;
+        case 4: changed.device_page += 1; break;
+        case 5: aliases = 2; break;
+        case 6: bytes = YUZU_PAGESIZE; break;
+        case 7: address += YUZU_PAGESIZE; break;
+        case 8: bytes = 0; break;
+        }
+        const auto request = cache.OrderedRange(changed, aliases, address, bytes);
+        REQUIRE(request.address == address);
+        REQUIRE(request.size == bytes);
+    }
+}

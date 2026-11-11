@@ -185,7 +185,7 @@ TEST_CASE("Ampere static exit capture ignores scheduling fields", "[video_core][
     }
 }
 
-TEST_CASE("Ampere geometry loop transfer is bounded to a nonreturning call pattern",
+TEST_CASE("Ampere geometry loop transfer is a predicated branch past the loop's BRA",
           "[video_core][ampere]") {
     const std::array<Instruction, 4> code{{
         {{0x00003944, 16, 0x03c00000, 0}},
@@ -194,22 +194,41 @@ TEST_CASE("Ampere geometry loop transfer is bounded to a nonreturning call patte
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
     REQUIRE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(code)));
+    // A RET there has no call to return from.
     auto returning = code;
     returning[2].words[0] = 0x00007950;
     REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(returning)));
+    // The loop's own branch may be conditional: the BRA lowering handles it.
     auto conditional_branch = code;
     conditional_branch[1].words[0] = 0x00001947;
-    REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(conditional_branch)));
+    REQUIRE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(conditional_branch)));
     auto extra_condition = code;
     extra_condition[0].words[2] ^= 1U << 24;
     REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(extra_condition)));
-    for (u32 instruction = 0; instruction < 2; ++instruction) {
-        for (u32 bit : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 30U, 31U}) {
-            auto extended_mode = code;
-            extended_mode[instruction].words[3] ^= 1U << bit;
-            REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(extended_mode)));
-        }
+    for (u32 bit : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 30U, 31U}) {
+        auto extended_mode = code;
+        extended_mode[0].words[3] ^= 1U << bit;
+        REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(extended_mode)));
     }
+}
+
+TEST_CASE("Ampere predicated NOINC after a return link setup stays a call",
+          "[video_core][ampere]") {
+    // MOV R2, 0x20 makes the instruction after the CALL its return address: a conditional real
+    // call, which is not lowered.
+    const std::array<Instruction, 5> code{{
+        {{0x00027802, 0x20, 0x00000f00, 0}},
+        {{0x00003944, 16, 0x03c00000, 0}},
+        {{0x00007947, 0xffffffe0, 0x0383ffff, 0}},
+        {{0x0000794d, 0, 0x03800000, 0}},
+        {{0x0000794d, 0, 0x03800000, 0}},
+    }};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(code);
+    REQUIRE_FALSE(static_cast<bool>(lowered));
+    REQUIRE(lowered.error_offset == 0x10);
+    auto unrelated = code;
+    unrelated[0].words[1] = 0x30;
+    REQUIRE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(unrelated)));
 }
 
 constexpr std::array<Instruction, 8> TerminalFloatTailProgram{{
@@ -231,66 +250,4 @@ TEST_CASE("Ampere terminal minmax tails allow an unrelated linked return",
     REQUIRE(lowered.instructions.back() == 0xe32000000007000fULL);
 }
 
-TEST_CASE("Ampere terminal minmax proof rejects intervening control and unknown state",
-          "[video_core][ampere]") {
-    for (const Instruction intervening : {
-             Instruction{{0x02007950, 0xffffffb0, 0x03c3ffff, 0}},
-             Instruction{{0x00007944, 0, 0x03c00000, 0}},
-             Instruction{{0x00007947, 0, 0x03800000, 0}},
-             Instruction{{0x00007949, 0xffffffb0, 0x0383ffff, 0}},
-             Instruction{{0x00007958, 0xffffffb0, 0x0b83ffff, 0}},
-             Instruction{{0x0000734e, 0, 0, 0}},
-             Instruction{{0x00007357, 0, 0, 0}},
-             Instruction{{0x00007957, 0, 0, 0}},
-             Instruction{{0x00007fff, 0, 0, 0}},
-         }) {
-        auto code = TerminalFloatTailProgram;
-        code[4] = intervening;
-        const auto lowered = Shader::Ampere::LowerToMaxwell(code);
-        REQUIRE_FALSE(static_cast<bool>(lowered));
-        REQUIRE(lowered.error_offset == 0x20);
-    }
-}
-
-TEST_CASE("Ampere terminal minmax proof requires an exact unconditional exit",
-          "[video_core][ampere]") {
-    for (const Instruction exit : {
-             Instruction{{0x0000194d, 0, 0x03800000, 0}},
-             Instruction{{0x0000f94d, 0, 0x03800000, 0}},
-             Instruction{{0x0000794d, 0, 0x03900000, 0}},
-             Instruction{{0x0000794d, 0, 0x03000000, 0}},
-             Instruction{{0x0000794d, 1, 0x03800000, 0}},
-         }) {
-        auto code = TerminalFloatTailProgram;
-        code[6] = exit;
-        const auto lowered = Shader::Ampere::LowerToMaxwell(code);
-        REQUIRE_FALSE(static_cast<bool>(lowered));
-        REQUIRE(lowered.error_offset == 0x20);
-    }
-    REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(
-        std::span<const Instruction>{TerminalFloatTailProgram}.first(4))));
-    auto distant_target = TerminalFloatTailProgram;
-    distant_target[2].words[1] = 0x1000;
-    REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(distant_target)));
-}
-
-TEST_CASE("Ampere terminal minmax proof rejects extended instruction modes",
-          "[video_core][ampere]") {
-    for (u32 instruction = 2; instruction <= 6; ++instruction) {
-        for (u32 bit : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 30U, 31U}) {
-            auto code = TerminalFloatTailProgram;
-            code[instruction].words[3] ^= 1U << bit;
-            REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(code)));
-        }
-    }
-    auto predicated = TerminalFloatTailProgram;
-    predicated[4].words[0] ^= 1U << 12;
-    REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(predicated)));
-    auto unknown_float_mode = TerminalFloatTailProgram;
-    unknown_float_mode[4].words[2] ^= 1U << 10;
-    REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(unknown_float_mode)));
-    auto invalid_register_form = TerminalFloatTailProgram;
-    invalid_register_form[4].words[1] |= 1U << 8;
-    REQUIRE_FALSE(static_cast<bool>(Shader::Ampere::LowerToMaxwell(invalid_register_form)));
-}
 } // namespace

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/hle/kernel/svc/svc_memory_stats.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -31,6 +32,7 @@ constexpr bool IsValidSharedMemoryPermission(MemoryPermission perm) {
 
 Result MapSharedMemory(Core::System& system, Handle shmem_handle, u64 address, u64 size,
                        Svc::MemoryPermission map_perm) {
+    MemoryStats::Note(MemoryStats::MapSharedMemory, size, true);
     LOG_TRACE(Kernel_SVC,
               "called, shared_memory_handle={:#x}, addr={:#x}, size={:#x}, permissions={:#08x}",
               shmem_handle, address, size, map_perm);

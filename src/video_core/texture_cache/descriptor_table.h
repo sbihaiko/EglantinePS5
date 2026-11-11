@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <vector>
 
 #include "common/alignment.h"
@@ -18,7 +19,7 @@
 
 namespace VideoCommon {
 
-template <typename T>
+template <typename T, typename Id = u32>
 class DescriptorTable {
 public:
     [[nodiscard]] bool Synchronize(GPUVAddr gpu_addr, u32 limit) noexcept {
@@ -30,7 +31,9 @@ public:
     }
 
     void Invalidate() noexcept {
-        std::ranges::fill(read_descriptors, 0);
+        // Every deleted image invalidates every channel's tables: clear once, on the next read.
+        invalidated = true;
+        ++changes;
     }
 
     [[nodiscard]] std::pair<T, bool> Read(Tegra::MemoryManager const& gpu_memory, u32 index) noexcept {
@@ -38,12 +41,14 @@ public:
         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
         std::pair<T, bool> result;
         gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
-        if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
-            result.second = result.first != descriptors[index];
-        } else {
-            read_descriptors[index / 64] |= 1ULL << (index % 64);
-            result.second = true;
+        if (invalidated) {
+            std::ranges::fill(read_descriptors, 0);
+            invalidated = false;
         }
+        auto& bits = read_descriptors[index / 64];
+        const u64 mask = 1ULL << (index % 64);
+        result.second = (bits & mask) == 0 || result.first != descriptors[index];
+        bits |= mask;
         if (result.second) {
             descriptors[index] = result.first;
         }
@@ -53,21 +58,29 @@ public:
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;
-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
+        ++changes;
+        // Power-of-two growth: amortised like the old 0x80000 rounding without 16 MiB per table.
+        const size_t num_descriptors = std::bit_ceil(static_cast<size_t>(limit) + 1);
         size_t old_size = read_descriptors.size();
         read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
         old_size = (std::min)(old_size, read_descriptors.size());
         std::fill(read_descriptors.begin(), read_descriptors.begin() + old_size, 0);
-        //
-        descriptors.resize(num_descriptors);
+        invalidated = false;
+        if (descriptors.size() < num_descriptors) {
+            descriptors.resize(num_descriptors);
+            bound_ids.resize(num_descriptors);
+        }
     }
 
     std::vector<u64> read_descriptors;
     std::vector<T> descriptors;
+    std::vector<Id> bound_ids; ///< Cache id resolved for each read descriptor
     GPUVAddr current_gpu_addr{};
     u32 current_limit{};
+    bool invalidated{};
+    /// Bumped by every Invalidate and Refresh: the ids resolved before are only good while it
+    /// stays the same (texture memo).
+    u64 changes{};
 };
 
 } // namespace VideoCommon

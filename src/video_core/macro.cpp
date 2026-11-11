@@ -1,3 +1,4 @@
+#include "video_core/nx2_loading_probe.h"
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -26,7 +27,9 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "common/container_hash.h"
+#include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/memory_manager.h"
@@ -1401,11 +1404,89 @@ YUZU_NO_INLINE void MacroEngine::ReadNativeMemory(Engines::Maxwell3D& maxwell3d,
     }
 }
 
+void MacroEngine::RecordBananzaTerrainDepthDraw(Engines::Maxwell3D& maxwell3d, u32 instances) {
+    if (!native_turing || !bananza_terrain_enabled.value_or(false) || instances != 1) {
+        return;
+    }
+    const auto& regs = maxwell3d.regs;
+    using Compare = Maxwell3D::Regs::ComparisonOp;
+    const bool less = regs.depth_test_func == Compare::Less_D3D ||
+                      regs.depth_test_func == Compare::Less_GL;
+    if (!regs.rasterize_enable || !regs.IsShaderConfigEnabled(4) ||
+        regs.rt_control.count.Value() != 2 || !regs.depth_write_enabled || !less ||
+        regs.color_mask[0].raw || regs.color_mask[1].raw ||
+        regs.rt[0].width < 1280 || regs.rt[0].height < 700 ||
+        maxwell3d.draw_manager.draw_state.topology != Maxwell3D::Regs::PrimitiveTopology::Triangles) {
+        return;
+    }
+    const auto& cb = maxwell3d.state.shader_stages[3].const_buffers[0];
+    auto& memory = maxwell3d.GetMemoryManager();
+    if (!cb.enabled || cb.size < 0x430 ||
+        !memory.IsFullyMappedRange(cb.address + 0x410, 0x20)) {
+        return;
+    }
+    const u64 counter = memory.Read<u64>(cb.address + 0x410);
+    const u64 counter_bytes = memory.Read<u64>(cb.address + 0x418);
+    const u64 indices = memory.Read<u64>(cb.address + 0x420);
+    const u64 index_bytes = memory.Read<u64>(cb.address + 0x428);
+    if (counter_bytes == 64 && index_bytes >= 6 && index_bytes <= 0xffffffffULL &&
+        index_bytes % 2 == 0 && memory.IsFullyMappedRange(counter, counter_bytes)) {
+        if (bananza_terrain_compat.RecordDepthDraw(memory.GetID(), counter, indices,
+                                                  u32(index_bytes / 2), instances)) {
+            // This compaction pass appends indices; its indirect arguments must start fresh.
+            const std::array<u32, 2> arguments{0, instances};
+            maxwell3d.Rasterizer().AccelerateInlineToMemory(
+                counter, sizeof(arguments),
+                std::span<const u8>{reinterpret_cast<const u8*>(arguments.data()), sizeof(arguments)});
+        }
+    }
+}
+
 void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                           std::span<const u32> parameters) {
+    VideoCommon::LoadingProbe::gpu.Mark("macro enter", method);
+    SCOPE_EXIT { VideoCommon::LoadingProbe::gpu.Mark("macro leave", method); };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     if (native_turing) {
         maxwell3d.RefreshParameters();
+        if (!bananza_terrain_enabled.has_value()) {
+            const u64 program_id = system.GetApplicationProcessProgramID();
+            if (program_id != 0) {
+                bananza_terrain_enabled = program_id == 0x040074a01bf12000ULL;
+            }
+        }
+        std::array<u32, 6> terrain_parameters{};
+        if (bananza_terrain_enabled.value_or(false) && method == 0x1e7 &&
+            parameters.size() == 6 && parameters[1] != 0 &&
+            parameters[0] == u32(Maxwell3D::Regs::PrimitiveTopology::Triangles)) {
+            const auto& regs = maxwell3d.regs;
+            using Compare = Maxwell3D::Regs::ComparisonOp;
+            const bool equal = regs.depth_test_func == Compare::Equal_D3D ||
+                               regs.depth_test_func == Compare::Equal_GL;
+            if (regs.rasterize_enable && regs.rt[0].width >= 1280 && regs.rt[0].height >= 700 &&
+                !regs.IsShaderConfigEnabled(4) && regs.IsShaderConfigEnabled(5) &&
+                regs.rt_control.count.Value() == 3 && !regs.depth_write_enabled && equal &&
+                regs.color_mask[0].raw && regs.index_buffer.FormatSizeInBytes() == 2) {
+                bananza_terrain_compat.BeginColorPass();
+                if (parameters[2] == 0 && parameters[3] == 0 && parameters[4] == 0 &&
+                    parameters[5] == 0) {
+                    // The compacted color draw can arrive with a zero instance field.
+                    // Reuse its depth draw only when both generated resources match.
+                    const auto instances = bananza_terrain_compat.FindInstances(
+                        maxwell3d.GetMemoryManager().GetID(), maxwell3d.GetMacroAddress(1),
+                        regs.index_buffer.StartAddress(), parameters[1]);
+                    if (instances) {
+                        std::copy(parameters.begin(), parameters.end(), terrain_parameters.begin());
+                        terrain_parameters[2] = *instances;
+                        parameters = terrain_parameters;
+                        if (!bananza_terrain_compat_logged) {
+                            bananza_terrain_compat_logged = true;
+                            LOG_INFO(HW_GPU, "Bananza terrain compatibility: preserving depth-pass instances for compacted color draws");
+                        }
+                    }
+                }
+            }
+        }
         const auto context = reinterpret_cast<std::uintptr_t>(this);
         static std::unordered_set<std::uintptr_t> captured_contexts;
         static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
@@ -1465,7 +1546,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                 }
                 {
                     VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
-                    maxwell3d.CallMethod(system, address, value, true);
+                    maxwell3d.MacroWrite(system, address, value);
                 }
                 // Turing MME memory reads (methods 0x550 SET_MME_MEM_ADDRESS_A/B, 0x558 data RAM
                 // address, 0x55c MME_DMA_READ into data RAM, 0x560 MME_DMA_READ_FIFOED into
@@ -1604,8 +1685,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
 
         UNREACHABLE();
     };
+    // HLE programs write registers directly, without the 3D engine's fast draw breaks.
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
     if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
+        FastDraw::Break(FastDraw::Reason::Method, method);
         execute_variant(it->second.program);
+        FastDraw::Break(FastDraw::Reason::Method, method);
         return;
     }
 
@@ -1646,7 +1731,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         ci.program = Compile(system, maxwell3d, code);
     }
 
+    FastDraw::Break(FastDraw::Reason::Method, method);
     execute_variant(ci.program);
+    FastDraw::Break(FastDraw::Reason::Method, method);
     if (Settings::values.dump_macros) {
         Dump(ci.hash, code, !std::holds_alternative<std::monostate>(ci.program));
     }

@@ -25,8 +25,10 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/readback_diagnostics.h"
 
 namespace VideoCommon {
 
@@ -85,8 +87,9 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
-        auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        auto [should_flush, committed_flushes, required_flushes] = CommitCacheFlushes();
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
+            ReadbackDiagnostics::CountFence(0, true);
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             gpu.BeginAsyncGuestWrite();
             SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
@@ -95,7 +98,9 @@ public:
             return;
         }
         skipped_fences = 0;
-        should_flush |= query_cache.HasUncommittedFlushes();
+        const bool query_flush = query_cache.HasUncommittedFlushes();
+        should_flush |= query_flush;
+        ReadbackDiagnostics::CountFence(required_flushes | (query_flush ? 4 : 0));
         query_cache.CommitAsyncFlushes();
         TFence new_fence = CreateFence(!should_flush);
         if constexpr (can_async_check) {
@@ -108,6 +113,7 @@ public:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
+            uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -206,6 +212,8 @@ private:
             }
             gpu.BeginAsyncGuestWrite();
             SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
+            // Downloads and operations write guest memory the next draws may read.
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             PopAsyncFlushes(pending_flushes.front());
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
@@ -237,7 +245,7 @@ private:
         }();
         struct Released {
             TFence fence;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             u8 flushes;
         };
         std::vector<Released> batch;
@@ -270,6 +278,10 @@ private:
             }
             gpu.BeginAsyncGuestWrite();
             SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
+            // Downloads and operations write guest memory the next draws may read: before (a draw
+            // locking the caches after this sees it) and after (one that noted the serial while
+            // they ran).
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             size_t texture_pops = 0;
             size_t buffer_pops = 0;
             for (const Released& released : batch) {
@@ -295,6 +307,7 @@ private:
                     operation();
                 }
             }
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             {
                 std::unique_lock lock(ring_guard);
                 for (Released& released : batch) {
@@ -330,6 +343,7 @@ private:
     struct CacheFlushes {
         bool should_flush;  ///< Downloads to wait for: the fence must reach the host GPU
         u8 committed;       ///< TextureFlushes, BufferFlushes: the caches that committed downloads
+        u8 required;        ///< The caches that requested device completion before committing
     };
 
     /// Commits the texture and buffer caches' downloads for a new fence (the query cache's are
@@ -343,6 +357,7 @@ private:
         {
             std::scoped_lock lock{texture_cache.mutex};
             flushes.should_flush = texture_cache.HasUncommittedFlushes();
+            if (flushes.should_flush) flushes.required |= TextureFlushes;
             if (texture_cache.HasAsyncFlushWork()) {
                 texture_cache.CommitAsyncFlushes();
                 flushes.committed |= TextureFlushes;
@@ -353,6 +368,7 @@ private:
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();
                 flushes.should_flush = true;
+                flushes.required |= BufferFlushes;
                 flushes.committed |= BufferFlushes;
             }
         }
@@ -383,8 +399,12 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    // Vectors, not deques: MSVC's deque of std::function holds one element per block, so every
+    // queued operation (one per query report, about 1000 a frame in busy scenes) allocated a
+    // block (Lichii #858, e9f57016b6).
+    using OperationList = std::vector<std::function<void()>>;
+    OperationList uncommitted_operations;
+    std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
 

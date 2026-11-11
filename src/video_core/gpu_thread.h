@@ -13,7 +13,8 @@
 #include <thread>
 #include <variant>
 
-#include "common/bounded_threadsafe_queue.h"
+#include "common/host_command_queue.h"
+#include "common/host_command_completion.h"
 #include "common/polyfill_thread.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/framebuffer_config.h"
@@ -97,9 +98,10 @@ using CommandData =
 struct CommandDataContainer {
     CommandDataContainer() = default;
 
-    explicit CommandDataContainer(CommandData&& data_, u64 next_fence_, bool block_,
+    explicit CommandDataContainer(CommandData&& data_, u64 next_fence_,
+                                  std::shared_ptr<Common::HostCommandCompletion> completion_,
                                   u64 published_work_sequence_)
-        : data{std::move(data_)}, fence{next_fence_}, block(block_),
+        : data{std::move(data_)}, fence{next_fence_}, completion{std::move(completion_)},
           published_work_sequence{published_work_sequence_} {
         if (const auto* read = std::get_if<CpuReadCommand>(&data); read && read->diagnostic) {
             read->diagnostic->fence = fence;
@@ -110,13 +112,13 @@ struct CommandDataContainer {
 
     CommandData data;
     u64 fence{};
-    bool block{};
+    std::shared_ptr<Common::HostCommandCompletion> completion;
     u64 published_work_sequence{};
 };
 
 /// Struct used to synchronize the GPU thread
 struct SynchState final {
-    using CommandQueue = Common::SPSCQueue<CommandDataContainer>;
+    using CommandQueue = Common::HostCommandQueue<CommandDataContainer>;
     std::mutex write_lock;
     CommandQueue queue;
     u64 last_fence{};

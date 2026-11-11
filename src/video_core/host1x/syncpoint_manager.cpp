@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
+
+#include "common/logging.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
 namespace Tegra {
@@ -57,11 +60,28 @@ void SyncpointManager::DeregisterHostAction(u32 syncpoint_id, const ActionHandle
     DeregisterAction(host_action_storage[syncpoint_id], handle);
 }
 
+// A syncpoint id from the command stream indexes fixed tables: one out of range (garbage
+// methods: a 24-bit fence id read from words that were not commands) read past them and crashed
+// in Increment on a null list node. Such an increment is dropped and reported.
+static bool SyncpointInRange(u32 syncpoint_id, size_t count) {
+    if (syncpoint_id < count) {
+        return true;
+    }
+    static std::atomic<u32> reported{};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_ERROR(HW_GPU, "Syncpoint {} out of range ({} syncpoints): increment dropped",
+                  syncpoint_id, count);
+    }
+    return false;
+}
+
 void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
+    if (!SyncpointInRange(syncpoint_id, NUM_MAX_SYNCPOINTS)) return;
     Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id]);
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
+    if (!SyncpointInRange(syncpoint_id, NUM_MAX_SYNCPOINTS)) return;
     Increment(syncpoints_host[syncpoint_id], wait_host_cv, host_action_storage[syncpoint_id]);
 }
 

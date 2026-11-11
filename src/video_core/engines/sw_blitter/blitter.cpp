@@ -1,3 +1,4 @@
+#include "video_core/nx2_loading_probe.h"
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -162,9 +163,11 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
     const auto dst_bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(dst.format));
     const size_t src_size = get_surface_size(src, src_bytes_per_pixel);
 
+    VideoCommon::LoadingProbe::blit.Mark("software read source", src.Address());
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::SafeRead> tmp_buffer(
         memory_manager, src.Address(), src_size, &impl->tmp_buffer);
 
+    VideoCommon::LoadingProbe::blit.Mark("software decode");
     const size_t src_copy_size = src_extent_x * src_extent_y * src_bytes_per_pixel;
     const size_t dst_copy_size = dst_extent_x * dst_extent_y * dst_bytes_per_pixel;
 
@@ -221,10 +224,15 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
         impl->dst_buffer.swap(impl->src_buffer);
     }
 
+    VideoCommon::LoadingProbe::blit.Mark("software read destination", dst.Address());
     const size_t dst_size = get_surface_size(dst, dst_bytes_per_pixel);
+    struct WritebackProbeScope {
+        ~WritebackProbeScope() { VideoCommon::LoadingProbe::software_writeback_active = false; }
+    } writeback_probe_scope;
     Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadWrite>
         tmp_buffer2(memory_manager, dst.Address(), dst_size, &impl->tmp_buffer);
 
+    VideoCommon::LoadingProbe::blit.Mark("software encode");
     if (dst.linear == Fermi2D::MemoryLayout::BlockLinear) {
         SwizzleSubrect(tmp_buffer2, impl->dst_buffer, dst_bytes_per_pixel, dst.width, dst.height,
                        dst.depth, config.dst_x0, config.dst_y0, dst_extent_x, dst_extent_y,
@@ -234,6 +242,9 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
                                  dst.pitch, config.dst_x0, config.dst_y0,
                                  static_cast<size_t>(dst_bytes_per_pixel));
     }
+    VideoCommon::LoadingProbe::blit.Mark("software writeback", dst.Address());
+    VideoCommon::LoadingProbe::software_writeback_active = true;
+    VideoCommon::LoadingProbe::writeback.Mark("scoped memory destructor", dst_size);
     return true;
 }
 

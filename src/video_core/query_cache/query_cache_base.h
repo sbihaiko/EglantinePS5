@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <mutex>
+#include "video_core/query_cache/published_semaphore.h"
 #include <optional>
 #include <span>
 #include "common/container/unordered_map.h"
@@ -16,9 +17,11 @@
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/query_cache/query_base.h"
+#include "video_core/query_cache/region_visit.h"
 #include "video_core/query_cache/types.h"
 
 namespace VideoCore {
@@ -58,6 +61,7 @@ public:
     ~QueryCacheBase();
 
     void InvalidateRegion(VAddr addr, std::size_t size) {
+        published_semaphores.Invalidate(addr, size);
         IterateCache<true>(addr, size,
                            [this](QueryLocation location) { InvalidateQuery(location); });
     }
@@ -109,6 +113,15 @@ public:
     /// release in accurate GPU mode).
     std::optional<u32> PendingRelease(DAddr cpu_addr);
 
+    std::optional<u32> PublishedSemaphore(DAddr address, const void* pointer) {
+        return published_semaphores.Read(address, pointer);
+    }
+    void InvalidatePublishedSemaphores(DAddr address, u64 size) {
+        published_semaphores.Invalidate(address, size);
+    }
+    void ClearPublishedSemaphores() { published_semaphores.Clear(); }
+
+
     // Async downloads
     void CommitAsyncFlushes();
 
@@ -128,44 +141,13 @@ public:
 protected:
     template <bool remove_from_cache, typename Func>
     void IterateCache(VAddr addr, std::size_t size, Func&& func) {
-        static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, QueryLocation>, bool>;
-        const u64 addr_begin = addr;
-        const u64 addr_end = addr_begin + size;
-
-        const u64 page_end = addr_end >> Core::DEVICE_PAGEBITS;
         std::scoped_lock lock(cache_mutex);
-        for (u64 page = addr_begin >> Core::DEVICE_PAGEBITS; page <= page_end; ++page) {
-            const u64 page_start = page << Core::DEVICE_PAGEBITS;
-            const auto in_range = [page_start, addr_begin, addr_end](const u32 query_location) {
-                const u64 cache_begin = page_start + query_location;
-                const u64 cache_end = cache_begin + sizeof(u32);
-                return cache_begin < addr_end && addr_begin < cache_end;
-            };
-            const auto& it = cached_queries.find(page);
-            if (it == std::end(cached_queries)) {
-                continue;
-            }
-            auto& contents = it->second;
-            for (auto& query : contents) {
-                if (!in_range(query.first)) {
-                    continue;
-                }
-                if constexpr (RETURNS_BOOL) {
-                    if (func(query.second)) {
-                        return;
-                    }
-                } else {
-                    func(query.second);
-                }
-            }
-            if constexpr (remove_from_cache) {
-                const auto in_range2 = [&](const std::pair<u32, QueryLocation>& pair) {
-                    return in_range(pair.first);
-                };
-                erase_if(contents, in_range2);
-            }
+        if (static u32 reports{}; size >= (u64{256} << 20) && reports++ < 16) {
+            LOG_WARNING(HW_GPU, "MKW_QUERY_SPARSE span={} page_slots={} cache_pages={}", size,
+                        size >> Core::DEVICE_PAGEBITS, cached_queries.size());
         }
+        VisitQueryRegion<Core::DEVICE_PAGEBITS, remove_from_cache>(cached_queries, addr, size,
+                                                                  std::forward<Func>(func));
     }
 
     using ContentCache = ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>>;
@@ -183,6 +165,7 @@ protected:
     /// erased by the fence that writes them.
     ::Common::unordered_map<DAddr, u32> pending_releases;
     std::mutex pending_releases_mutex;
+    PublishedSemaphoreStore<> published_semaphores;
 
     struct QueryCacheBaseImpl;
     friend struct QueryCacheBaseImpl;

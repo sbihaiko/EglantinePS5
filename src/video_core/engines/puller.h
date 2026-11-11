@@ -79,6 +79,8 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         bool reported;
+        /// Split GPU thread: the last check that drained the back (CanResumeAcquire).
+        std::chrono::steady_clock::time_point checked{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

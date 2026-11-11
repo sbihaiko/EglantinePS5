@@ -73,6 +73,9 @@ private:
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
     std::atomic<bool> m_is_interrupted{};
+    // Wake-up latency diagnostics: the time Interrupt() set the flag while this core slept (0 if none).
+    std::atomic<long long> m_interrupt_ns{0};
+    std::atomic<bool> m_sleeping{false};
     bool m_is_single_core{};
 };
 

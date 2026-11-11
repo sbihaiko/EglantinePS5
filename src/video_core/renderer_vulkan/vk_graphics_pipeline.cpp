@@ -1,3 +1,4 @@
+#include "video_core/nx2_loading_probe.h"
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -5,9 +6,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <vector>
+#include <cstdlib>
+#include <chrono>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -24,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -54,6 +61,17 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
 
+// The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
+VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
+    if (info.is_task) {
+        return VK_SHADER_STAGE_TASK_BIT_EXT;
+    }
+    if (info.is_mesh) {
+        return VK_SHADER_STAGE_MESH_BIT_EXT;
+    }
+    return slot_stage;
+}
+
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
     for (size_t index = 0; index < infos.size(); ++index) {
@@ -64,7 +82,7 @@ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader
             VK_SHADER_STAGE_GEOMETRY_BIT,
             VK_SHADER_STAGE_FRAGMENT_BIT,
         };
-        builder.Add(infos[index], stages.at(index));
+        builder.Add(infos[index], StageFlag(infos[index], stages.at(index)));
     }
     return builder;
 }
@@ -247,6 +265,57 @@ ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& m
     return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
                     DefaultSpec>(modules, infos);
 }
+
+// EDEN_NX2_TEXTURE_MEMO=0 turns the texture memo off; read once.
+bool TextureMemoEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEXTURE_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_TEXTURE_MEMO_VERIFY=1, read once: draws resolved from a memo are also resolved in full
+// and compared.
+bool TextureMemoVerify() {
+    static const bool verify = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEXTURE_MEMO_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return verify;
+}
+
+// Texture memo counts, logged every 10 s with EDEN_NX2_GPU_PROFILE or the verify env.
+std::atomic<u64> g_memo_hits{};
+std::atomic<u64> g_memo_misses{};
+std::atomic<u64> g_memo_mismatches{};
+
+// Counters the drawing thread writes: a plain load and store, not a locked add.
+void Count(std::atomic<u64>& counter) {
+    counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+void ReportTextureMemo() {
+    if (!VideoCommon::Nx2Profile::Enabled() && !TextureMemoVerify()) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point next_report{};
+    const Clock::time_point now = Clock::now();
+    if (now < next_report) {
+        return;
+    }
+    const bool first = next_report == Clock::time_point{};
+    next_report = now + std::chrono::seconds{10};
+    const u64 hits = g_memo_hits.exchange(0, std::memory_order_relaxed);
+    const u64 misses = g_memo_misses.exchange(0, std::memory_order_relaxed);
+    if (!first && (hits != 0 || misses != 0)) {
+        LOG_INFO(Render_Vulkan,
+                 "Texture memo: {} draws resolved from the memo, {} in full in 10 s; {} verify "
+                 "mismatches in total",
+                 hits, misses, g_memo_mismatches.load(std::memory_order_relaxed));
+    }
+}
 } // Anonymous namespace
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
@@ -282,6 +351,47 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    const auto any_written = [](const auto& descriptors) {
+        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
+    };
+    writes_images = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
+        return any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
+    texture_memo_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
+        return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
+               info.image_descriptors.empty() &&
+               std::ranges::all_of(info.texture_descriptors,
+                                    [](const auto& desc) { return !desc.has_secondary; });
+    }) && num_textures != 0;
+    // Fast draw (nx2_fast_draw.h): which pipelines can keep their views and samplers, and the
+    // constant buffers their handles come from.
+    if (writes_images) {
+        delta_blocker = DeltaBlocker::WritesImages;
+    } else if (IsMeshPipeline()) {
+        delta_blocker = DeltaBlocker::Mesh;
+    }
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        u32& handles = handle_constant_buffers[stage];
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            handles |= 1U << desc.cbuf_index;
+            if (desc.has_secondary) {
+                handles |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            handles |= 1U << desc.cbuf_index;
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            handles |= 1U << desc.cbuf_index;
+            if (desc.has_secondary) {
+                handles |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        for (const auto& desc : info.image_descriptors) {
+            handles |= 1U << desc.cbuf_index;
+        }
+    }
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
@@ -312,12 +422,19 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
+    // Before the build is queued: the build lets go of the modules (below).
+    configure_func = ConfigureFunc(*spv_modules, stage_infos);
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {
             MakePipeline(render_pass);
+            // The pipeline holds the compiled code: the driver's copies of the SPIR-V go. Kept for
+            // every pipeline they were Eden's largest heap holder (Mario Kart World: 110 MiB in
+            // 3,585 modules, growing with each pipeline a race builds).
+            spv_modules.reset();
         } catch (const vk::Exception& exception) {
+            spv_modules.reset();
             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
             std::scoped_lock lock{build_mutex};
             is_built = true;
@@ -343,7 +460,6 @@ GraphicsPipeline::GraphicsPipeline(
     } else {
         func();
     }
-    configure_func = ConfigureFunc(*spv_modules, stage_infos);
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -368,6 +484,68 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+
+    // Texture memo: a pipeline whose descriptors are all sampled textures resolves them from what
+    // its last full resolve read while every byte of it is the same.
+    const bool use_memo{texture_memo_eligible && TextureMemoEnabled()};
+    const bool verify_memo{use_memo && TextureMemoVerify()};
+    boost::container::small_vector<GPUVAddr, 32> handle_addresses;
+    boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 32> memo_views;
+    boost::container::small_vector<VideoCommon::SamplerId, 32> memo_samplers;
+    std::vector<VideoCommon::ImageId> memo_prepared;
+    std::vector<VideoCommon::ImageId> full_prepared;
+    bool memo_hit{};
+    if (use_memo) {
+        const auto collect_addresses{[&](size_t stage) LAMBDA_FORCEINLINE {
+            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    handle_addresses.push_back(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                               (index << desc.size_shift));
+                }
+            }
+        }};
+        if constexpr (Spec::enabled_stages[0]) {
+            collect_addresses(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            collect_addresses(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            collect_addresses(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            collect_addresses(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            collect_addresses(4);
+        }
+        views.resize(num_image_elements);
+        samplers.resize(num_textures);
+        if (verify_memo) {
+            // The full resolve prepares the images: the memo only lists those it would prepare.
+            texture_cache.LogPrepares(&memo_prepared, true);
+        }
+        memo_hit = handle_addresses.size() == views.size() &&
+                   texture_cache.ResolveMemoizedTextures(
+                       texture_memo, std::span(handle_addresses.data(), handle_addresses.size()),
+                       std::span(views.data(), views.size()),
+                       std::span(samplers.data(), samplers.size()));
+        if (verify_memo) {
+            texture_cache.LogPrepares(nullptr, false);
+        }
+        if (memo_hit && verify_memo) {
+            memo_views.assign(views.begin(), views.end());
+            memo_samplers.assign(samplers.begin(), samplers.end());
+        }
+        if (!memo_hit || verify_memo) {
+            views.clear();
+            samplers.clear();
+        }
+    }
+    const bool resolve_in_full{!memo_hit || verify_memo};
+
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -376,12 +554,25 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             for (const auto& desc : info.storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written);
+                                                       desc.cbuf_offset, desc.is_written,
+                                                       desc.indirect_offset);
                 ++ssbo_index;
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
+            if (desc.handle_program != ~0U) {
+                // Read by the shader from a storage buffer: computed for this draw.
+                return TexturePair(VideoCommon::EvaluateTextureHandle(
+                                       info, desc.handle_program, *gpu_memory,
+                                       [&](u32 cbuf) -> GPUVAddr {
+                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
+                                                      ? cbufs[cbuf].address
+                                                      : GPUVAddr{};
+                                       },
+                                       device.GetStorageBufferAlignment()),
+                                   via_header_index);
+            }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
@@ -422,13 +613,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 add_image(desc, false);
             }
         }
-        for (const auto& desc : info.texture_descriptors) {
-            for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{read_handle(desc, index)};
-                views.push_back({handle.first});
+        if (resolve_in_full) {
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    const auto handle{read_handle(desc, index)};
+                    views.push_back({handle.first});
 
-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
-                samplers.push_back(sampler);
+                    VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+                    samplers.push_back(sampler);
+                    if (use_memo && handle_reads.size() < handle_addresses.size()) {
+                        handle_reads.push_back({handle_addresses[handle_reads.size()],
+                                                handle.first, handle.second});
+                    }
+                }
             }
         }
         if constexpr (Spec::has_images) {
@@ -459,10 +656,68 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
-    {
+    if (memo_hit && verify_memo) {
+        texture_cache.LogPrepares(&full_prepared, false);
+    }
+    if (resolve_in_full) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
+    }
+    if (memo_hit && verify_memo) {
+        texture_cache.LogPrepares(nullptr, false);
+    }
+    if (use_memo) {
+        if (!memo_hit) {
+            Count(g_memo_misses);
+            // A pipeline whose draws keep changing textures stops paying for a memo nobody uses.
+            if (++texture_memo.misses <= 8 || (texture_memo.misses & 15) == 0) {
+                texture_cache.MemoizeTextures(texture_memo,
+                                              std::span(handle_reads.data(), handle_reads.size()),
+                                              std::span(views.data(), views.size()),
+                                              std::span(samplers.data(), samplers.size()));
+            }
+        } else {
+            texture_memo.misses = 0;
+            Count(g_memo_hits);
+        }
+        if (memo_hit && verify_memo) {
+            // Bindings alone miss what the paths do to the images (Lichii #904 prepared the null
+            // one).
+            for (auto* const prepared : {&memo_prepared, &full_prepared}) {
+                std::ranges::sort(*prepared);
+                prepared->erase(std::unique(prepared->begin(), prepared->end()), prepared->end());
+            }
+            const bool same =
+                std::ranges::equal(views, memo_views,
+                                   [](const auto& lhs, const auto& rhs) {
+                                       return lhs.index == rhs.index && lhs.id == rhs.id;
+                                   }) &&
+                std::ranges::equal(samplers, memo_samplers) && memo_prepared == full_prepared;
+            if (!same) {
+                Count(g_memo_mismatches);
+                LOG_ERROR(Render_Vulkan,
+                          "Texture memo: pipeline {:016x} resolved other views, samplers or "
+                          "prepared images than its memo",
+                          key.Hash());
+            }
+        }
+        ReportTextureMemo();
+    }
+    if (std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None) {
+        const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
+                                  const VideoCommon::ImageViewInOut& rhs) {
+            return lhs.index == rhs.index && lhs.id == rhs.id;
+        };
+        if (std::exchange(verify_delta, false)) {
+            delta_mismatch = !delta_views_valid ||
+                             !std::ranges::equal(views, delta_views, same_view) ||
+                             !std::ranges::equal(samplers, delta_samplers);
+        }
+        delta_views.assign(views.begin(), views.end());
+        delta_samplers.assign(samplers.begin(), samplers.end());
+        configured_stages = Spec::enabled_stages;
+        delta_views_valid = true;
     }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
@@ -597,6 +852,91 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return ConfigureDraw(rescaling, render_area);
 }
 
+bool GraphicsPipeline::DeltaImagesChange() const noexcept {
+    return texture_cache.SampledViewsChange(delta_views);
+}
+
+// The PS5 port (tools/prepare-vulkan-port.py) instruments ConfigureImpl at lines it finds once in
+// this file: the ones ConfigureDelta shares are spelled differently here.
+bool GraphicsPipeline::ConfigureDelta(bool indexed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    // ConfigureImpl without reading handles and resolving image views, samplers and texture
+    // buffers: the buffers are resolved, synchronized and bound as it does. The texture buffer
+    // bindings ConfigureImpl made stay in the buffer cache (nothing else binds graphics texture
+    // buffers between two draws of the chain).
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks,
+                                        &uniform_buffer_sizes);
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!configured_stages[stage]) {
+                continue;
+            }
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            size_t ssbo_index{};
+            for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                ASSERT(desc.count == 1);
+                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                       desc.cbuf_offset, desc.is_written,
+                                                       desc.indirect_offset);
+                ++ssbo_index;
+            }
+        }
+    }
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.UpdateGraphicsBuffers(indexed);
+        buffer_cache.BindHostGeometryBuffers(indexed);
+    }
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+    const auto& regs{maxwell3d->regs};
+    RescalingPushConstant rescaling;
+    RenderAreaPushConstant render_area;
+    const VideoCommon::SamplerId* samplers_it{delta_samplers.data()};
+    const VideoCommon::ImageViewInOut* views_it{delta_views.data()};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!configured_stages[stage]) {
+            continue;
+        }
+        {
+            Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            buffer_cache.BindHostStageBuffers(stage);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                 rescaling, samplers_it, views_it);
+        }
+        if (stage_infos[stage].uses_render_area) {
+            render_area.uses_render_area = true;
+            // Switch 2 titles may never program the surface clip; use colour target 0 then.
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
+    }
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(/*is_clear=*/false);
+        texture_cache.CheckFeedbackLoop(
+            std::span<const VideoCommon::ImageViewInOut>{delta_views.data(), delta_views.size()});
+    }
+    if (!pipeline && IsBuilt()) {
+        return false;
+    }
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    const bool configured = ConfigureDraw(rescaling, render_area);
+    return configured;
+}
+
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
@@ -680,18 +1020,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+        cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
                              rescaling_data.data());
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
         if (uses_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
         }
@@ -1073,6 +1413,19 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
     }
 
+    const bool is_mesh{IsMeshPipeline()};
+    if (is_mesh) {
+        // Mesh pipelines have no vertex input or input assembly.
+        dynamic_states.erase(std::remove_if(dynamic_states.begin(), dynamic_states.end(),
+                                            [](VkDynamicState state) {
+                                                return state == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT ||
+                                                       state == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT ||
+                                                       state == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT ||
+                                                       state == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT ||
+                                                       state == VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT;
+                                            }),
+                             dynamic_states.end());
+    }
     const VkPipelineDynamicStateCreateInfo dynamic_state_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext = nullptr,
@@ -1095,7 +1448,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
-                .stage = MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)),
+                .stage = StageFlag(stage_infos[stage],
+                                   MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
                 .module = *(*spv_modules)[stage],
                 .pName = "main",
                 .pSpecializationInfo = nullptr,
@@ -1109,15 +1463,16 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    VideoCommon::LoadingProbe::driver.Mark("graphics pipeline", IsMeshPipeline());
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
-        .pVertexInputState = &vertex_input_ci,
-        .pInputAssemblyState = &input_assembly_ci,
-        .pTessellationState = &tessellation_ci,
+        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
+        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
         .pViewportState = &viewport_ci,
         .pRasterizationState = &rasterization_ci,
         .pMultisampleState = &multisample_ci,
@@ -1130,6 +1485,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    VideoCommon::LoadingProbe::driver.Mark("graphics pipeline done", IsMeshPipeline());
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

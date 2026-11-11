@@ -43,6 +43,10 @@ struct LoweredNativeCode {
     u32 texture_bound = ~0U;
     /// Constant buffer for surface descriptors, when the program needs another than texture_bound.
     u32 surface_bound = ~0U;
+    /// FNV-1a of the native instructions (Shader::Ampere::NativeProgramKey): names a game's program.
+    u64 native_program_key{};
+    /// The program has tensor (HMMA) instructions.
+    bool uses_hmma{};
 };
 
 class GenericEnvironment : public Shader::Environment {
@@ -66,6 +70,17 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) final;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
+
+    [[nodiscard]] u64 NativeProgramKey() const override {
+        return lowered_native ? lowered_native->native_program_key : 0;
+    }
+
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+
+    [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                          u32 indirect) override;
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -249,6 +264,13 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
+
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+
+    [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                          u32 indirect) override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 

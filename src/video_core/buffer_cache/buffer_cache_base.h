@@ -139,6 +139,9 @@ public:
 
     std::array<Binding, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_buffers;
     std::array<Binding, NUM_COMPUTE_STORAGE_BUFFERS> compute_storage_buffers;
+    /// How many bytes of each compute storage binding a dispatch marks GPU-written (native
+    /// programs: as far as the shader's stores reach; otherwise the whole binding).
+    std::array<u32, NUM_COMPUTE_STORAGE_BUFFERS> compute_storage_write_marks{};
     std::array<TextureBufferBinding, NUM_TEXTURE_BUFFERS> compute_texture_buffers;
 
     std::array<u32, NUM_STAGES> enabled_uniform_buffer_masks{};
@@ -278,8 +281,10 @@ public:
 
     void UnbindGraphicsStorageBuffers(size_t stage);
 
+    /// indirect_offset: when set, the constant buffer value is a pointer to a table and the
+    /// buffer's pointer is read at this offset in it (native programs).
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written);
+                                   bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -288,8 +293,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+                                  bool is_written, u32 indirect_offset = ~0U,
+                                  const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindComputeTextureBuffers();
 
@@ -346,6 +353,9 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
+
+    /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
+    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
     template <typename Func>
     void BufferOperations(Func&& func) {
@@ -488,7 +498,8 @@ private:
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written) const;
+                                               bool is_written, bool native_pointer = false,
+                                               bool table_pointer = false) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
@@ -531,6 +542,15 @@ private:
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
     MemoryTracker memory_tracker;
+    /// What each vertex buffer slot was last synchronized against (BindHostVertexBuffers).
+    struct VertexSyncCache {
+        BufferId buffer_id{};
+        DAddr device_addr{};
+        u32 size{};
+        u64 sequence{};
+    };
+    std::array<VertexSyncCache, NUM_VERTEX_BUFFERS> vertex_sync_cache{};
+    VertexSyncCache index_sync_cache{}; ///< The same for the index buffer (BindHostIndexBuffer)
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
@@ -589,14 +609,41 @@ private:
     /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next
     /// fence.
     void QueueDownload(DAddr addr, u64 size) {
-        if (DownloadsAtFence(addr, size)) {
+        if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(addr, size);
             return;
         }
-        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
-            uncommitted_gpu_modified_ranges.Add(start, end - start);
+        // With only Preflushable marks, just the marked pages are queued (upstream Eglantine
+        // 0bf0f834b9): a write that covers one CPU-read page of a large binding copied the whole
+        // binding back at every fence. Ocarina of Time's compute programs with unknown store
+        // extents mark 8 MiB bindings: ~60 MiB a frame came back, 850 MiB a second.
+        // EDEN_NX2_EXACT_PREFLUSH=0 restores the whole-range behaviour.
+        static const bool exact = [] {
+            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!exact && memory_tracker.IsRegionPreflushable(addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(addr, size);
+            return;
+        }
+        const DAddr end = addr + size;
+        u64 queued = 0;
+        if (exact) {
+            memory_tracker.ForEachPreflushableRange(addr, size, [&](DAddr begin, u64 length) {
+                const DAddr lower = (std::max)(begin, addr);
+                const DAddr upper = (std::min)(begin + length, end);
+                if (lower < upper) {
+                    uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+                    queued += upper - lower;
+                }
+            });
+        }
+        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr range_end) {
+            uncommitted_gpu_modified_ranges.Add(start, range_end - start);
         });
-        ArmReadTraps(addr, size);
+        if (queued < size) {
+            ArmReadTraps(addr, size);
+        }
     }
 
     // Async Buffers

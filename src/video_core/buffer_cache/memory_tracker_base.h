@@ -71,7 +71,49 @@ public:
     }
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
+    /// Sequence number of the latest CPU-modified mark (see NoCpuMarksSince).
+    [[nodiscard]] u64 CpuMarkSequence() const noexcept {
+        return cpu_mark_sequence;
+    }
+
+    /// Whether no page in [addr, addr + size) can have become CPU modified after `since`
+    /// (a CpuMarkSequence value). CPU-modified bits are only set by MarkRegionAsCpuModified
+    /// (recorded per 64 KiB region, hashed: a collision only makes the answer conservative),
+    /// cached-write flushes and new regions (both count as everywhere), so a range synchronized
+    /// at `since` with no later mark in its regions has nothing to upload.
+    [[nodiscard]] bool NoCpuMarksSince(u64 since, VAddr addr, u64 size) const noexcept {
+        if (since < cpu_mark_barrier) {
+            return false;
+        }
+        if (since == cpu_mark_sequence) {
+            return true;
+        }
+        const u64 first = addr >> CPU_MARK_REGION_BITS;
+        const u64 last = (addr + (size ? size - 1 : 0)) >> CPU_MARK_REGION_BITS;
+        if (last - first >= CPU_MARK_MAX_REGIONS) {
+            return false;
+        }
+        for (u64 region = first; region <= last; ++region) {
+            if (cpu_mark_regions[region % CPU_MARK_REGIONS] > since) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        ++cpu_mark_sequence;
+        if (query_size != 0) {
+            const u64 first = dirty_cpu_addr >> CPU_MARK_REGION_BITS;
+            const u64 last = (dirty_cpu_addr + query_size - 1) >> CPU_MARK_REGION_BITS;
+            if (last - first >= CPU_MARK_REGIONS) {
+                cpu_mark_barrier = cpu_mark_sequence;
+            } else {
+                for (u64 region = first; region <= last; ++region) {
+                    cpu_mark_regions[region % CPU_MARK_REGIONS] = cpu_mark_sequence;
+                }
+            }
+        }
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
         });
@@ -124,12 +166,16 @@ public:
 
     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
     void FlushCachedWrites(VAddr query_cpu_addr, u64 query_size) noexcept {
+        cpu_mark_barrier = ++cpu_mark_sequence;
         IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
             manager->FlushCachedWrites();
         });
     }
 
     void FlushCachedWrites() noexcept {
+        if (!cached_pages.empty()) {
+            cpu_mark_barrier = ++cpu_mark_sequence;
+        }
         for (auto id : cached_pages) {
             top_tier[id]->FlushCachedWrites();
         }
@@ -149,6 +195,14 @@ public:
     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {
         IteratePages<false>(query_cpu_range, query_size, [&func, clear](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::GPU, clear, manager->cpu_addr + offset, size, func);
+        });
+    }
+
+    /// Call 'func' for each range marked as Preflushable
+    template <typename Func>
+    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
         });
     }
 
@@ -235,6 +289,8 @@ private:
     }
 
     void CreateRegion(std::size_t page_index) {
+        // A new region starts CPU modified everywhere.
+        cpu_mark_barrier = ++cpu_mark_sequence;
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
     }
@@ -253,6 +309,13 @@ private:
         free_managers.pop_front();
         return new_manager;
     }
+
+    static constexpr u64 CPU_MARK_REGION_BITS = 16;
+    static constexpr u64 CPU_MARK_REGIONS = 8192;
+    static constexpr u64 CPU_MARK_MAX_REGIONS = 64;
+    std::array<u64, CPU_MARK_REGIONS> cpu_mark_regions{};
+    u64 cpu_mark_sequence = 1;
+    u64 cpu_mark_barrier = 1;
 
     std::array<Manager*, NUM_HIGH_PAGES> top_tier{};
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;

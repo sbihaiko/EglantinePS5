@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -73,6 +75,9 @@ struct OverlapResult {
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output);
 
+[[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleBlockLinearImage(
+    const ImageInfo& info, std::span<const u8> input, std::span<u8> output, bool native_tiling);
+
 /// Unswizzles only the blocks of a 2D block-linear image that overlap `dirty_ranges` (sorted,
 /// non-overlapping [begin, end) byte offsets from the image start) into `output`. Returns no copies
 /// when the image layout is not one this handles; the caller then uploads the whole image.
@@ -80,8 +85,42 @@ struct OverlapResult {
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const std::pair<u64, u64>> dirty_ranges, std::vector<u8>& output);
 
+using UploadReader = std::function<void(GPUVAddr, std::span<u8>)>;
+using UploadChunk = std::function<void(std::span<const u8>, std::span<const BufferImageCopy>)>;
+
+/// Streams selected plain 2D layers without a whole-layer CPU or staging allocation.
+/// The upload callback must finish consuming each chunk before returning. Unsupported layouts
+/// return false before invoking either callback.
+[[nodiscard]] bool StreamLayerUploads(const ImageInfo& info, GPUVAddr address,
+                                     std::span<const u32> layers, size_t limit,
+                                     const UploadReader& read, const UploadChunk& upload,
+                                     bool native_tiling);
+
 /// Rewrites `copies` (from UnswizzleImage) to the layout ConvertImage produces, without converting.
 void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies);
+
+[[nodiscard]] std::vector<LevelRect> SparseTileRects(
+    const ImageInfo& info, std::span<const std::pair<u64, u64>> ranges, u32 tile_width,
+    u32 tile_height, s32 tail_level);
+
+[[nodiscard]] size_t UnswizzledRectsBytes(const ImageInfo& info, std::span<const LevelRect> rects);
+
+/// Streams sparse 2D rectangles in bounded chunks, including partial GOB rows and mip tails.
+/// Unsupported layouts or invalid rectangles return false before any callback is invoked.
+[[nodiscard]] bool StreamRectUploads(const ImageInfo& info, GPUVAddr address,
+                                    std::span<const LevelRect> rects, size_t limit,
+                                    const UploadReader& read, const UploadChunk& upload,
+                                    bool native_tiling);
+
+
+[[nodiscard]] std::vector<BufferImageCopy> UnswizzleImageRects(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+    std::span<const LevelRect> rects, std::span<u8> output);
+
+[[nodiscard]] std::vector<BufferImageCopy> UnswizzleImageRects(
+    const std::function<void(GPUVAddr, std::span<u8>)>& read, GPUVAddr gpu_addr,
+    const ImageInfo& info, std::span<const LevelRect> rects, std::span<u8> output,
+    bool native_tiling);
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies);
@@ -92,6 +131,12 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 [[nodiscard]] Extent3D MipSize(Extent3D size, u32 level);
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
+
+/// Whether `copies` from `src` write every texel of `dst` unscaled: same 2D format, every level
+/// and layer from the origin. False when either image is rescaled or lacks part of its host
+/// memory (sparse, unbacked, trimmed levels).
+[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                                         std::span<const ImageCopy> copies);
 
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);
@@ -137,3 +182,23 @@ void DeduceBlitImages(ImageInfo& dst_info, ImageInfo& src_info, const ImageBase*
 [[nodiscard]] u32 MapSizeBytes(const ImageBase& image);
 
 } // namespace VideoCommon
+
+namespace VideoCommon {
+std::vector<BufferImageCopy> DownloadRowBands(const ImageInfo& info, size_t limit);
+struct PartialDownloadBand {
+    BufferImageCopy copy;
+    u64 guest_offset;
+    size_t guest_size;
+    u64 write_offset;
+    size_t write_size;
+};
+
+/// Download only GOB rows intersecting a partial guest read. Publication is restricted to the
+/// exact requested bytes; callers must retain GPU-modified state for the rest of the image.
+[[nodiscard]] std::optional<std::vector<PartialDownloadBand>> PartialDownloadBands(
+    const ImageInfo& info, u64 offset, size_t size, size_t limit);
+
+void SwizzleRowBand(const ImageInfo& info, const BufferImageCopy& copy,
+                    std::span<const u8> linear, std::span<u8> guest, bool native);
+std::pair<u64, size_t> RowBandGuestRange(const ImageInfo& info, const BufferImageCopy& copy);
+}

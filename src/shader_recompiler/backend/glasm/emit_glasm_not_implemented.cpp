@@ -102,4 +102,20 @@ void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, ScalarU32 a0, ScalarU32 
     NotImplemented();
 }
 
+void EmitIsbeRead(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeWriteAttribute(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeWriteMapU8(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeWriteMapU32(EmitContext& ctx) {
+    NotImplemented();
+}
+
 } // namespace Shader::Backend::GLASM

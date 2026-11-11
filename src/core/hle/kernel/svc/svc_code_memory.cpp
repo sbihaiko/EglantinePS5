@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/hle/kernel/svc/svc_memory_stats.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_code_memory.h"
@@ -33,6 +34,7 @@ constexpr bool IsValidUnmapFromOwnerCodeMemoryPermission(MemoryPermission perm) 
 } // namespace
 
 Result CreateCodeMemory(Core::System& system, Handle* out, u64 address, uint64_t size) {
+    MemoryStats::Note(MemoryStats::CreateCodeMemory, size, true);
     LOG_TRACE(Kernel_SVC, "called, address={:#x}, size={:#x}", address, size);
 
     // Validate address / size.
@@ -67,6 +69,7 @@ Result CreateCodeMemory(Core::System& system, Handle* out, u64 address, uint64_t
 Result ControlCodeMemory(Core::System& system, Handle code_memory_handle,
                          CodeMemoryOperation operation, u64 address, uint64_t size,
                          MemoryPermission perm) {
+    MemoryStats::Note(MemoryStats::ControlCodeMemory, size, true);
 
     LOG_TRACE(Kernel_SVC,
               "called, code_memory_handle={:#x}, operation={:#x}, address={:#x}, size={:#x}, "

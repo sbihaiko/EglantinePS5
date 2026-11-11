@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "tests/video_core/ampere_high_uniforms.h"
 
 namespace {
 using Shader::Ampere::Instruction;
@@ -89,12 +90,20 @@ TEST_CASE("Ampere effective addresses accept a uniform addend", "[video_core][am
                      (u64{reg} << 20) | (u64{shift} << 39)));
         }
     }
-    for (const u32 source : {28U, 255U, 0x104U}) {
+    for (const u32 source : {255U, 0x104U}) {
         const std::array<Instruction, 2> code{{
             {{0x04067c11, source, 0x0f8e30ff, 0x020fc800}},
             {{0x0000794d, 0, 0x03800000, 0}},
         }};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+    }
+    {
+        // UR28, once unmapped: mirrored below R216.
+        const std::array<Instruction, 2> code{{
+            {{0x04067c11, 28, 0x0f8e30ff, 0x020fc800}},
+            {{0x0000794d, 0, 0x03800000, 0}},
+        }};
+        RequireHighUniformMirror(code, 28);
     }
     const std::array<Instruction, 2> carry{{
         {{0x04067c11, 4, 0x0f8030ff, 0x020fc800}},

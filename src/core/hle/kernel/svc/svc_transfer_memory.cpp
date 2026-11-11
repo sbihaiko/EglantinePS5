@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/hle/kernel/svc/svc_memory_stats.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -30,6 +31,7 @@ constexpr bool IsValidTransferMemoryPermission(MemoryPermission perm) {
 /// Creates a TransferMemory object
 Result CreateTransferMemory(Core::System& system, Handle* out, u64 address, u64 size,
                             MemoryPermission map_perm) {
+    MemoryStats::Note(MemoryStats::CreateTransferMemory, size, true);
     auto& kernel = system.Kernel();
 
     // Validate the size.

@@ -257,6 +257,11 @@ void PhysicalCore::Interrupt() {
 
     // Add interrupt flag.
     m_is_interrupted = true;
+    if (m_sleeping.load(std::memory_order_relaxed)) {
+        m_interrupt_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count(),
+                             std::memory_order_relaxed);
+    }
 
     // Interrupt ourselves.
     m_on_interrupt.notify_one();

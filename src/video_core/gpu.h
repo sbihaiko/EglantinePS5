@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -247,6 +248,7 @@ public:
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     [[nodiscard]] VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size);
+    [[nodiscard]] std::optional<u32> ReadPublishedSemaphore(DAddr addr, const void* pointer);
 
     u64 ReadbackGeneration() const;
     void InvalidateReadbackCache();

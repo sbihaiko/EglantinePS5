@@ -21,7 +21,9 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
@@ -85,6 +87,11 @@ void GpuSplit::CheckOwner(const char* where) {
 GpuSplit GpuSplit::instance;
 
 void GpuSplit::MaybeStart(Core::System& system_) {
+    static const bool blocks = [] {
+        const char* value = std::getenv("EDEN_NX2_REG_BLOCKS");
+        return value == nullptr || value[0] != '0';
+    }();
+    reg_blocks = blocks;
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
         return value != nullptr ? value[0] : '2';
@@ -137,12 +144,21 @@ void GpuSplit::Stop() {
     // wrap at a time and never reached the old write position (the next game's first GPU work
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
+    regs_entry = nullptr;
+    regs_count = 0;
     write_position = 0;
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
     back_engine = nullptr;
+    front_releases.clear();
+    front_pending.clear();
+    front_lower_bounds.clear();
+    front_adds.clear();
+    front_reports.clear();
+    reported_words.clear();
+    sync_pending = false;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
@@ -183,6 +199,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    CloseRegs();
     if (published_local == write_position) {
         return;
     }
@@ -195,7 +212,86 @@ void GpuSplit::Publish() {
     }
 }
 
+std::optional<u32> GpuSplit::PendingLowerBound(u64 key, u32 memory) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    std::optional<u64> bound;
+    if (const auto it = front_adds.find(key); it != front_adds.end()) {
+        auto& adds = it->second;
+        std::erase_if(adds, [done](const FrontRelease& add) { return done >= add.position; });
+        u64 sum = 0;
+        for (const auto& add : adds) sum += add.value;
+        if (adds.empty()) {
+            front_adds.erase(it);
+        } else if (u64{memory} + sum <= 0xffffffffULL) {
+            bound = u64{memory} + sum;
+        }
+    }
+    if (const auto it = front_lower_bounds.find(key); it != front_lower_bounds.end()) {
+        if (done >= it->second.position) {
+            front_lower_bounds.erase(it);
+        } else {
+            bound = (std::max)(bound.value_or(0), u64{(std::max)(memory, it->second.value)});
+        }
+    }
+    if (front_adds.size() > 4096 || front_lower_bounds.size() > 4096) {
+        std::erase_if(front_lower_bounds, [done](const auto& entry) { return done >= entry.second.position; });
+        std::erase_if(front_adds, [done](auto& entry) {
+            std::erase_if(entry.second, [done](const FrontRelease& add) { return done >= add.position; });
+            return entry.second.empty();
+        });
+    }
+    return bound ? std::optional<u32>{static_cast<u32>(*bound)} : std::nullopt;
+}
+
+std::optional<u64> GpuSplit::PendingPosition(u64 key) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    if (front_pending.size() > 4096) {
+        std::erase_if(front_pending, [done](const auto& entry) { return done >= entry.second; });
+    }
+    const auto it = front_pending.find(key);
+    if (it == front_pending.end()) {
+        return std::nullopt;
+    }
+    if (done >= it->second) {
+        front_pending.erase(it);
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::optional<u32> GpuSplit::PendingRelease(u64 key) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    if (front_releases.size() > 4096) {
+        std::erase_if(front_releases, [done](const auto& entry) { return done >= entry.second.position; });
+    }
+    const auto it = front_releases.find(key);
+    if (it == front_releases.end()) {
+        return std::nullopt;
+    }
+    if (done >= it->second.position) {
+        front_releases.erase(it);
+        return std::nullopt;
+    }
+    return it->second.value;
+}
+
+bool GpuSplit::WritePending(u64 key) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    if (front_reports.size() > 4096) {
+        std::erase_if(front_reports, [done](const auto& entry) { return done >= entry.second; });
+    }
+    if (const auto it = front_reports.find(key); it != front_reports.end()) {
+        if (done < it->second) {
+            return true;
+        }
+        front_reports.erase(it);
+    }
+    return PendingRelease(key) || PendingPosition(key) || PendingLowerBound(key, 0);
+}
+
 void GpuSplit::Drain() {
+    sync_pending = false;
+    CloseRegs();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
@@ -206,6 +302,42 @@ void GpuSplit::Drain() {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            return;
+        }
+        if (spins < 16384) {
+            Pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void GpuSplit::DrainToLastWriter() {
+    // Waiting only up to the last compute, copy or upload method crashed Mario Kart World
+    // while loading on the console (a list read before its writer ran, then a clear with a
+    // garbage render target): something the front does not count as a writer fills them. Off
+    // unless EDEN_NX2_LIST_DRAIN_TO_WRITER=1; the default waits for everything sent.
+    static const bool to_writer = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_DRAIN_TO_WRITER");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!to_writer) {
+        Drain();
+        return;
+    }
+    DrainTo(last_writer_position);
+}
+
+void GpuSplit::DrainTo(u64 position) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= position) {
+        return;
+    }
+    Publish();
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    for (u32 spins = 0;; ++spins) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        if (consumed_cache >= position) {
             return;
         }
         if (spins < 16384) {
@@ -249,12 +381,14 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
     }
 }
 
-void GpuSplit::DeferFunction(std::function<void()>&& func) {
+void GpuSplit::DeferFunction(std::function<void()>&& func, u64 flags) {
     auto* const heap = new std::function<void()>(std::move(func));
-    Defer([heap] {
-        (*heap)();
-        delete heap;
-    });
+    Defer(
+        [heap] {
+            (*heap)();
+            delete heap;
+        },
+        flags);
 }
 
 size_t GpuSplit::Execute(const u64* entry) {
@@ -269,6 +403,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
@@ -290,6 +427,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -299,7 +439,31 @@ size_t GpuSplit::Execute(const u64* entry) {
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
     }
+    case Kind::Regs: {
+        const u32 count = static_cast<u32>((head >> 8) & 0xff);
+        auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        for (u32 i = 0; i < count; ++i) {
+            engine->method_sink.emplace_back(static_cast<u32>(entry[1 + i]), static_cast<u32>(entry[1 + i] >> 32));
+        }
+        engine->ConsumeSink(*system);
+        return 1 + count;
+    }
+    case Kind::CbData: {
+        const u32 count = static_cast<u32>((head >> 8) & 0xff);
+        auto* const engine = back_engine;
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        static_cast<Tegra::Engines::Maxwell3D*>(engine)->ProcessCBDataBlock(entry + 1, count);
+        return 1 + count;
+    }
     case Kind::Call: {
+        if ((head & FastDrawNeutral) == 0) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+        }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
@@ -345,10 +509,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         g_back_busy.store(true, std::memory_order_relaxed);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            Tegra::g_nx2_back_position.store(read_position, std::memory_order_relaxed);
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
-            if (read_position - last_store >= 4096 && read_position != available) {
+            // Often enough for the front's partial waits (DrainTo a pending release) too.
+            if (read_position - last_store >= 256 && read_position != available) {
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }

@@ -1,3 +1,4 @@
+#include "video_core/nx2_loading_probe.h"
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -34,7 +35,23 @@ VideoCore::RasterizerDownloadArea ReadMemory(VideoCore::RasterizerInterface& ras
     if (diagnostic) {
         diagnostic->backend_start = ReadbackDependencyDiagnostics::Now();
     }
+    ReadbackDependencyDiagnostics::BackendScope backend_scope{diagnostic};
     const u64 generation = manager.ReadbackGeneration();
+    if (diagnostic && diagnostic->trace_index != ~u64{0}) {
+        using VideoCommon::CacheType;
+        // Snapshot on the GPU owner, after preceding work. A zero mask here alone is
+        // NOT permission to bypass ordering at the CPU request time.
+        const auto scalar_address = addr + (size == 4096 ? diagnostic->original_address & 4095 : 0);
+        if (diagnostic->scalar_valid) {
+            const auto pending = rasterizer.PendingSemaphoreRelease(scalar_address);
+            diagnostic->pending_backend_valid = pending.has_value();
+            diagnostic->pending_backend = pending.value_or(0);
+        }
+        diagnostic->dirty_mask =
+            (rasterizer.MustFlushRegion(addr, size, CacheType::BufferCache) ? 1 : 0) |
+            (rasterizer.MustFlushRegion(addr, size, CacheType::TextureCache) ? 2 : 0) |
+            (rasterizer.MustFlushRegion(addr, size, CacheType::QueryCache) ? 4 : 0);
+    }
     auto area = rasterizer.GetFlushArea(addr, size);
     if (diagnostic) {
         diagnostic->backend_generation = generation;
@@ -63,11 +80,10 @@ VideoCore::RasterizerDownloadArea ReadMemory(VideoCore::RasterizerInterface& ras
 }
 
 // Tells a CPU thread waiting in PushCommand that its command ran.
-void SignalCommand(SynchState& state, u64 fence, bool block) {
+void SignalCommand(SynchState& state, u64 fence,
+                   const std::shared_ptr<Common::HostCommandCompletion>& completion) {
     state.signaled_fence.store(fence, std::memory_order_release);
-    if (block) {
-        state.signaled_fence.notify_all();
-    }
+    if (completion) completion->Signal();
 }
 
 } // Anonymous namespace
@@ -130,6 +146,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 read && read->diagnostic) {
                 read->diagnostic->front_popped = ReadbackDependencyDiagnostics::Now();
                 read->diagnostic->split = split.Active();
+                read->diagnostic->pending_channels = scheduler.HasPendingChannels();
             }
             last_progress = std::chrono::steady_clock::now();
             if (split.Active()) {
@@ -142,7 +159,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); });
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                    // TickWork ends the fast draw delta chain itself when it runs a request.
+                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
+                                VideoCommon::GpuSplit::FastDrawNeutral);
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     split.DeferFunction(std::move(run->func));
                 } else if (const auto* read = std::get_if<CpuReadCommand>(&next.data)) {
@@ -163,9 +182,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 } else {
                     ASSERT(false);
                 }
-                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
-                    SignalCommand(*state_ptr, fence, block);
-                });
+                split.DeferFunction([state_ptr = &state, fence = next.fence, completion = next.completion] {
+                    SignalCommand(*state_ptr, fence, completion);
+                }, VideoCommon::GpuSplit::FastDrawNeutral);
                 split.Publish();
                 continue;
             }
@@ -197,7 +216,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             } else {
                 ASSERT(false);
             }
-            SignalCommand(state, next.fence, next.block);
+            SignalCommand(state, next.fence, next.completion);
         }
         if (split.Active()) {
             split.Drain();
@@ -229,14 +248,24 @@ VideoCore::RasterizerDownloadArea ThreadManager::ReadMemory(DAddr addr, u64 size
         dependency->address = addr;
         dependency->size = size;
         dependency->requested_generation = ReadbackGeneration();
+        dependency->completed_fence_at_request = state.signaled_fence.load(std::memory_order_acquire);
         dependency->docked_mode = static_cast<u32>(Settings::values.use_docked_mode.GetValue());
         dependency->gpu_accuracy = static_cast<u32>(Settings::values.gpu_accuracy.GetValue());
         dependency->runtime_gpu_accuracy = static_cast<u32>(Settings::values.current_gpu_accuracy);
         dependency->dma_accuracy = static_cast<u32>(Settings::values.dma_accuracy.GetValue());
         dependency->cpu_accuracy = static_cast<u32>(Settings::values.cpu_accuracy.GetValue());
     }
+    if (dependency && dependency->scalar_valid) {
+        const auto scalar_address = addr + (size == 4096 ? dependency->original_address & 4095 : 0);
+        const auto pending = rasterizer->PendingSemaphoreRelease(scalar_address);
+        dependency->pending_before_valid = pending.has_value();
+        dependency->pending_before = pending.value_or(0);
+    }
     PushCommand(CpuReadCommand{addr, size, &result, dependency ? &*dependency : nullptr}, true, is_async);
     if (dependency) {
+        if (dependency->scalar_valid)
+            dependency->value_after = ReadbackDependencyDiagnostics::ScalarSnapshot(
+                ReadbackDependencyDiagnostics::caller_context);
         dependency->cpu_return = ReadbackDependencyDiagnostics::Now();
         dependency->return_generation = ReadbackGeneration();
         ReadbackDependencyDiagnostics::Report(*dependency, result);
@@ -301,10 +330,12 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
         block = true;
     }
 
-    if (const auto* read = std::get_if<CpuReadCommand>(&command_data);
-        read && read->diagnostic) {
-        read->diagnostic->before_lock = ReadbackDependencyDiagnostics::Now();
-    }
+    auto* read_command = std::get_if<CpuReadCommand>(&command_data);
+    auto* read_diagnostic = read_command ? read_command->diagnostic : nullptr;
+    if (read_diagnostic) read_diagnostic->before_lock = ReadbackDependencyDiagnostics::Now();
+    // Reuse one completion per synchronous caller. Each queue item owns a reference
+    // until its notification returns; no allocation per read after the first call.
+    auto completion = block ? Common::HostCommandCompletion::ForCurrentThread() : nullptr;
     std::unique_lock lk(state.write_lock);
     if (state.shutting_down) {
         return 0;
@@ -314,17 +345,13 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
         InvalidateReadbackCache();
     }
     const u64 fence{++state.last_fence};
-    state.queue.EmplaceWait(std::move(command_data), fence, block,
-                            state.published_work_sequence.load(std::memory_order_acquire));
+    state.queue.Emplace(std::move(command_data), fence, completion,
+                        state.published_work_sequence.load(std::memory_order_acquire));
 
     lk.unlock();
-    if (block) {
-        u64 signaled = state.signaled_fence.load(std::memory_order_acquire);
-        while (signaled < fence) {
-            state.signaled_fence.wait(signaled, std::memory_order_acquire);
-            signaled = state.signaled_fence.load(std::memory_order_acquire);
-        }
-    }
+    if (read_diagnostic) read_diagnostic->wait_begin = ReadbackDependencyDiagnostics::Now();
+    if (completion) completion->Wait();
+    if (read_diagnostic) read_diagnostic->wait_end = ReadbackDependencyDiagnostics::Now();
 
     return fence;
 }
