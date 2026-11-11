@@ -17,6 +17,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0908-fence-batching-off-by-default` | — | — | ours |
 | `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
 | `0910-count-only-counters` | `EDEN_NX2_COUNTERS=1` (`EDEN_NX2_FAST_DRAW_PROBE` picks the probed methods) | off | ours |
+| `0911-nan-guard-and-invariant-position` | `EDEN_NX2_NAN_GUARD=1`, `EDEN_NX2_POSITION_INVARIANT=1` | off | notquiteog/Dragoon `395547c` (Shakoquo/Hookshot `f04461bc9`) |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
@@ -52,6 +53,15 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   executable 3D methods it runs. Thunk addresses are absolute: subtract the logged anchor, add
   the address of `Nx2CountersAnchor` in the symbols ELF (`llvm-nm -C`), then symbolize. Measure FPS
   with neither switch set.
+
+- **NaN guard and invariant position.** Bright flashes and white glow on AMD have two causes the
+  colour output mask does not cover. A float colour output holding NaN spreads through bloom, blur
+  and downsample averages: with `EDEN_NX2_NAN_GUARD=1` NaN becomes 0 and the rest is clamped to
+  +-1e30. The colour pass drawn again with depth EQUAL after the depth pre-pass can be rejected in
+  spots when AMD computes a slightly different position, showing the bright sky that bloom blows
+  up: `EDEN_NX2_POSITION_INVARIANT=1` decorates `gl_Position` Invariant. GrowingBlackBeans
+  measured both with the colour output masks (viejunerd/Eglantine-PS5- #21): flashes from a few
+  per walk to nearly none, no FPS cost. The first boot after a change builds the new pipelines.
 
 - **Submit thread (driver).** `sceAgcDriverSubmitDcb` keeps the submitting thread in the kernel
   for a while; in run11 the driver spent 135-220 ms a second in `agc`. With the switch, RADV

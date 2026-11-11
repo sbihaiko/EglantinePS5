@@ -1,0 +1,116 @@
+From 5f637a717a9fb18916b43ffb5b731ddb046391b4 Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Wed, 11 Nov 2026 00:54:46 -0300
+Subject: [PATCH] shader_recompiler: NaN-guarded colour outputs and invariant
+ positions (off by default)
+
+Two AMD fixes for Ocarina's bloom, from notquiteog/Dragoon 395547c (sharkiix's
+Shakoquo/Hookshot f04461bc9 and the shader part of 1e4527fce; ideas from
+NX2navi patches 0007 and 0027), behind switches of their own:
+
+- EDEN_NX2_NAN_GUARD=1: a float colour output carries no NaN or infinity
+  (NaN becomes 0, the rest is clamped to +-1e30), so one NaN texel cannot
+  spread through bloom, blur and downsample averages into white glow.
+- EDEN_NX2_POSITION_INVARIANT=1: gl_Position is decorated Invariant, so the
+  colour pass drawn again with depth EQUAL after the depth pre-pass is not
+  rejected in spots (holes showing the bright sky, blown up by bloom).
+
+GrowingBlackBeans measured both, with the colour output masks, on a base PS5
+(viejunerd/Eglantine-PS5- #21): bright flashes from "a few per walk" to
+nearly none, at no FPS cost. Shaders are translated at every boot, so env.txt
+is enough; the first boot after a change builds the new pipelines.
+---
+ .../spirv/emit_spirv_context_get_set.cpp      |  6 +++++
+ .../backend/spirv/spirv_emit_context.cpp      | 22 +++++++++++++++++++
+ .../backend/spirv/spirv_emit_context.h        | 11 ++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index b68c507..b9e01b4 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -491,6 +491,12 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
+     const AttributeType type{ctx.runtime_info.color_output_types[index]};
+     if (type == AttributeType::Float) {
+         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
++        if (NanGuard()) {
++            // NaN to 0, the rest clamped to +-1e30 (EDEN_NX2_NAN_GUARD, spirv_emit_context.h).
++            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-1e30f)),
++                                        ctx.Const(1e30f))};
++            value = ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), clamped);
++        }
+         ctx.OpStore(pointer, value);
+     } else if (type == AttributeType::UnsignedInt) {
+         const Id pointer{ctx.OpAccessChain(ctx.output_u32, ctx.frag_color.at(index), component_id)};
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index a7317c7..f0960ce 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -30,6 +30,22 @@ bool AmdShaderFixes() {
+     return enabled;
+ }
+ 
++bool NanGuard() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_NAN_GUARD");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++bool PositionInvariant() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_POSITION_INVARIANT");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
+ namespace {
+ enum class Operation {
+     Increment,
+@@ -1854,6 +1870,9 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+             if (!Sirit::ValidId(output_position)) {
+                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
+                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
++                if (PositionInvariant()) {
++                    Decorate(output_position, spv::Decoration::Invariant);
++                }
+             }
+             return {output_position,
+                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
+@@ -1884,6 +1903,9 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
+     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
+         stage == Stage::VertexB) {
+         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
++        if (PositionInvariant()) {
++            Decorate(output_position, spv::Decoration::Invariant);
++        }
+     }
+     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
+         if (stage == Stage::Fragment) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index e1a2737..3e0e405 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -27,6 +27,17 @@ namespace Shader::Backend::SPIRV {
+ /// once; shaders are translated at every boot, so env.txt is enough.
+ [[nodiscard]] bool AmdShaderFixes();
+ 
++/// EDEN_NX2_NAN_GUARD=1 (notquiteog/Dragoon 395547c, from Shakoquo/Hookshot f04461bc9): float
++/// colour outputs carry no NaN or infinity (NaN becomes 0, the rest is clamped to +-1e30), so one
++/// NaN texel cannot spread through bloom, blur and downsample averages into white glow. Read once.
++[[nodiscard]] bool NanGuard();
++
++/// EDEN_NX2_POSITION_INVARIANT=1 (same source): gl_Position is decorated Invariant. Ocarina draws a
++/// depth pre-pass, then the colour pass again with depth EQUAL; without Invariant AMD's compiler may
++/// compute a slightly different position and reject the colour pass in spots, which shows the
++/// bright sky through holes that bloom then blows up. Read once.
++[[nodiscard]] bool PositionInvariant();
++
+ static std::bitset<8> clip_distance_written;
+ 
+ using Sirit::Id;
+-- 
+2.53.0
+
