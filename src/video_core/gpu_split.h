@@ -132,6 +132,19 @@ public:
     }
     void DeferFunction(std::function<void()>&& func, u64 flags = 0);
 
+    /// Front: runs `func` on the back and waits for it. For work on back-owned state (the
+    /// scheduler, the caches) that the front needs done before it goes on: a drained back still
+    /// submits from its idle hook (Scheduler::FlushDeferred), so the front must not record itself.
+    template <typename Func>
+    void Run(const Func& func, Nx2Profile::Zone zone = Nx2Profile::Zone::SplitDrain) {
+        if (IsBackThread() || !Active()) {
+            func();
+            return;
+        }
+        Defer(func);
+        Drain(zone);
+    }
+
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
     static inline bool check_owner{};

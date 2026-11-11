@@ -61,6 +61,8 @@ enum class Zone : u32 {
     DrainPuller,  ///< Front waits for the back: a puller method that needs its result
     DrainCpuRead, ///< Front waits for the back: a CPU read of GPU-written memory
     DrainList,    ///< Front waits for the back: a command list on a GPU-written page
+    DrainFenceRelease, ///< Front waits for the back to release fences (GpuSplit::Run)
+    DrainMacroFlush,   ///< Front waits for the back to flush a macro DMA read (GpuSplit::Run)
     Count,
 };
 
@@ -74,6 +76,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "fence skipped", "method", "split drain", "split wait", "submit", "GPU wait",
     "split full", "drain: macro parameters", "drain: sync fence", "drain: DMA read",
     "drain: command end", "drain: puller", "drain: CPU read", "drain: list",
+    "drain: fence release", "drain: macro flush",
 };
 
 inline bool Enabled() {

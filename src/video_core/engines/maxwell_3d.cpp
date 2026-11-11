@@ -1378,7 +1378,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     constexpr auto flush_caches = VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache;
     const bool dirty = drain && memory_manager.IsMemoryDirty(source, read_bytes, flush_caches);
     if (dirty) {
-        memory_manager.FlushRegion(source, read_bytes, flush_caches);
+        split.Run(
+            [memory = &memory_manager, source, read_bytes, flush_caches] {
+                memory->FlushRegion(source, read_bytes, flush_caches);
+            },
+            VideoCommon::Nx2Profile::Zone::DrainMacroFlush);
     }
     if (trust && *trust >= 0) {
         bool changed = dirty;

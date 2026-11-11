@@ -546,12 +546,15 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::Zone::DrainSync);
-        rasterizer->SignalFence([this]() {
-            std::scoped_lock lk(sync_mutex);
-            synced = true;
-            sync_cv.notify_all();
-        });
+        VideoCommon::GpuSplit::Get().Run(
+            [this] {
+                rasterizer->SignalFence([this]() {
+                    std::scoped_lock lk(sync_mutex);
+                    synced = true;
+                    sync_cv.notify_all();
+                });
+            },
+            VideoCommon::Nx2Profile::Zone::DrainSync);
     }
 
     return true;
