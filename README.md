@@ -69,17 +69,19 @@ is the agent's way to see the console and its safe way back from a freeze.
 
 ## Status against the goal
 
-As of 2026-11-11, build `0f537b0` for the sessions below, build 3 (`30d1655`) played once as b3-A, build 4 (`9e519f5`) twice as b4-A and b4-A2, and build 5 (`06873bf`) once as b5-A. FPS is in 5 s windows, frame generation off.
+As of 2026-11-11. Builds on this page: `0f537b0` (`pr99-test`), build 3 (`30d1655`), build 4
+(`9e519f5`), build 5 (`06873bf`), build 6 (`144cced`, on `main`) and build 7 (`a71f5fb`, branch
+`b7-memory`). FPS is in 5 s windows, frame generation off.
 
 | criterion | target | status |
 |---|---|---|
-| Bloom | normal, as the player judges it | **met** (b2-A and b2-B) |
-| Flashes | none, as the player judges it | not met: still present, much weaker |
-| Stability | no crash in 2 sessions of 20+ min | not met: GPU page fault at about 10 min (b2-B), 9 min (b2-D) and 8 min (b5-A); a freeze with the GPU stuck at about 10 min (b2-D2); stalls of 7.5 s and 17.6 s with the memory pool exhausted (b2-D3); without `skip` the GPU hangs (b2-C); b4-A and b4-A2 ended with the app gone after `EDEN_HANG` of 10-20 s; b3-A had no fault in 17 min but went unplayable |
-| FPS in Link's house | 30 or more | **met**: 30-34 |
-| FPS after the house | 30 or more | not met: 22-31 |
-| FPS in Kokiri Forest | 38 or more | not met: 13-37 |
-| Merge | the work on the fork's `main`, with docs | not yet: it lives on `pr99-test` |
+| Bloom | normal, as the player judges it | met on the PR #99 base (b2-A, b2-B); the player has not judged it since the builds returned to `main`, which does not carry PR #99 |
+| Flashes | none, as the player judges it | not met: still present, much weaker than before 0911 |
+| Stability | no crash in 2 sessions of 20+ min | **half met**: b6-A ran 27 min with no page fault and no crash, under `RADV_PS5_RETIRE_SLACK=1`; the second session (b6-B) ended by hand at 6 min after the pool ran out, not by a fault |
+| FPS in Link's house | 30 or more | met at the start of a session: 29-35 |
+| FPS after the house | 30 or more | not met: 20-31, and 2-18 once the pool is exhausted |
+| FPS in Kokiri Forest | 38 or more | not met: 13-38, following the pool |
+| Merge | the work on the fork's `main`, with docs | not yet: builds 1-6 are on `main`; build 7, the 0927-0930 patches and `ReserveOver` live on `b7-memory` |
 
 ## What we learned
 
@@ -175,6 +177,8 @@ here is open.
 
 ### FPS and the texture cache
 
+- **The budget is not what exhausts the pool.** Under pressure the largest free run collapses with
+  any budget, and cutting it to 1536/2304 changed nothing (b6-C). See *The pool runs out first*.
 - **Memory.** A base PS5 gives the app 12,224 MiB of direct memory against 13,440 MiB on a Pro. The
   parent's 40.6 FPS in Link's house was most likely measured on a Pro.
 - **The collector's figure.** The texture cache's device memory figure covers the whole shared pool:
@@ -203,6 +207,44 @@ here is open.
   Kokiri 13-34 and steadier against 13-36. Lichii measured 4-7 to 53-59 FPS in the Castle Town guard
   house with the three #1314 switches together. Which of the six switches gave the gain here is not
   isolated. Stutters of 1-4 s remain at the heaviest points.
+
+### The pool runs out first
+
+Build 6 settled what ends these sessions, and it is not a fault. With `RADV_PS5_RETIRE_SLACK=1`
+there was no GPU page fault and no crash in two sessions (b6-A, 27 min, and its continuation), and
+both 150 MiB `MKW_BUFFER_MERGE` precursors happened again with no fault after them. What ends them
+is memory:
+
+| quantity (b6-A) | start | mid | end |
+|---|---|---|---|
+| pool, largest contiguous free block | 10,060 MiB | 728 -> 140 MiB | 3-18 MiB |
+| guest (`application held`) | 100 MiB | 4,923 -> 5,169 MiB | 5,313 MiB, oscillating to 4,389 |
+| emulator heap holds | 1,008 MiB | 1,640 MiB | 1,793 MiB |
+| RADV live buffers of 16 MiB or more | 1 block | 105 -> 91 blocks | 92 blocks / 2.7 GiB, a plateau from t=90 s |
+
+Five things follow, and three earlier readings are now discarded:
+
+- **Placement, not total.** Guest + driver plateau + app heap is about 9.7 GiB, the whole pool. The
+  driver's live set stops growing by t=90 s and the guest gives ~800 MiB back at times; nothing
+  leaks. The free *run* collapses early and stays collapsed, so every 16 MiB request lands in the
+  pieces path or waits.
+- **Discarded: the texture cache exhausts the pool.** `EDEN_NX2_TC_EXPECTED_MIB` and
+  `TC_CRITICAL_MIB` cut to 1536/2304 (the log confirms `expected 1536 MiB, critical 2304 MiB,
+  minimum 1024 MiB`) changed nothing: the same 92 buffers of 16 MiB and the same collapse in about
+  3 minutes (b6-C).
+- **Discarded: the app's `Commit` is where the stall time goes.** `dev_alloc_n=0` in every long
+  stall, so no `vk::Buffer::Commit` ran then; a 2 MiB-piece fallback would have shown a large
+  `dev_alloc_ms`.
+- **Discarded: a driver leak.** The live set is a plateau, and the guest's own figure rises and
+  falls.
+- **Correlation has to be built at the source.** `EDEN_STALL` and the driver's free log use
+  different clocks with no shared origin, so the instruments are on the code paths:
+  `EDEN_NX2_BACK_PROFILE` (0928) and `mem_release_ms`/`mem_pageout_ms` (0929).
+- **Not a PS5-only symptom.** Lichii #1299 (4 GB desktop GPU) and #871 (AMD device loss at the
+  movie-to-3D handover) describe the same class.
+
+What the 22 stalls of b7-A looked like: all `split_wait`, sometimes with `tc_upload` and
+`staging_create` beside it, the worst 7.3 s, while the largest free block sat at 2 MiB.
 
 ### The missing door
 
@@ -281,6 +323,12 @@ EDEN_OOT_MESH_DRAWS=skip
 The file holds one `NAME=VALUE` per line; a line that starts with `#` is a comment. The fork
 generates each session's `env.txt` with a script rather than filtering an earlier log by hand.
 
+Builds 3 to 7 add, all off by default: the 0920-0925 switches, `RADV_PS5_RETIRE=1` with
+`RADV_PS5_RETIRE_SLACK=1`, `RADV_PS5_FREE_LOG=1` and `EDEN_NX2_STALL_REPORT=400`. Build 7 also
+enables `EDEN_PS5_RESERVE_OVER=1` (a mapping becomes reserved in one call) and
+`EDEN_NX2_OOT_TEXTURE_POOL_X2=1`; the latter needs 0930, which build 7 does not carry, so the switch
+did nothing there. 0928 and 0929 are diagnostic and first ship in build 8.
+
 ## Patch series and switches
 
 The fork's patches live in `tools/eglantine-patches/`. Each is behind a switch, off by default,
@@ -311,6 +359,18 @@ except 0901, 0903, and 0909, which are on.
 | heap no give-back | `EDEN_PS5_HEAP_NO_GIVEBACK=1` | off | the app heap gives nothing back when the pool is short; blocks of 32 MiB or more are still returned when freed | ours |
 | driver free log | `RADV_PS5_FREE_LOG=1` | off | logs frees and allocations of 16 MiB or more, pieced allocations, sparse binds, regrown scratch and descriptor buffers, and trimmed granules, each with a time and submission numbers (`tools/patch-radv-free-log.py`) | ours, diagnostic |
 | driver submit thread | `RADV_PS5_SUBMIT_THREAD=1` | off | submits on a `RadvSubmit` thread (`tools/patch-radv-submit-thread.py`) | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
+| 0920 flash fixes | `EDEN_NX2_FLASH_FIXES=1` | off | Lichii #679's items 2 and 3 for the one-frame flashes | exploitizm/Eglantine `e0ce856`, sharkiix |
+| 0921 pending poll | `EDEN_NX2_PENDING_POLL_US=50` | off | polls a pending submission after 50 us instead of 1 ms | Lichii #446 |
+| 0922 skip loop writes | `EDEN_NX2_SKIP_LOOP_WRITES=1` | off | skips constant-buffer writes inside a loop (split front only) | Lichii #178 with #488 |
+| 0923 DMA read reported | `EDEN_NX2_DMA_READ_REPORTED=1` | off | treats an already-reported DMA read as reported; risk: a stale occlusion result for a frame | Lichii #1032 (closed), on 0027 |
+| 0924 upload batch | `EDEN_NX2_UPLOAD_BATCH=1` | off | batches texture uploads | Lichii #1245 |
+| 0925 dispatch barrier inline | `EDEN_NX2_DISPATCH_BARRIER_INLINE=1` | off | inlines the dispatch barrier | Lichii #1246 |
+| 0926 device alloc | `EDEN_NX2_STALL_REPORT` only | n/a | `dev_alloc_n/ms/mib` on the `EDEN_STALL` line: the driver's allocation time for a `vk::Buffer` | ours, diagnostic |
+| 0927 OoT texture pool x2 | `EDEN_NX2_OOT_TEXTURE_POOL_X2=1` | off | the store that sizes the game's graphics allocator doubles x8 first; the routine goes in the executable padding after the text segment, guarded by the `main` build id | Lichii #1313, RsMan-Dev |
+| 0928 back profile | `EDEN_NX2_BACK_PROFILE=1` | off | the split's back records idle/execute/submit/fence; `EDEN_STALL` ends with `back_phase=` and its age | ours, diagnostic |
+| 0929 memory give-back | `EDEN_NX2_STALL_REPORT` only | n/a | `mem_release_ms` and `mem_pageout_ms`: the guest's time giving memory back | ours, diagnostic |
+| 0930 texture pool reached | same switch as 0927 | off | `HasNSOPatch` answers for the built-in patch, without which the loader never calls `PatchNSO` | ours |
+| driver retire slack | `RADV_PS5_RETIRE_SLACK=<n>` | 0 | holds each freed buffer n submissions past the newest one at its destroy; 1 covers a list the split's front recorded but the back had not submitted | ours, on Mihawk `f5610fe270` |
 
 0913-0918 are on `pr99-test` only. Switches from the parent that matter here:
 
@@ -375,6 +435,10 @@ house.
 | b4-A | `9e519f5` | b3-A without `NO_GIVEBACK`, plus the six 0920-0925 switches | 29-31 | 16-31 | n/a | app gone after `EDEN_HANG` of 10.6 and 20.6 s at frame 19387; no page fault; pool at 2-8 MiB |
 | b4-A2 | `9e519f5` | same | n/a | 0.1-27 | n/a | 21 stalls, the worst 9.1 s, all pure `split_wait`; 114 `EDEN_HANG`; unplayable after about 8 min |
 | b5-A | `06873bf` | same env | 28-35 | 20-27 | n/a | **no `EDEN_HANG`**; 2 stalls, worst 1.6 s; median 41.1 FPS; GPU page fault at `0x4060629000` about 8 min in, on a 64 MiB block freed 97 ms earlier; the app restarted itself |
+| b6-A | `144cced` | b5 env plus `RADV_PS5_RETIRE_SLACK=1` | 29-35 | 22-38 | n/a | 27 min, **no page fault and no crash**; pool exhausted (largest block 4 MiB); 5 stalls, the worst 8.8 s; closed by hand |
+| b6-B | `144cced` | same | n/a | 18-28 | n/a | second session; pool at 4 MiB and 21 stalls by 8 min; closed by hand |
+| b6-C | `144cced` | same, thresholds cut to `TC_EXPECTED_MIB=1536`, `TC_CRITICAL_MIB=2304` | n/a | 7.5-28 | n/a | the cut changed nothing: pool at 7 MiB and the same 10/16 FPS windows in about 3 min |
+| b7-A | `a71f5fb` | b6 env plus `EDEN_PS5_RESERVE_OVER=1` and `EDEN_NX2_OOT_TEXTURE_POOL_X2=1` | n/a | 1.0-27.2 | n/a | 64 windows in 6 min, **no fault and no crash**; 22 stalls, the worst 7.3 s, all `split_wait`; pool at 2 MiB. The 0927 switch did nothing in this build (see below) |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
@@ -382,9 +446,10 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
 
 1. Does the bloom fix come from the PR #99 base or from the mesh skip?
 2. What causes the remaining one-frame flashes?
-3. What causes the async GPU page fault, now that it happens with the submit thread off? b3-A, with
-   retire on and no page fault in 17 min, points at a free while a submission still reads it, but
-   retire was not isolated from no-giveback.
+3. **Answered, provisionally.** The page fault was a free while a submission still read the
+   buffer. b3-A (retire, no fault in 17 min) and b6-A/b6-B (`RADV_PS5_RETIRE_SLACK=1`, no fault in
+   27 min and 8 min, with both 150 MiB merge precursors) point at the same mechanism: a buffer the
+   split's front recorded was freed before the back submitted the list that names it.
 4. Why do the mesh-only draws hang the GPU here, when the parent's bisect found they draw the leaves
    correctly?
 5. Is the door a mesh-only draw, or a task draw that waits on pointer binding for graphics stages?
@@ -392,10 +457,16 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
 6. Which of 0913-0918 gave the b2-B gain, and what reaches 38 FPS in Kokiri? Candidates in
    `docs/OOT-SIBLING-PORTS.md`: Lichii #1329 and #1056, viejunerd's texture switches, and Lichii
    #1334.
-7. Where does the back wait during the pure `split_wait` stalls? The b3-A logs cannot answer it
-   offline: `EDEN_STALL` counts emulator seconds and the free log's `t=` counts milliseconds since
-   boot, with no shared origin and no timestamp on the `EDEN_MEMORY` lines. The next diagnostic
-   gives `vkAllocateMemory` its own stall category, which both times it and puts it in the report.
+7. Where does the back wait during the pure `split_wait` stalls? It cannot be answered offline:
+   `EDEN_STALL` counts emulator seconds and the free log's `t=` counts milliseconds since boot, and
+   the `EDEN_MEMORY` lines carry no timestamp. 0928 answers it on the console (`back_phase=` and
+   its age on every `EDEN_STALL` line), 0929 adds the guest's give-back time, and both need a build.
+8. What allocates the 92 buffers of exactly 16 MiB (2.7 GiB) that plateau in VRAM? They are not
+   texture-cache images (cutting the cache changed nothing). Naming them needs an allocation site:
+   the driver's free log has no caller, and the app's `Commit` is not on the path.
+9. Does the game's own texture pool (`EDEN_NX2_OOT_TEXTURE_POOL_X2`, Lichii #1313) change how much
+   the guest holds? Build 7 enabled the switch but the loader never called the patch (0927 alone
+   does not make `HasNSOPatch` answer); 0930 fixes that.
 
 **What b3-A settled.** Guest memory compression is not a cause of the stalls: `cram_unpack_ms` was
 0.0 in all 51 `EDEN_STALL` lines. The stalls are the front GPU thread waiting for the back
