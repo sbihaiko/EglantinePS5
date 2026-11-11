@@ -121,7 +121,16 @@ diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/re
 index 6b2137d60d..a0a7db64f7 100644
 --- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
 +++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
-@@ -525,6 +525,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+@@ -18,7 +18,8 @@
+ 
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+ 
+ #include "common/settings.h"
++#include "common/stall_ledger.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "video_core/gpu_split.h"
+@@ -525,6 +526,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
          }
  
          std::scoped_lock lock{submit_mutex};
