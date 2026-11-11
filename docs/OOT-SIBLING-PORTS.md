@@ -116,6 +116,26 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   `EDEN_NX2_TC_OWN_BYTES=1` the log also prints the device figure every 600 frames, which is the
   query that makes the driver print `RADV_PS5_MEMORY` (`RADV_PS5_MEMORY_REPORT=1`).
 
+## Open investigations
+
+- **Bloom.** The glow around lights and the sky is blown out in every session since gameplay
+  was first reached on this base, and no switch so far has changed it: the colour output mask
+  (0901), `EDEN_NX2_AMD_SHADER_FIXES=1`, the NaN guard and invariant position (0911), routed
+  global atomics (0912), and the 2560/3328 texture cache limits. Suspect: auto-exposure. Under
+  0912, 5 of the 8 compute shaders with global atomics still drop them (no bound NVN storage
+  buffer), so the exposure value the tonemapper reads is never updated. Next: parent PR #99 +
+  #100 (branch `pr99-test`), which says it fixes exposure; if the bloom stays, the cause is not
+  exposure.
+- **Flashes.** The whole image flashes bright for one frame, often ("lightning on a rainy
+  night"). Unchanged by every switch listed for bloom. Not texture re-decode alone: the larger
+  texture cache removed the long stalls and the packing passes, and the flashes stayed. Next:
+  PR #99 + #100, then Lichii #1199 and #1236 (unmap freed GPU ranges: OoT drew from freed heap,
+  giving white flashes after area changes).
+- **GPU page fault with the submit thread.** `RADV_PS5_SUBMIT_THREAD=1` crashed 2 of 4 sessions
+  with an async GPU page fault right after a RADV trim; 0 of 4 crashed without it. Suspect: a
+  deferred submission still references memory the trim released. Keep the switch off until the
+  trim waits for the submit thread.
+
 ## Looked at, not ported
 
 - **Null image on a memo hit** (Lichii `c2e293ec8`, #910). This pin already gates
