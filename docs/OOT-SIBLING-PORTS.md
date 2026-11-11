@@ -16,6 +16,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0907-profile-split-drain-sites` | `EDEN_NX2_GPU_PROFILE=1` | off | ours |
 | `0908-fence-batching-off-by-default` | — | — | ours |
 | `0909-fence-work-on-split-back` | none | on | Lichii `e3d8e9c605` (#70), fence part |
+| `0910-count-only-counters` | `EDEN_NX2_COUNTERS=1` (`EDEN_NX2_FAST_DRAW_PROBE` picks the probed methods) | off | ours |
 
 - **Colour output mask.** A render target the fragment shader does not write keeps its contents.
   AMD writes undefined values (NaN) there, and bloom spreads them into white glow.
@@ -41,6 +42,15 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   the chunk. `GpuSplit::Run` now sends the puller's fence releases, a GP entry's sync fence and
   the macro DMA read flush to the back, and waits. Batching (0905) stays off until a run shows it
   stable with this patch.
+
+- **Count-only counters.** The profile reads the clock twice per zone, about 2.6 million times a
+  second on the split's back (26 ns a read here: an estimated 135 ms a second), so it slows what
+  it measures. `EDEN_NX2_COUNTERS=1` counts without the clock and logs every 10 s: the sets of
+  fast draw breaks per draw (and how many draws only `EDEN_NX2_FAST_DRAW_PROBE` methods broke,
+  default `0x54c,0x556`), the back's ring entries by kind and its deferred calls by thunk, and the
+  executable 3D methods it runs. Thunk addresses are absolute: subtract the logged anchor, add
+  the address of `Nx2CountersAnchor` in the symbols ELF (`llvm-nm -C`), then symbolize. Measure FPS
+  with neither switch set.
 
 - **Batched submissions.** In run11 the back GPU thread made 850-1,540 queue submissions a
   second, one per fence and per command list end, and the driver spent 135-220 ms a second in

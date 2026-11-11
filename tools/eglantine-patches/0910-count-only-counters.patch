@@ -1,0 +1,546 @@
+From 9aa9b2592b84b363ccef7dd884737870c939d8ed Mon Sep 17 00:00:00 2001
+From: sbihaiko <bihaiko@protonmail.com>
+Date: Tue, 10 Nov 2026 22:42:43 -0300
+Subject: [PATCH] video_core: count-only counters for the split's back
+ (EDEN_NX2_COUNTERS)
+
+Profile zones read the clock twice each, ~2.6 million times a second on the
+back, which costs it an estimated 135 ms a second and skews what they measure.
+EDEN_NX2_COUNTERS=1 counts without reading the clock, and logs every 10 s:
+
+- Fast draw break sets: for each draw that lost its delta chain to a state
+  change, the distinct breaks made on the back since the previous draw, not
+  only the last. The log gives set sizes, sole breaks, pairs, breaks by draw,
+  and the draws broken only by EDEN_NX2_FAST_DRAW_PROBE methods (default
+  0x54c clear_report_value, 0x556 render_enable mode), the draws a change to
+  those methods would turn into delta draws.
+- The back's ring entries by kind (direct, run and sunk methods, multi,
+  register blocks, constant buffer data, calls), and its deferred calls by
+  thunk address, with an anchor address to look them up in the symbols ELF.
+- The executable 3D methods the back runs, by method, with their share of
+  same-value writes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/engines/maxwell_3d.cpp         |  56 ++++++++++
+ src/video_core/engines/maxwell_3d.h           |   4 +
+ src/video_core/gpu_split.cpp                  |  99 +++++++++++++++++
+ src/video_core/nx2_fast_draw.h                |  35 +++++-
+ .../renderer_vulkan/vk_rasterizer.cpp         | 105 +++++++++++++++++-
+ .../renderer_vulkan/vk_rasterizer.h           |  10 ++
+ 6 files changed, 305 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 6ce3165e8e..8ce575038a 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -23,6 +23,7 @@
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/texture_barrier_epoch.h"
+@@ -33,6 +34,57 @@
+ 
+ namespace Tegra::Engines {
+ 
++namespace {
++
++/// EDEN_NX2_COUNTERS: executable 3D methods run on this thread, by method, and how many found the
++/// register holding the value already. Allocated on first use; leaked with the thread.
++struct ExecCounters {
++    std::array<u32, Maxwell3D::Regs::NUM_REGS> calls{};
++    std::array<u32, Maxwell3D::Regs::NUM_REGS> same{};
++};
++thread_local ExecCounters* t_exec_counters{};
++
++ExecCounters* ExecCountersHere() {
++    if (!VideoCommon::Nx2FastDraw::CountersEnabled()) [[likely]] {
++        return nullptr;
++    }
++    if (t_exec_counters == nullptr) {
++        t_exec_counters = new ExecCounters{};
++    }
++    return t_exec_counters;
++}
++
++} // Anonymous namespace
++
++void Maxwell3D::ReportExecCounters(double seconds) {
++    ExecCounters* const counters = t_exec_counters;
++    if (counters == nullptr) {
++        return;
++    }
++    std::vector<std::pair<u32, u32>> methods;
++    u64 total{};
++    u64 same{};
++    for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
++        if (counters->calls[method] != 0) {
++            methods.emplace_back(counters->calls[method], method);
++            total += counters->calls[method];
++            same += counters->same[method];
++        }
++    }
++    const size_t shown = (std::min<size_t>)(methods.size(), 20);
++    std::partial_sort(methods.begin(), methods.begin() + shown, methods.end(), std::greater{});
++    std::string top;
++    for (size_t i = 0; i < shown; ++i) {
++        const u32 method = methods[i].second;
++        top += fmt::format(" {:#x}:{:.0f} ({}% same)", method,
++                           static_cast<double>(methods[i].first) / seconds,
++                           counters->same[method] * 100 / methods[i].first);
++    }
++    LOG_INFO(HW_GPU, "GPU back executable 3D methods per second: {:.0f} ({:.0f} same value) |{}",
++             static_cast<double>(total) / seconds, static_cast<double>(same) / seconds, top);
++    *counters = ExecCounters{};
++}
++
+ /// First register id that is actually a Macro call.
+ constexpr u32 MacroRegistersStart = 0xE00;
+ 
+@@ -629,6 +681,10 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
+         }
+         return;
+     }
++    if (ExecCounters* const counters = ExecCountersHere()) [[unlikely]] {
++        ++counters->calls[method];
++        counters->same[method] += regs.reg_array[method] == argument ? 1 : 0;
++    }
+     ProcessDirtyRegisters(method, argument);
+     ProcessMethodCall(method, argument, method_argument, is_last_call);
+ }
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 201e511dfd..b3030f675c 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -62,6 +62,10 @@ namespace Tegra::Engines {
+ 
+ class Maxwell3D final : public EngineInterface {
+ public:
++    /// EDEN_NX2_COUNTERS: logs and resets this thread's executable method counts (the split's
++    /// back calls it with its own report).
++    static void ReportExecCounters(double seconds);
++
+     explicit Maxwell3D(MemoryManager& memory_manager);
+     ~Maxwell3D();
+ 
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 06040779a7..c91c2a4662 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -3,7 +3,10 @@
+ 
+ #include <algorithm>
+ #include <cstdlib>
++#include <string>
+ #include <thread>
++#include <unordered_map>
++#include <vector>
+ 
+ #ifdef _MSC_VER
+ #include <intrin.h>
+@@ -31,6 +34,85 @@ namespace VideoCommon {
+ 
+ namespace {
+ 
++/// EDEN_NX2_COUNTERS: the back's ring entries by kind, and its deferred calls by function, counted
++/// without clock reads. Allocated on the back when the counters are on.
++struct BackCounters {
++    enum Kind : size_t {
++        EngineEntry,
++        MethodDirect,
++        MethodRun,
++        MethodSunk,
++        MultiEntry,
++        RegsEntry,
++        RegsWrites,
++        CbDataEntry,
++        CallNeutral,
++        CallBreaking,
++        Count,
++    };
++    std::array<u64, Count> kinds{};
++    std::unordered_map<u64, u64> calls; ///< Kind::Call entries by thunk address
++    u64 window_start{};
++    u32 ticks{};
++};
++thread_local BackCounters* t_back_counters{};
++
++/// Logged with the thunk addresses: its own address in the symbols ELF turns them into names.
++[[gnu::noinline]] u64 Nx2CountersAnchor() {
++    return 0x4e78324374ULL;
++}
++
++void CountBack(BackCounters::Kind kind, u64 amount = 1) {
++    if (BackCounters* const counters = t_back_counters) [[unlikely]] {
++        counters->kinds[kind] += amount;
++    }
++}
++
++void ReportBackCounters() {
++    BackCounters* const counters = t_back_counters;
++    if (counters == nullptr || (++counters->ticks & 255) != 0) {
++        return;
++    }
++    const u64 now = Nx2Profile::Now();
++    if (counters->window_start == 0) {
++        counters->window_start = now;
++        return;
++    }
++    if (now - counters->window_start < 10'000'000'000ULL) {
++        return;
++    }
++    const double seconds = static_cast<double>(now - counters->window_start) / 1e9;
++    const auto rate = [&](size_t kind) {
++        return static_cast<double>(counters->kinds[kind]) / seconds;
++    };
++    std::vector<std::pair<u64, u64>> calls;
++    for (const auto& [thunk, count] : counters->calls) {
++        calls.emplace_back(count, thunk);
++    }
++    const size_t shown = (std::min<size_t>)(calls.size(), 16);
++    std::partial_sort(calls.begin(), calls.begin() + shown, calls.end(), std::greater{});
++    std::string top;
++    for (size_t i = 0; i < shown; ++i) {
++        top += fmt::format(" {:#x}:{:.0f}", calls[i].second,
++                           static_cast<double>(calls[i].first) / seconds);
++    }
++    LOG_INFO(HW_GPU,
++             "GPU back entries per second: engine {:.0f} | methods direct {:.0f}, run {:.0f}, "
++             "sunk {:.0f} | multi {:.0f} | register blocks {:.0f} ({:.0f} writes) | constant "
++             "buffer data {:.0f} | calls {:.0f} fast draw neutral, {:.0f} breaking | calls by "
++             "thunk (anchor {:#x}):{}",
++             rate(BackCounters::EngineEntry), rate(BackCounters::MethodDirect),
++             rate(BackCounters::MethodRun), rate(BackCounters::MethodSunk),
++             rate(BackCounters::MultiEntry), rate(BackCounters::RegsEntry),
++             rate(BackCounters::RegsWrites), rate(BackCounters::CbDataEntry),
++             rate(BackCounters::CallNeutral), rate(BackCounters::CallBreaking),
++             reinterpret_cast<u64>(&Nx2CountersAnchor), top);
++    Tegra::Engines::Maxwell3D::ReportExecCounters(seconds);
++    counters->kinds = {};
++    counters->calls.clear();
++    counters->window_start = now;
++}
++
+ void Pause() {
+ #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+     _mm_pause();
+@@ -397,6 +479,7 @@ size_t GpuSplit::Execute(const u64* entry) {
+     case Kind::Wrap:
+         return 0;
+     case Kind::Engine:
++        CountBack(BackCounters::EngineEntry);
+         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
+         return 2;
+     case Kind::Method: {
+@@ -407,12 +490,15 @@ size_t GpuSplit::Execute(const u64* entry) {
+             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+         }
+         if ((head & Direct) != 0) {
++            CountBack(BackCounters::MethodDirect);
+             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+             engine->ConsumeSink(*system);
+             engine->CallMethod(*system, method, argument, true);
+         } else if (!engine->execution_mask[method]) {
++            CountBack(BackCounters::MethodSunk);
+             engine->method_sink.emplace_back(method, argument);
+         } else {
++            CountBack(BackCounters::MethodRun);
+             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+             engine->ConsumeSink(*system);
+             if ((head & HasSegment) != 0) {
+@@ -426,6 +512,7 @@ size_t GpuSplit::Execute(const u64* entry) {
+         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+         const u32 amount = static_cast<u32>(head >> 32);
+         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
++        CountBack(BackCounters::MultiEntry);
+         auto* const engine = back_engine;
+         if (!engine->reports_fast_draw_breaks) {
+             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+@@ -441,6 +528,8 @@ size_t GpuSplit::Execute(const u64* entry) {
+     }
+     case Kind::Regs: {
+         const u32 count = static_cast<u32>((head >> 8) & 0xff);
++        CountBack(BackCounters::RegsEntry);
++        CountBack(BackCounters::RegsWrites, count);
+         auto* const engine = back_engine;
+         if (!engine->reports_fast_draw_breaks) {
+             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+@@ -454,6 +543,7 @@ size_t GpuSplit::Execute(const u64* entry) {
+     }
+     case Kind::CbData: {
+         const u32 count = static_cast<u32>((head >> 8) & 0xff);
++        CountBack(BackCounters::CbDataEntry);
+         auto* const engine = back_engine;
+         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+         engine->ConsumeSink(*system);
+@@ -461,6 +551,11 @@ size_t GpuSplit::Execute(const u64* entry) {
+         return 1 + count;
+     }
+     case Kind::Call: {
++        if (BackCounters* const counters = t_back_counters) [[unlikely]] {
++            ++counters->kinds[(head & FastDrawNeutral) != 0 ? BackCounters::CallNeutral
++                                                            : BackCounters::CallBreaking];
++            ++counters->calls[entry[1]];
++        }
+         if ((head & FastDrawNeutral) == 0) {
+             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+         }
+@@ -481,9 +576,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+ #ifdef _WIN32
+     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+ #endif
++    if (Nx2FastDraw::CountersEnabled()) {
++        t_back_counters = new BackCounters{};
++    }
+     u64 read_position = 0;
+     while (!stop_token.stop_requested()) {
+         Nx2Profile::Report("GPU back thread");
++        ReportBackCounters();
+         u64 available = published.load(std::memory_order_acquire);
+         if (available == read_position) {
+             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+diff --git a/src/video_core/nx2_fast_draw.h b/src/video_core/nx2_fast_draw.h
+index 4108837389..aa10edc589 100644
+--- a/src/video_core/nx2_fast_draw.h
++++ b/src/video_core/nx2_fast_draw.h
+@@ -91,6 +91,35 @@ inline void SetEnabledForTest(bool on) {
+     return verify;
+ }
+ 
++/// EDEN_NX2_COUNTERS=1: count-only diagnostics, without the profile's clock reads; read once.
++[[nodiscard]] inline bool CountersEnabled() {
++    static const bool on = std::getenv("EDEN_NX2_COUNTERS") != nullptr;
++    return on;
++}
++
++/// The distinct breaks (reason | method << 8) made on this thread since its last draw took them
++/// (EDEN_NX2_COUNTERS): the rasterizer counts which sets end delta chains, not only the last.
++struct BreakSet {
++    static constexpr u32 Max = 8;
++    std::array<u32, Max> sources{};
++    u32 count{};
++    bool overflow{};
++
++    void Add(u32 source) {
++        for (u32 i = 0; i < count; ++i) {
++            if (sources[i] == source) {
++                return;
++            }
++        }
++        if (count < Max) {
++            sources[count++] = source;
++        } else {
++            overflow = true;
++        }
++    }
++};
++inline thread_local BreakSet t_break_set;
++
+ inline std::atomic<u64> g_serial{1};
+ /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
+ inline std::atomic<u32> g_last_break{};
+@@ -98,7 +127,11 @@ inline std::atomic<u32> g_last_break{};
+ inline void Break(Reason reason, u32 method = 0) {
+     if (Enabled()) {
+         g_serial.fetch_add(1, std::memory_order_relaxed);
+-        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
++        const u32 source = static_cast<u32>(reason) | (method << 8);
++        g_last_break.store(source, std::memory_order_relaxed);
++        if (CountersEnabled()) {
++            t_break_set.Add(source);
++        }
+     }
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 02317c2f42..544182d01e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -264,6 +264,10 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
+     namespace FastDraw = VideoCommon::Nx2FastDraw;
+     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
+     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
++    FastDraw::BreakSet break_set{};
++    if (FastDraw::CountersEnabled()) {
++        break_set = std::exchange(FastDraw::t_break_set, FastDraw::BreakSet{});
++    }
+     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
+         ++fast_draw_stats.full[static_cast<size_t>(reason)];
+         return nullptr;
+@@ -284,6 +288,9 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
+         if (const u32 method = last_break >> 8; method < FastDrawMaxwell::NUM_REGS) {
+             ++fast_draw_stats.break_methods[method];
+         }
++        if (FastDraw::CountersEnabled()) {
++            CountBreakSet(break_set);
++        }
+         return full(FullDraw::StateChanged);
+     }
+     if (draw.map_serial != gpu_memory->MapSerial()) {
+@@ -393,6 +400,52 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
+     };
+ }
+ 
++void RasterizerVulkan::CountBreakSet(const VideoCommon::Nx2FastDraw::BreakSet& breaks) {
++    namespace FastDraw = VideoCommon::Nx2FastDraw;
++    FastDrawStats& stats = fast_draw_stats;
++    const u32 count = breaks.count;
++    ++stats.set_sizes[breaks.overflow ? 5 : (std::min<u32>)(count, 4)];
++    for (u32 i = 0; i < count; ++i) {
++        ++stats.any_sources[breaks.sources[i]];
++    }
++    if (breaks.overflow || count == 0) {
++        return;
++    }
++    if (count == 1) {
++        ++stats.sole_sources[breaks.sources[0]];
++    } else if (count == 2) {
++        const u32 low = (std::min)(breaks.sources[0], breaks.sources[1]);
++        const u32 high = (std::max)(breaks.sources[0], breaks.sources[1]);
++        ++stats.pair_sources[(u64{low} << 32) | high];
++    }
++    // EDEN_NX2_FAST_DRAW_PROBE=<3D methods, comma separated> (default 0x54c,0x556): the methods a
++    // change would stop breaking on, as register writes or as methods. Counts the draws whose
++    // breaks were all among them: the draws that change would turn into delta draws.
++    static const std::vector<u32> probe = [] {
++        std::vector<u32> methods;
++        const char* value = std::getenv("EDEN_NX2_FAST_DRAW_PROBE");
++        std::string_view rest = value != nullptr ? value : "0x54c,0x556";
++        while (!rest.empty()) {
++            const size_t comma = rest.find(',');
++            const std::string item{rest.substr(0, comma)};
++            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
++            if (!item.empty()) {
++                methods.push_back(static_cast<u32>(std::strtoul(item.c_str(), nullptr, 0)));
++            }
++        }
++        return methods;
++    }();
++    const bool only_probe = std::all_of(breaks.sources.begin(), breaks.sources.begin() + count,
++                                        [](u32 source) {
++        const auto reason = static_cast<FastDraw::Reason>(source & 0xff);
++        return (reason == FastDraw::Reason::Register || reason == FastDraw::Reason::Method) &&
++               std::find(probe.begin(), probe.end(), source >> 8) != probe.end();
++    });
++    if (only_probe) {
++        ++stats.probe_only;
++    }
++}
++
+ void RasterizerVulkan::ReportFastDraws() {
+     const u64 now = VideoCommon::Nx2Profile::Now();
+     FastDrawStats& stats = fast_draw_stats;
+@@ -403,8 +456,9 @@ void RasterizerVulkan::ReportFastDraws() {
+     if (now - stats.window_start < 10'000'000'000ULL) {
+         return;
+     }
+-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
+-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
++    // Logged only with EDEN_NX2_GPU_PROFILE, EDEN_NX2_FAST_DRAW_VERIFY or EDEN_NX2_COUNTERS.
++    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify &&
++        !VideoCommon::Nx2FastDraw::CountersEnabled()) {
+         stats = FastDrawStats{.window_start = now};
+         return;
+     }
+@@ -493,6 +547,47 @@ void RasterizerVulkan::ReportFastDraws() {
+     }
+     LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
+              breaks, top);
++    if (VideoCommon::Nx2FastDraw::CountersEnabled()) {
++        namespace FastDraw = VideoCommon::Nx2FastDraw;
++        const auto source_name = [](u32 source) {
++            const u32 reason = source & 0xff;
++            const u32 method = source >> 8;
++            if (reason == static_cast<u32>(FastDraw::Reason::Register)) {
++                return fmt::format("reg {:#x}", method);
++            }
++            if (reason == static_cast<u32>(FastDraw::Reason::Method)) {
++                return fmt::format("method {:#x}", method);
++            }
++            const char* name = reason < FastDraw::reason_names.size() ? FastDraw::reason_names[reason] : "?";
++            return method != 0 ? fmt::format("{} {:#x}", name, method) : std::string{name};
++        };
++        const auto top_of = [&](const auto& map, size_t limit, const auto& name) {
++            std::vector<std::pair<u32, typename std::decay_t<decltype(map)>::key_type>> sorted;
++            for (const auto& [key, value] : map) {
++                sorted.emplace_back(value, key);
++            }
++            const size_t n = (std::min)(sorted.size(), limit);
++            std::partial_sort(sorted.begin(), sorted.begin() + n, sorted.end(), std::greater{});
++            std::string text;
++            for (size_t i = 0; i < n; ++i) {
++                text += fmt::format(" {}:{:.0f}", name(sorted[i].second),
++                                    static_cast<double>(sorted[i].first) / seconds);
++            }
++            return text.empty() ? std::string{" none"} : text;
++        };
++        const auto pair_name = [&](u64 key) {
++            return source_name(static_cast<u32>(key >> 32)) + "+" + source_name(static_cast<u32>(key));
++        };
++        const auto rate = [&](u64 value) { return static_cast<double>(value) / seconds; };
++        LOG_INFO(Render_Vulkan,
++                 "Fast draw break sets per second (state changed draws): breaks on another thread "
++                 "{:.0f}, 1 {:.0f}, 2 {:.0f}, 3 {:.0f}, 4-8 {:.0f}, over 8 {:.0f} | only probe "
++                 "methods {:.0f} | sole:{} | pairs:{} | in the set:{}",
++                 rate(stats.set_sizes[0]), rate(stats.set_sizes[1]), rate(stats.set_sizes[2]),
++                 rate(stats.set_sizes[3]), rate(stats.set_sizes[4]), rate(stats.set_sizes[5]),
++                 rate(stats.probe_only), top_of(stats.sole_sources, 12, source_name),
++                 top_of(stats.pair_sources, 8, pair_name), top_of(stats.any_sources, 16, source_name));
++    }
+     stats = FastDrawStats{.window_start = now};
+ }
+ 
+@@ -718,7 +813,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+             const size_t index = static_cast<size_t>(path);
+             fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
+             ++fast_draw_stats.prepare_draws[index];
+-            // Every 10 s, from the thread that owns the counters.
++        }
++        // Every 10 s, from the thread that owns the counters (one clock read every 256 draws
++        // when only the counters are on).
++        if (fast_draw_timed ||
++            (VideoCommon::Nx2FastDraw::CountersEnabled() && (++fast_draw_report_ticks & 255) == 0)) {
+             ReportFastDraws();
+         }
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 230bb2ce03..a54453790f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -8,6 +8,7 @@
+ 
+ #include <array>
+ #include <chrono>
++#include <unordered_map>
+ 
+ #include <boost/container/static_vector.hpp>
+ 
+@@ -300,6 +301,13 @@ private:
+         /// StateChanged draws by the reason of the last break, and by its 3D method.
+         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
+         std::array<u32, FastDrawMaxwell::NUM_REGS> break_methods{};
++        /// EDEN_NX2_COUNTERS: StateChanged draws by the set of breaks since the previous draw.
++        /// Sizes: none on this thread (breaks on another thread), 1, 2, 3, 4-8, more than 8.
++        std::array<u64, 6> set_sizes{};
++        std::unordered_map<u32, u32> sole_sources; ///< Sets of one break: which
++        std::unordered_map<u32, u32> any_sources;  ///< Draws whose set holds the break
++        std::unordered_map<u64, u32> pair_sources; ///< Sets of two breaks
++        u64 probe_only{}; ///< Sets made only of EDEN_NX2_FAST_DRAW_PROBE methods
+         u64 window_start{};
+     };
+     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
+@@ -311,6 +319,8 @@ private:
+     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
+                           u64 map_serial);
+     void ReportFastDraws();
++    u32 fast_draw_report_ticks{};
++    void CountBreakSet(const VideoCommon::Nx2FastDraw::BreakSet& breaks);
+     ReusableDraw reusable_draw;
+     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+-- 
+2.53.0
+
