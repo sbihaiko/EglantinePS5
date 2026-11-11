@@ -27,6 +27,17 @@ namespace Shader::Backend::SPIRV {
 /// once; shaders are translated at every boot, so env.txt is enough.
 [[nodiscard]] bool AmdShaderFixes();
 
+/// EDEN_NX2_NAN_GUARD=1 (notquiteog/Dragoon 395547c, from Shakoquo/Hookshot f04461bc9): float
+/// colour outputs carry no NaN or infinity (NaN becomes 0, the rest is clamped to +-1e30), so one
+/// NaN texel cannot spread through bloom, blur and downsample averages into white glow. Read once.
+[[nodiscard]] bool NanGuard();
+
+/// EDEN_NX2_POSITION_INVARIANT=1 (same source): gl_Position is decorated Invariant. Ocarina draws a
+/// depth pre-pass, then the colour pass again with depth EQUAL; without Invariant AMD's compiler may
+/// compute a slightly different position and reject the colour pass in spots, which shows the
+/// bright sky through holes that bloom then blows up. Read once.
+[[nodiscard]] bool PositionInvariant();
+
 static std::bitset<8> clip_distance_written;
 
 using Sirit::Id;

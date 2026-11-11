@@ -34,6 +34,22 @@ bool AmdShaderFixes() {
     return enabled;
 }
 
+bool NanGuard() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_NAN_GUARD");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool PositionInvariant() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_POSITION_INVARIANT");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 namespace {
 enum class Operation {
     Increment,
@@ -2002,6 +2018,9 @@ void EmitContext::DefineMesh(const IR::Program& program) {
             if (!Sirit::ValidId(output_position)) {
                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
+                if (PositionInvariant()) {
+                    Decorate(output_position, spv::Decoration::Invariant);
+                }
             }
             return {output_position,
                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
@@ -2032,6 +2051,9 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        if (PositionInvariant()) {
+            Decorate(output_position, spv::Decoration::Invariant);
+        }
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {
