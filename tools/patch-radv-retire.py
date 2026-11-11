@@ -69,6 +69,29 @@ radv_ps5_retire_enabled(void)
    return enabled;
 }
 
+/* How many submissions past the one that was newest at the destroy a buffer waits for.
+ * Zero keeps mihawk's rule. One covers the case b5-A showed: the split's front records
+ * commands that name a buffer, the back submits them later, and the destroy happens while
+ * submitted_seq already equals the GPU's completed value, so the buffer is released before
+ * the list that reads it is even submitted. RADV_PS5_RETIRE_SLACK=1 waits for one more. */
+static uint64_t
+radv_ps5_retire_slack(void)
+{
+   static int slack = -1;
+   if (slack < 0) {
+      const char *value = getenv("RADV_PS5_RETIRE_SLACK");
+      slack = 0;
+      if (value) {
+         for (const char *p = value; *p >= '0' && *p <= '9' && slack < 64; p++)
+            slack = slack * 10 + (*p - '0');
+      }
+      if (slack)
+         fprintf(stderr, "radv/ps5: a freed buffer waits %d submissions past the newest at its "
+                         "destroy (RADV_PS5_RETIRE_SLACK=%d)\n", slack, slack);
+   }
+   return (uint64_t)slack;
+}
+
 static void
 radv_ps5_memory_release(struct radv_ps5_memory *memory, bool sparse)
 {
@@ -110,7 +133,7 @@ radv_ps5_memory_retire(struct radv_ps5_queue *queue, struct radv_ps5_memory *mem
    /* Out of the trim's list before the record is copied: the trim keeps pointers to it. */
    if (!sparse)
       radv_ps5_memory_hold(memory);
-   const uint64_t seq = p_atomic_read(&queue->submitted_seq);
+   const uint64_t seq = p_atomic_read(&queue->submitted_seq) + radv_ps5_retire_slack();
    if (seq <= radv_ps5_queue_poll(queue)) {
       radv_ps5_memory_release(memory, sparse);
    } else {
