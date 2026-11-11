@@ -14,6 +14,12 @@ Switch 2 capable fork of [Eden](https://github.com/eden-emulator/mirror). All cr
 core belongs to the Eglantine and Eden projects and their contributors. EglantinePS5 is not
 affiliated with or endorsed by the Eglantine team, the Eden team, or Sony.
 
+> [!TIP]
+> **This work runs through [Ariel](https://github.com/sbihaiko/ariel)**, a PS5 payload shell built
+> for AI agents. Ariel lets the agent behind these sessions see the console, follow a test session,
+> and bring a frozen console back without anyone at the pad. Every change that matters still needs
+> the owner's signature. See [How Ariel speeds up the work](#how-ariel-speeds-up-the-work).
+
 Every result below comes from one console: a base PS5 (CFI-2014, not a Pro) on firmware 11.20,
 Docked for the fixed-route sessions. The core pin is `3140648a` with the parent's patch series.
 
@@ -28,6 +34,38 @@ Docked for the fixed-route sessions. The core pin is `3140648a` with the parent'
   What the sibling forks taught, and what was ported or left out, is in
   [`docs/OOT-SIBLING-PORTS.md`](docs/OOT-SIBLING-PORTS.md).
 - The complete source is in this repository. To build it, see [docs/BUILDING.md](docs/BUILDING.md).
+
+## How Ariel speeds up the work
+
+Each round has the same steps: build on Actions, install, write `env.txt`, the player runs the
+route, the logs come back, and the result is written up. Only one of those steps needs the player:
+the route at the pad. The goal is for an agent to do everything else, and to do it safely on a
+console with kernel privileges. [Ariel](https://github.com/sbihaiko/ariel) is what makes that
+possible. It is a fork of [ps5-payload-dev/shsrv](https://github.com/ps5-payload-dev/shsrv) with
+an agent port on TCP 2324: one command per connection, and every answer ends in `exit <status>`,
+so the agent branches on a word, not on prose.
+
+- **Seeing needs no approval.** With only the access token, the agent can run `ps`, `procstat`,
+  `tail`, `grep`, `cat`, `stat`, `dmesg`, and `sysinfo`. That covers what the loop needs:
+  confirming the app is closed before `env.txt` changes, checking an install by the eboot's size
+  (hashes never match; see [Tooling](#tooling)), and following `stderr.log` and `heap.log` while
+  the player is on the route.
+- **Changing needs the owner's key.** Writes, `kill`, `launch`, `shutdown`, and payload installs
+  answer `approval_required` with a challenge that names the exact action. The owner's signer signs
+  that one action, once. The agent never holds the key, so text injected into a log or a web page
+  cannot turn into an action. That is what makes it safe to leave the agent watching a session
+  alone.
+- **Recovery without the pad.** On 2026-11-11 a GPU hang froze the console, with the controller
+  stuck. The agent asked Ariel for a `shutdown`, the owner signed the challenge, and the console
+  powered off about two minutes later. Nobody had to hold the power button. The plain shell has no
+  power-off command, and its `suspend` did nothing. Ariel's `shutdown` goes through the console's
+  own path, which unmounts the removable drives first.
+- **One tool surface.** `ariel-mcp` exposes the same commands as MCP tools, so a client such as
+  Claude Code discovers what it may ask instead of being taught the grammar. The server holds no
+  key and never signs.
+
+Files still move over ftpsrv (TCP 2121), and the kernel log streams from klogsrv (TCP 3232). Ariel
+is the agent's way to see the console and its safe way back from a freeze.
 
 ## Status against the goal
 
