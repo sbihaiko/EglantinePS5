@@ -164,6 +164,16 @@ namespace {
     }();
     return enabled;
 }
+
+// EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1: a pass with no color target and a square depth target is
+// not rescaled (RescaleRenderTargets; Lichii #1314).
+[[nodiscard]] inline bool SquareDepthUnscaledEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
 } // namespace
 
 template <class P>
@@ -1029,6 +1039,18 @@ bool TextureCache<P>::RescaleRenderTargets() {
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
         check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
+        // EDEN_NX2_TC_SQUARE_DEPTH_UNSCALED=1 (Lichii #1314): a square depth target with no color
+        // target is a shadow map. Scaling it doesn't sharpen the picture, it multiplies the map's
+        // memory by the square of the scale (648 MiB for Ocarina of Time's 12288x12288 sun shadow
+        // map at 1.5x), and the guard house's local shadow maps change size every frame, each
+        // size rescaled again. A full-screen depth prepass isn't square, and a pass with a color
+        // target keeps that target's scale, so both still scale. With EDEN_NX2_TC_PADDED_SQUARE
+        // the padded local shadow maps become square too.
+        if (SquareDepthUnscaledEnabled() && can_rescale && tmp_depth_image != CORRUPT_ID &&
+            std::ranges::all_of(tmp_color_images, [](ImageId id) { return id == CORRUPT_ID; })) {
+            const Extent3D& size = slot_images[tmp_depth_image].info.size;
+            can_rescale = size.width != size.height;
+        }
 
         if (can_rescale) {
             rescaled = any_rescaled || scale_rating >= 2;
