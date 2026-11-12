@@ -263,10 +263,14 @@ The free log of build 12 prints the return address that asked for each buffer. I
 all **134 allocations of 16 MiB or more came from one single address**, 3,762 MiB cumulative, and
 **102 of them were exactly one 16 MiB block**. A block of that size is a VMA block: the build 10
 A/B (`EDEN_PS5_VMA_BLOCK_MIB=8` and `=32`) showed the free log's sizes following that variable, and
-both directions were worse than the 16 MiB default. So what runs the pool out is one driver-side
-block creation path, not a scatter of holders.
+both directions were worse than the 16 MiB default.
 
-That also explains the 0931 result. Patch 0931 ports mihawk's three heap holders (shader IR pool,
+**The single caller says less than it looks like.** Every `vkAllocateMemory` enters the driver
+through the same function, so one caller is what the instrument must show whatever the emulator
+asked for: it proves the blocks are VMA blocks, not which consumer asks for them. Naming the
+consumer needs a call site above VMA — an app-side instrument, not a driver one.
+
+That is also why the 0931 result reads the way it does. Patch 0931 ports mihawk's three heap holders (shader IR pool,
 upload scratch, ASTC scan buffer). Its A/B, both sessions on build 12 with the same env otherwise:
 b12-A without the switch had 84 windows, median 30.4 FPS, quartiles 59.9 / 59.7 / 25.5 / 30.2,
 4 stalls, 0 faults; b12-B with `EDEN_NX2_HEAP_GIVEBACK=1` had 51 windows, median 30.3, quartiles
@@ -428,6 +432,36 @@ except 0901, 0903, and 0909, which are on.
 - **Evidence**: the kernel log streams for the whole session, and logs are copied when the app exits.
 - **One session per change is a lead, not a result.**
 
+## What each change bought
+
+FPS in 5 s windows, frame generation off, on the same console (base PS5, Docked). Only the rows
+marked **A/B** compare two sessions that differ in that one thing; the rest are separate sessions
+on the fixed route, so they show a direction, not a number to add up.
+
+| change | commit or patch | how it was measured | FPS effect |
+|---|---|---|---|
+| texture cache 2560/3328 | `env`: `TC_EXPECTED_MIB`/`TC_CRITICAL_MIB` | run3 versus run7 | about 30 falling to 12, versus about 36: the larger cache removed the long stalls |
+| routed global atomics | 0912 (`EDEN_NX2_GLOBAL_ATOMICS=1`) | 0912 build versus the builds before it | the best FPS before PR #99: house 49 -> 27, after the house 19-33, Kokiri 38-39 |
+| PR #99 + #100 | core patches 0070, 0072-0078 | the parent's own measurement, not ours | 15.7 -> 20.2 outdoors on the parent's PS5 Pro; on this console the PR #99 base held 22-29 in the house |
+| thread layout (pin CPU cores) | `env`: `EDEN_PS5_PLACE`, `EDEN_SECONDARY_MASK` | run A versus run B, same build | +2 to +7 after the house |
+| `RADV_PS5_RETIRE_SLACK=1` | `tools/patch-radv-retire.py` | b5-A (fault) versus b6-A (none) | none: it buys stability, not frames — 27 min with no page fault and no crash |
+| **back profile** | 0928 (`EDEN_NX2_BACK_PROFILE=1`) | **A/B**: b10-A/b10-B against b10-D, same build | **costs about 8x**: 7.1-7.8 FPS with it on, 60 with it off. Diagnostic only, never on for play |
+| **OoT texture pool x2** | 0927 (`EDEN_NX2_OOT_TEXTURE_POOL_X2=1`) | **A/B**: b10-A against b10-B (both with the back profile on) | no gain (7.1 versus 7.8); the pool doubling did not survive its own test |
+| `ReserveOver` | parent PR #95 (`EDEN_PS5_RESERVE_OVER=1`) | **A/B**: b6-D (build 6) against b7-B (build 7), both on build 6's env, so the switch off on both | none measurable, and the refactor is innocent: 23.2 / 29.6 / 28.4 against 28.9 / 27.0 / 26.5 / 27.8 |
+| **VMA block size** | `EDEN_PS5_VMA_BLOCK_MIB` 8 / 16 / 32 | **A/B**, three sessions | 20-25 / 60 until the collapse / 30-35. The 16 MiB default is the best of the three |
+| **heap holders give back** | 0931 (`EDEN_NX2_HEAP_GIVEBACK=1`) | **A/B**: b12-A against b12-B, same build and env otherwise | none: median 30.4 versus 30.3, the same collapse point. It gives 96 MiB back and that is all |
+| frame generation | `framegen.txt` `0 2` (FSR3) | not tested yet | would double the frames on screen, not the game's own rate |
+
+Two things this table says out loud:
+
+- **The only thing that ever produced 60 FPS was the run where the back profile was off** (b10-D,
+  build 10 with build 6's env): 60 for 13 minutes, then the pool collapsed. No individual patch in
+  the series has been shown to be worth a frame on its own except the routed atomics and the larger
+  texture cache.
+- **Every same-session A/B so far has been a negative result.** Block size, pool doubling, heap
+  give-back and `ReserveOver` all came back at noise or worse. What is left is memory pressure
+  itself, which the collapse numbers point at.
+
 ## Session log
 
 Getting to gameplay (2026-11-09 to 2026-11-10):
@@ -510,10 +544,12 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
    slow, not blocked.
 9. **Half answered.** What allocates the buffers of exactly 16 MiB that plateau in VRAM (92 of
    them, 1.47 GiB)? They are not texture-cache images (cutting the cache changed nothing), and the
-   app's `Commit` is not on the path. Build 12's free log answers "how many sites": one, for all
-   134 allocations of 16 MiB and over. Build 13's `self=`/`req=`/`flags=` answer "which one", and
-   work out whether the blocks are full or mostly empty — which decides between one consumer and
-   fragmentation.
+   app's `Commit` is not on the path. Build 12's free log proves the blocks are VMA blocks (one
+   caller for all 134 allocations of 16 MiB and over) but not the consumer: every Vulkan allocation
+   enters the driver through that same function. The next step is above VMA — the device memory
+   callbacks `vulkan_device.cpp` leaves null (`.pDeviceMemoryCallbacks`), which name each block's
+   type and size, plus VMA's own per-pool statistics, which say whether the blocks are full or
+   mostly empty. That decides between one consumer and fragmentation.
 10. Does the game's own texture pool (`EDEN_NX2_OOT_TEXTURE_POOL_X2`, Lichii #1313) change how much
    the guest holds? Build 10 confirmed that 0930 makes the loader reach the patch
    (`ApplyOotTexturePool: ... the graphics allocator's initial pool is doubled` in `eden_log.txt`).
