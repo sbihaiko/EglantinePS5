@@ -1,0 +1,107 @@
+diff --git a/src/video_core/host_pool.h b/src/video_core/host_pool.h
+new file mode 100644
+index 0000000..a39e940
+--- /dev/null
++++ b/src/video_core/host_pool.h
+@@ -0,0 +1,101 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++
++#include "common/common_types.h"
++
++// What the build's memory pool has left, and how it gives memory back.
++//
++// On the console the CPU and the GPU share one pool, so what limits graphics is what is left of
++// it, whoever took the rest, not the driver's own count (which reports the same allocations
++// twice over, as VRAM and as visible VRAM). That figure lives in the application layer, which on
++// the console is also the guest's memory allocator, and the core may not include it: the core is
++// the same in the desktop build, which has no pool. This header is the one seam between the two.
++// The application registers how its pool answers, once, before the renderer starts; the caches
++// and the allocator ask here.
++//
++// Nothing is registered in a build without a pool, and every query then reads as "not known":
++// callers keep their own budgets and behave exactly as before.
++namespace VideoCommon::HostPool {
++
++// Bytes the pool can still hand out (the largest free block), or 0 when not known. The
++// application answers from its own probe, refreshed a few times a second at most.
++using FreeBytesQuery = u64 (*)();
++
++// The pool is short: what the guest writes is waiting for memory. Asked apart from the free
++// figure because short also counts the headroom the guest keeps, which the core cannot see.
++using IsShortQuery = bool (*)();
++
++// The pool is critical: under a quarter of what the caches call their budget, from which the
++// application collects as if past its mark. Under the console's pool the free figure alone can
++// sit above that mark while the pool is nearly gone, so the caches ask this as well.
++using IsCriticalQuery = bool (*)();
++
++// Give back what the renderer can (decode copies, the image pool, idle staging buffers) and the
++// guest's pack memory. attempt counts the times the caller has retried since it ran out; from
++// one on it may wait for the GPU to finish. False: nothing given back, or none installed.
++using RecoverQuery = bool (*)(int attempt);
++
++namespace detail {
++
++inline std::atomic<FreeBytesQuery>& FreeBytesSlot() {
++    static std::atomic<FreeBytesQuery> query{nullptr};
++    return query;
++}
++inline std::atomic<IsShortQuery>& IsShortSlot() {
++    static std::atomic<IsShortQuery> query{nullptr};
++    return query;
++}
++inline std::atomic<IsCriticalQuery>& IsCriticalSlot() {
++    static std::atomic<IsCriticalQuery> query{nullptr};
++    return query;
++}
++inline std::atomic<RecoverQuery>& RecoverSlot() {
++    static std::atomic<RecoverQuery> query{nullptr};
++    return query;
++}
++
++} // namespace detail
++
++// The application installs these once, before the renderer starts.
++inline void SetFreeBytesQuery(FreeBytesQuery query) {
++    detail::FreeBytesSlot().store(query, std::memory_order_release);
++}
++inline void SetIsShortQuery(IsShortQuery query) {
++    detail::IsShortSlot().store(query, std::memory_order_release);
++}
++inline void SetIsCriticalQuery(IsCriticalQuery query) {
++    detail::IsCriticalSlot().store(query, std::memory_order_release);
++}
++
++// The renderer installs this when it starts: the recovery touches the texture cache's state, so
++// only the thread that owns it installs it, and only from there does it run.
++inline void SetRecoverQuery(RecoverQuery query) {
++    detail::RecoverSlot().store(query, std::memory_order_release);
++}
++
++// False in a build without a pool: callers keep their own budgets.
++inline bool Installed() {
++    return detail::FreeBytesSlot().load(std::memory_order_acquire) != nullptr;
++}
++inline u64 FreeBytes() {
++    const auto query = detail::FreeBytesSlot().load(std::memory_order_acquire);
++    return query != nullptr ? query() : u64{0};
++}
++inline bool IsShort() {
++    const auto query = detail::IsShortSlot().load(std::memory_order_acquire);
++    return query != nullptr && query();
++}
++inline bool IsCritical() {
++    const auto query = detail::IsCriticalSlot().load(std::memory_order_acquire);
++    return query != nullptr && query();
++}
++inline bool Recover(int attempt) {
++    const auto query = detail::RecoverSlot().load(std::memory_order_acquire);
++    return query != nullptr && query(attempt);
++}
++
++} // namespace VideoCommon::HostPool

@@ -8,6 +8,7 @@
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
 #include "common/sparse_large_vector.h"
+#include "video_core/host_pool.h"
 #include <string_view>
 #include <algorithm>
 #include <string>
@@ -658,6 +659,23 @@ void StartSummaryThread() {
 [[maybe_unused]] static const bool graphics_memory_probe_installed =
     (graphics_memory_probe.store(&GraphicsMemoryShort, std::memory_order_relaxed),
      graphics_memory_free.store(&GraphicsMemoryFree, std::memory_order_relaxed), true);
+// The core's seam to the pool (video_core/host_pool.h): the caches then ask what the console's
+// shared pool has left instead of the driver's doubled count, and the allocator's recovery has
+// the guest's pack memory to call on. Same answers as the pointers above, in the core's types;
+// a build without a pool installs nothing there and the caches keep their own budgets.
+static u64 HostPoolFreeBytes() {
+    return static_cast<u64>(GraphicsMemoryFree());
+}
+static bool HostPoolIsShort() {
+    return GraphicsMemoryShort();
+}
+static bool HostPoolIsCritical() {
+    return GraphicsMemoryIsCritical();
+}
+[[maybe_unused]] static const bool host_pool_installed =
+    (VideoCommon::HostPool::SetFreeBytesQuery(&HostPoolFreeBytes),
+     VideoCommon::HostPool::SetIsShortQuery(&HostPoolIsShort),
+     VideoCommon::HostPool::SetIsCriticalQuery(&HostPoolIsCritical), true);
 #endif
 
 namespace {
