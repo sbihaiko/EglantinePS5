@@ -71,8 +71,8 @@ is the agent's way to see the console and its safe way back from a freeze.
 
 As of 2026-11-12. Builds on this page: `0f537b0` (`pr99-test`), build 3 (`30d1655`), build 4
 (`9e519f5`), build 5 (`06873bf`), build 6 (`144cced`, on `main`), and on branch `b7-memory` build 7
-(`a71f5fb`), 10 (`855c8f9`), 11 (`e7e6381`), 12 (`355fa35`) and 13 (`37c35d9`). FPS is in 5 s
-windows, frame generation off.
+(`a71f5fb`), 10 (`855c8f9`), 11 (`e7e6381`), 12 (`355fa35`), 13 (`37c35d9`), 14
+(`4a5dfa4`) and 15 (`eb9f3ac`). FPS is in 5 s windows, frame generation off.
 
 | criterion | target | status |
 |---|---|---|
@@ -407,7 +407,16 @@ except 0901, 0903, and 0909, which are on.
 | 0929 memory give-back | `EDEN_NX2_STALL_REPORT` only | n/a | `mem_release_ms` and `mem_pageout_ms`: the guest's time giving memory back | ours, diagnostic |
 | 0930 texture pool reached | same switch as 0927 | off | `HasNSOPatch` answers for the built-in patch, without which the loader never calls `PatchNSO` | ours |
 | 0931 heap holders give back | `EDEN_NX2_HEAP_GIVEBACK=1` | off | a shader IR pool keeps at most 4 MiB between shaders; an upload scratch over 8 MiB is given back every 256 frames and the ASTC scan buffer after one scan. Measured: 96 MiB given back, frame rate unchanged (b12-A versus b12-B) | mihawk-99/PS5_Lichii `70b85df49d` patch 0230 |
+| 0932 scrub all channels | `EDEN_NX2_SCRUB_ALL_CHANNELS=1` | off | a deleted buffer scrubs its range in every channel that still binds it, each with its own dirty flags, not only the channel the flags name | Lichii #1459 (`1207061`) |
+| 0933 transient targets | `EDEN_NX2_RT_EVICT_PRESSURE=<n>` (default 8, `0` off) | off | under pressure, a render target the GPU never wrote gives its memory back after n frames instead of waiting for the collector | mihawk-99 0227 |
+| 0936 VMA block stats | `EDEN_NX2_VMA_STATS=1` | off | prints `eden vma-stats` for every block made and given back, with its type, size and memory, and the allocator's totals every 600 frames | ours, diagnostic |
+| 0937 pool bridge | none | n/a | `src/video_core/host_pool.h`: the core asks the application's pool (free bytes, short, critical, recover) instead of the port script injecting its `performance.h` into the core; nothing installed reads as "not known", so a build without a pool behaves as before | ours |
+| 0938 pool-critical collector | `EDEN_NX2_POOL_CRITICAL_GC=1` | off | when the application's pool is critical the collector runs its aggressive pass, whatever the figure it counts says | mihawk-99 0233, collector half |
+| 0939 renderer memory recover | `EDEN_NX2_MEMORY_RECOVERY=1` | off | out of device memory the allocator has the GPU thread finish what it submitted, then drop idle decode copies, staging buffers, MSAA scratch and resolve shadows, and retries eight times instead of three | mihawk-99 0234, renderer half |
 | driver retire slack | `RADV_PS5_RETIRE_SLACK=<n>` | 0 | holds each freed buffer n submissions past the newest one at its destroy; 1 covers a list the split's front recorded but the back had not submitted | ours, on Mihawk `f5610fe270` |
+
+0932 and 0936 landed in build 14; 0933 and 0937-0939 in build 15. None of them has a session
+yet: their rows say what the change does, not what it bought.
 
 0913-0918 are on `pr99-test` only. Switches from the parent that matter here:
 
