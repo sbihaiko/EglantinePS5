@@ -1,0 +1,173 @@
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 7b6571d33d..050ed4a838 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -259,6 +259,33 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage
+     }
+ }
+ 
++size_t StagingBufferPool::ReleaseCached() {
++    // One ReleaseLevel pass drops up to sixteen entries at its level; a pass over every level for
++    // every level size clears the cache however full it is.
++    const auto size_of = [this] {
++        size_t total = 0;
++        for (const MemoryUsage usage :
++             {MemoryUsage::DeviceLocal, MemoryUsage::Upload, MemoryUsage::Download}) {
++            for (const auto& buffers : GetCache(usage)) {
++                total += buffers.entries.size();
++            }
++        }
++        return total;
++    };
++    const size_t before = size_of();
++    for (size_t pass = 0; pass < NUM_LEVELS; ++pass) {
++        for (size_t level = 0; level < NUM_LEVELS; ++level) {
++            ReleaseLevel(GetCache(MemoryUsage::DeviceLocal), level);
++            ReleaseLevel(GetCache(MemoryUsage::Upload), level);
++            ReleaseLevel(GetCache(MemoryUsage::Download), level);
++        }
++        if (size_of() == 0) {
++            break;
++        }
++    }
++    return before - size_of();
++}
++
+ void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
+     ReleaseLevel(GetCache(usage), current_delete_level);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 6d967abb41..75c57d67d1 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -46,6 +46,11 @@ public:
+ 
+     void TickFrame();
+ 
++    // Gives back every cached buffer whose GPU use is over: the allocator's recovery calls this
++    // once the GPU thread has finished what it submitted, when that is all of them. Returns the
++    // number of buffers dropped.
++    size_t ReleaseCached();
++
+ private:
+     struct StreamBufferCommit {
+         size_t upper_bound;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 30c78536e6..5558a904b7 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -10,7 +10,10 @@
+ #include <limits>
+ #include <array>
+ #include <cstdlib>
++#include <atomic>
++#include <functional>
+ #include <optional>
++#include <thread>
+ #include <span>
+ #include <memory>
+ #include <utility>
+@@ -25,6 +28,7 @@
+ #include "common/settings.h"
+ 
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
++#include "video_core/host_pool.h"
+ #include "video_core/nx2.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ 
+@@ -2140,7 +2144,52 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
+     }
+ }
+ 
++namespace {
++// The recovery the allocator calls when it is out of device memory (EDEN_NX2_MEMORY_RECOVERY).
++// It reads and frees the texture cache runtime's state, which only the GPU thread touches, so it
++// answers no from any other thread.
++std::function<bool(int)> eden_recover_graphics_memory;
++std::atomic<std::thread::id> eden_recover_graphics_memory_owner{};
++bool EdenRecoverGraphicsMemory(int attempt) {
++    if (std::this_thread::get_id() !=
++            eden_recover_graphics_memory_owner.load(std::memory_order_acquire) ||
++        !eden_recover_graphics_memory) {
++        return false;
++    }
++    return eden_recover_graphics_memory(attempt);
++}
++} // Anonymous namespace
++
+ void TextureCacheRuntime::TickFrame() {
++    // EDEN_NX2_MEMORY_RECOVERY=1 (mihawk 0234): the allocator, out of device memory, asks the
++    // renderer to give back what it can before it ends the session. From the second attempt on the
++    // GPU thread first finishes what it submitted, so everything the cache keeps for reuse is idle
++    // and can go: decode copies, staging buffers, and the scratch images kept for the next frame.
++    if (static const bool recovery = [] {
++            const char* const value = std::getenv("EDEN_NX2_MEMORY_RECOVERY");
++            return value != nullptr && value[0] == '1' && value[1] == '\0';
++        }();
++        recovery && !VideoCommon::HostPool::RecoveryInstalled()) {
++        eden_recover_graphics_memory = [this](int attempt) {
++            if (attempt >= 1) {
++                scheduler.Finish();
++            }
++            while (!pending_transcodes.empty() &&
++                   scheduler.IsFree(pending_transcodes.front().tick)) {
++                pending_transcodes.pop_front();
++            }
++            std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
++                return scheduler.IsFree(scratch.tick);
++            });
++            std::erase_if(pending_resolve_shadows,
++                          [this](const auto& pending) { return scheduler.IsFree(pending.first); });
++            staging_buffer_pool.ReleaseCached();
++            return true;
++        };
++        eden_recover_graphics_memory_owner.store(std::this_thread::get_id(),
++                                                 std::memory_order_release);
++        VideoCommon::HostPool::SetRecoverQuery(&EdenRecoverGraphicsMemory);
++    }
+     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+         pending_transcodes.pop_front();
+     }
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 2f752362bb..75b05d89ed 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -25,6 +25,7 @@
+ #include "common/logging.h"
+ #include <ranges>
+ #include "video_core/vulkan_common/vma.h"
++#include "video_core/host_pool.h"
+ #include "video_core/readback_diagnostics.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+@@ -38,15 +39,24 @@ extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noex
+ 
+ namespace Vulkan {
+ namespace {
+-// Out of device memory: asks for memory back (`bytes` and a 64 MiB block more) and tries again, up
+-// to three times. The pool the console shares with the guest's memory fills with cold guest
+-// memory that can be packed; before this, the first failure ended the app.
++// Out of device memory: asks for memory back and tries again. The pool the console shares with the
++// guest's memory fills with cold guest memory that can be packed (`bytes` and a 64 MiB block more);
++// before this, the first failure ended the app. With the renderer's recovery installed
++// (EDEN_NX2_MEMORY_RECOVERY, video_core/host_pool.h) the renderer gives back what it holds unused
++// too, and the loop runs longer: each attempt is then a chance for the GPU thread to free
++// something, not only for the guest to pack.
+ template <typename Create>
+ VkResult RecoverDeviceMemory(VkResult result, VkDeviceSize bytes, Create&& create) {
+-    for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && attempt < 3; ++attempt) {
+-        if (&eden_memory_recover == nullptr ||
+-            eden_memory_recover(static_cast<std::size_t>(bytes) + (std::size_t{64} << 20)) == 0)
++    const int attempts = VideoCommon::HostPool::RecoveryInstalled() ? 8 : 3;
++    for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && attempt < attempts;
++         ++attempt) {
++        const bool given = VideoCommon::HostPool::Recover(attempt);
++        const bool packed = &eden_memory_recover != nullptr &&
++                            eden_memory_recover(static_cast<std::size_t>(bytes) +
++                                                (std::size_t{64} << 20)) != 0;
++        if (!given && !packed) {
+             break;
++        }
+         result = create();
+     }
+     return result;
