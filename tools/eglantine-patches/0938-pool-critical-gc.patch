@@ -1,0 +1,32 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 11af5093ea..86ebaebfef 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -30,6 +30,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/host_pool.h"
+ #include "video_core/texture_cache/conversion.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/physical_alias.h"
+@@ -379,9 +380,16 @@ void TextureCache<P>::RunGarbageCollector() {
+             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+         }
+     };
+-    Configure(false);
+-    Collect();
+-    if (total_used_memory >= critical_memory) {
++    // EDEN_NX2_POOL_CRITICAL_GC=1 (mihawk 0233): when the application's pool is critical, collect
++    // as if over the mark even where the figure the caches count says otherwise. On the console
++    // that figure is the pool's own, scaled by what the pool could ever give graphics, so a pool
++    // under 512 MiB free can still read below the mark while the collector sits in its cheap mode.
++    static const bool pool_critical_gc = [] {
++        const char* const value = std::getenv("EDEN_NX2_POOL_CRITICAL_GC");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    const bool pool_critical = pool_critical_gc && VideoCommon::HostPool::IsCritical();
++    if (total_used_memory >= critical_memory || pool_critical) {
+         Configure(true);
+         Collect();
+     }
