@@ -35,6 +35,7 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 | `0928-back-profile` | `EDEN_NX2_BACK_PROFILE=1` | off | ours, from the review of the pool-exhaustion stalls: the split's back thread records its phase (idle, execute, submit, fence) and the `EDEN_STALL` line ends with `back_phase=` and how long it has been in it, so a stall says whether the back was idle, submitting or waiting on the GPU while the front waited seconds |
 | `0929-mem-giveback` | none of its own: with `EDEN_NX2_STALL_REPORT` on, the `EDEN_STALL` line carries `mem_release_ms` and `mem_pageout_ms` | — | ours: the review's second alternative, guest map/unmap thrash. Time the guest spends giving memory back (`DecommitMemoryRange`, `PageOutRange`), so a stall that lands on those transitions is visible |
 | `0930-oot-texture-pool-has-patch` | same switch as 0927 | off | ours: the loader calls `PatchNSO` only when `HasNSOPatch` says yes, so 0927 alone never ran. Build 7 shipped without this and the switch did nothing (no `TEXTURE_POOL` line in `eden_log.txt`) |
+| `0931-heap-holders-giveback` | `EDEN_NX2_HEAP_GIVEBACK=1` | off | mihawk-99/PS5_Lichii `70b85df49d` patch 0230 ("three heap holders give their memory back", measured at 1,735 MiB live in play): a shader IR pool keeps at most 4 MiB between shaders (OoT held 113 MiB in six pools after the boot build), an upload scratch buffer over 8 MiB is given back every 256 frames and the ASTC scan buffer after a scan over 8 MiB (64 + 56 MiB were kept from the save load on) |
 | app: `src/memory_pages.cpp` (`ReserveOver`) | `EDEN_PS5_RESERVE_OVER=1` (unset keeps the two calls) | off | parent PR #95: a mapping becomes reserved address space in one call, so the range is never free for a moment while another mapping can land in it (`DecommitMemoryRange`, `PageOutRange`, the rollbacks of `CommitMemoryRange`/`PageInRange`, the fastmem window's `UnmapChunks`) |
 | driver: `tools/patch-radv-submit-thread.py` | `RADV_PS5_SUBMIT_THREAD=1` (`RADV_PS5_SUBMIT_SPIN_US`, default 2000) | off | PlayTendoh mesa 0008, by way of Vampinity `lead-mesh-14` |
 | driver: `tools/patch-radv-retire.py` | `RADV_PS5_RETIRE=1`; `RADV_PS5_RETIRE_SLACK=<n>` (default 0) holds each freed buffer n submissions past the newest one at its destroy, for command lists the split's front recorded but the back had not submitted yet | off | mihawk-99/PS5_Mesa `f5610fe270` |
@@ -237,6 +238,13 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   large) and `EDEN_PS5_RESERVE_OVER` (parent PR #95: a mapping becomes reserved address space in
   one call, no window for another mapping). Judged by time-to-pool-exhaustion (baseline ~3 min) and
   the first stall over 1 s (baseline 2.7 s).
+
+Build 11 (`e7e6381`, run 43143919613) adds a `caller=` field to the free log's lines of 16 MiB and
+over, so the allocation that collapses the run is named at the source instead of guessed. Its
+session was not run: the console was off. Build 11 also carries 0931, which ports mihawk's three
+heap holders (shader IR pool, upload scratch, ASTC scan buffer) behind `EDEN_NX2_HEAP_GIVEBACK=1`:
+that patch measured 1,735 MiB live in play after giving the three back, and it is the cheapest
+answer yet to "placement, not total" above.
 
 ## Looked at, not ported
 
