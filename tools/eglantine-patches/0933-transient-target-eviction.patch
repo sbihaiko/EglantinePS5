@@ -1,3 +1,21 @@
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index 542b33a..d768f17 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -134,6 +134,13 @@ public:
+         ResetStorageBit(id.Value());
+     }
+ 
++    /// Whether the id still names a live object. A stored id's slot can be freed and reused
++    /// before anything looks at it again, and reading the object through a dead id is undefined.
++    [[nodiscard]] bool Contains(SlotId id) const noexcept {
++        return id.Value() / 64 < stored_bitset.size() &&
++               ((stored_bitset[id.Value() / 64] >> (id.Value() % 64)) & 1) != 0;
++    }
++
+     [[nodiscard]] Iterator begin() noexcept {
+         const auto it = std::ranges::find_if(stored_bitset, [](u64 value) { return value != 0; });
+         if (it == stored_bitset.end()) {
 diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
 index 3bce683..793a354 100644
 --- a/src/video_core/texture_cache/image_base.h
@@ -13,7 +31,7 @@ index 3bce683..793a354 100644
  DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
  
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index a275259..9a6ab5c 100644
+index a275259..bb491c9 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
 @@ -638,6 +638,57 @@ void TextureCache<P>::TickFrame() {
@@ -33,9 +51,9 @@ index a275259..9a6ab5c 100644
 +                break;
 +            }
 +            transient_targets.pop_front();
-+            // The slot may have been freed since the entry was queued: SlotVector has no
-+            // contains(), and its storage bit is what says the id still names a live image.
-+            if (!entry.id || !slot_images.ReadStorageBit(entry.id.Value())) {
++            // The slot may have been freed since the entry was queued, and reading the image
++            // through the dead id would be undefined.
++            if (!entry.id || !slot_images.Contains(entry.id)) {
 +                continue;
 +            }
 +            Image& image = slot_images[entry.id];
