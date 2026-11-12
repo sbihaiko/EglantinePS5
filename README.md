@@ -411,12 +411,12 @@ except 0901, 0903, and 0909, which are on.
 | 0933 transient targets | `EDEN_NX2_RT_EVICT_PRESSURE=<n>` | off | under pressure, a render target the GPU never wrote gives its memory back after n frames instead of waiting for the collector | mihawk-99 0227 |
 | 0936 VMA block stats | `EDEN_NX2_VMA_STATS=1` | off | prints `eden vma-stats` for every block made and given back, with its type, size and memory, and the allocator's totals every 600 frames | ours, diagnostic |
 | 0937 pool bridge | none | n/a | `src/video_core/host_pool.h`: the core asks the application's pool (free bytes, short, critical, recover) instead of the port script injecting its `performance.h` into the core; nothing installed reads as "not known", so a build without a pool behaves as before | ours |
-| 0938 pool-critical collector | `EDEN_NX2_POOL_CRITICAL_GC=1` | off | when the application's pool is critical the collector runs its aggressive pass, whatever the figure it counts says | mihawk-99 0233, collector half |
-| 0939 renderer memory recover | `EDEN_NX2_MEMORY_RECOVERY=1` | off | out of device memory the allocator has the GPU thread finish what it submitted, then drop idle decode copies, staging buffers, MSAA scratch and resolve shadows, and retries eight times instead of three | mihawk-99 0234, renderer half |
 | driver retire slack | `RADV_PS5_RETIRE_SLACK=<n>` | 0 | holds each freed buffer n submissions past the newest one at its destroy; 1 covers a list the split's front recorded but the back had not submitted | ours, on Mihawk `f5610fe270` |
 
-0932 and 0936 landed in build 14; 0933 and 0937-0939 in build 15. None of them has a session
-yet: their rows say what the change does, not what it bought.
+Build 14 never compiled (0932 and 0936 had errors); 0932, 0933, 0936, 0937 and 0939 land in
+build 15. None of them has a session yet: their rows say what the change does, not what it
+bought. 0938 (pool-critical collector) is not needed here: `tools/prepare-vulkan-port.py`
+already makes the collector follow the pool's short and critical state in the build tree.
 
 0913-0918 are on `pr99-test` only. Switches from the parent that matter here:
 

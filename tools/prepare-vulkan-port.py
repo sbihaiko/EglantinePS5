@@ -2150,7 +2150,9 @@ probes = {
 }
 for name, index, expected in (
     ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 6),  # three diagnostic mapped-readback probe waits
-    ('vk_texture_cache', 8, 1), ('vk_swapchain', 9, 6),
+    # 0939 (EDEN_NX2_MEMORY_RECOVERY) adds a second one: the allocator's recovery has the GPU
+    # thread finish what it submitted before it drops the cache's idle resources.
+    ('vk_texture_cache', 8, 2), ('vk_swapchain', 9, 6),
     ('vk_descriptor_buffer', 10, 2), ('vk_multi_range_buffer', 11, 1),
     ('vk_compute_pass', 12, 1),
 ):
