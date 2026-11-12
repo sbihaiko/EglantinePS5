@@ -20,7 +20,7 @@ index 636adda..160c57e 100644
  }
  
 diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
-index 75b05d8..e115adc 100644
+index 75b05d8..69a8c2f 100644
 --- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
 +++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
 @@ -6,8 +6,11 @@
@@ -35,19 +35,17 @@ index 75b05d8..e115adc 100644
  #include <unistd.h>
  #include <array>
  #include <bit>
-@@ -39,6 +42,11 @@ extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noex
+@@ -39,6 +42,9 @@ extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noex
  
  namespace Vulkan {
  namespace {
-+namespace {
 +/// Destroys the images the recycler keeps (EDEN_NX2_IMAGE_RECYCLE_MIB) and goes on keeping.
 +void DropRecycledImages();
-+} // namespace
 +
  // Out of device memory: asks for memory back and tries again. The pool the console shares with the
  // guest's memory fills with cold guest memory that can be packed (`bytes` and a 64 MiB block more);
  // before this, the first failure ended the app. With the renderer's recovery installed
-@@ -48,6 +56,11 @@ namespace {
+@@ -48,6 +54,11 @@ namespace {
  template <typename Create>
  VkResult RecoverDeviceMemory(VkResult result, VkDeviceSize bytes, Create&& create) {
      const int attempts = VideoCommon::HostPool::RecoveryInstalled() ? 8 : 3;
@@ -59,7 +57,7 @@ index 75b05d8..e115adc 100644
      for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && attempt < attempts;
           ++attempt) {
          const bool given = VideoCommon::HostPool::Recover(attempt);
-@@ -121,6 +134,110 @@ namespace {
+@@ -121,6 +132,110 @@ namespace {
          }
          return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
      }
@@ -170,7 +168,7 @@ index 75b05d8..e115adc 100644
  } // namespace
  
  //MemoryCommit is now VMA-backed
-@@ -238,10 +355,32 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
+@@ -238,10 +353,32 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
              }
          });
      }
@@ -203,7 +201,7 @@ index 75b05d8..e115adc 100644
  void MemoryAllocator::DestroySparsePools() {
      for (VmaPool& pool : sparse_pools) {
          if (pool != VK_NULL_HANDLE) {
-@@ -284,6 +423,31 @@ VmaPool MemoryAllocator::SparsePool(u32 memory_type) const {
+@@ -284,6 +421,31 @@ VmaPool MemoryAllocator::SparsePool(u32 memory_type) const {
  
  vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
  {
@@ -235,7 +233,7 @@ index 75b05d8..e115adc 100644
      const VmaAllocationCreateInfo alloc_ci = {
              .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
                       (dedicated ? VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT}
-@@ -398,6 +562,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+@@ -398,6 +560,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
          );
      }
  
