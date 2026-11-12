@@ -315,6 +315,19 @@ proves a suballocation without needing any symbol at all.
 - **CI.** GitHub can disable Actions on a fork on its own: the API still reports them enabled and a
   dispatch answers 422. Only the button on the repository's Actions tab turns them back on. A push to
   `main` builds nothing; `release.yml` runs on a `v*` tag, a pull request, or a manual dispatch.
+- **The submodule pointer stays at the pin.** The Eglantine submodule in this repository is checked
+  out on local scratch commits (`scratch: 0929 state`), and `git add -A` at the top level takes that
+  pointer into the commit. Actions then cannot fetch it (`upload-pack: not our ref`) and the build
+  dies at checkout. Commit the patch files by name, or put the pointer back with
+  `git update-index --add --cacheinfo 160000,3140648a…,Eglantine`.
+- **`tools/make-core-patch.sh` assumes the submodule HEAD is the pin**, which it is not here: HEAD
+  already carries the whole 09xx series, so the script's own `git apply` of the lower patches fails.
+  Make the patch in a temporary tree instead: `git archive 3140648a`, apply every lower patch in
+  order, copy the edited files over, and diff those paths.
+- **A declaration added to a translation unit that already has an anonymous namespace goes inside
+  it.** Writing a second `namespace { … }` inside the first is a different unnamed namespace, so the
+  declaration and the later definition are two functions and the build says
+  `call to 'DropRecycledImages' is ambiguous`.
 - **Compile ahead.** On an early build, before gameplay, turning it off gave 5 of 12 windows above
   40 ms against none with it on.
 
@@ -529,6 +542,7 @@ house.
 | b10-D | `855c8f9` | b6 env, so back-profile off | 60 | 60 until t≈745 s, then 20-29 and 9.3 | n/a | 14 min, **no fault and no crash**; 117 of 157 windows at 55-60 FPS; pool 5978 MiB flat for 13 min, then 6 MiB; 9 stalls, the worst 7.6 s |
 | b12-A | `355fa35` | b6 env (`EDEN_NX2_HEAP_GIVEBACK` absent) | n/a | 59.9 / 59.7 / 25.5 / 30.2 by quarter | n/a | 84 windows, median 30.4, 4 stalls, 0 faults; the free log names one caller for all 134 allocations of 16 MiB and over |
 | b12-B | `355fa35` | b6 env plus `EDEN_NX2_HEAP_GIVEBACK=1` | n/a | 59.9 / 21.1 / 26.9 / 31.1 by quarter | n/a | 51 windows, median 30.3, 3 stalls, 0 faults; 96 MiB given back, the collapse unchanged |
+| b15-A | `eb9f3ac` | b6 env; 0932, 0933, 0936, 0937 and 0939 in the build, every switch off | 59.9 | 59.9 until t≈414, then 26.9 by median from t≈180 | n/a | 73 windows in 8 min, no crash; from t≈432 the pool's largest free block fell to 3 MiB with 4968 MiB held of 9679 mapped and the trim giving back 0, and the frame loop fell to 0.2 FPS with gaps of 6-15 s (the b10-D collapse, about 300 s earlier) |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
