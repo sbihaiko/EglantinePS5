@@ -208,6 +208,16 @@ here is open.
   house with the three #1314 switches together. Which of the six switches gave the gain here is not
   isolated. Stutters of 1-4 s remain at the heaviest points.
 
+### The profiler costs 3.6x on the back thread
+
+`EDEN_NX2_BACK_PROFILE=1` (0928) ran in every b10 session that looked slow, and no earlier build had
+it, so "build 10 is slow" and "the back profile is slow" were the same observation (b10-A/B/C against
+b10-D, 2026-11-11). With the switch on a frame took 134 ms: `split_wait` 67-82 ms while the back
+thread was in `execute` with nothing else accounted. The cause was in 0928 itself: the `Execute` mark
+was built inside the loop over ring entries, and an entry is one GPU method write, not a draw, so
+every one paid two `steady_clock` reads and four atomic stores. `bb74083` sets the mark once per
+batch. Sessions with the switch on must never be compared with sessions with it off.
+
 ### The pool runs out first
 
 Build 6 settled what ends these sessions, and it is not a fault. With `RADV_PS5_RETIRE_SLACK=1`
@@ -439,6 +449,14 @@ house.
 | b6-B | `144cced` | same | n/a | 18-28 | n/a | second session; pool at 4 MiB and 21 stalls by 8 min; closed by hand |
 | b6-C | `144cced` | same, thresholds cut to `TC_EXPECTED_MIB=1536`, `TC_CRITICAL_MIB=2304` | n/a | 7.5-28 | n/a | the cut changed nothing: pool at 7 MiB and the same 10/16 FPS windows in about 3 min |
 | b7-A | `a71f5fb` | b6 env plus `EDEN_PS5_RESERVE_OVER=1` and `EDEN_NX2_OOT_TEXTURE_POOL_X2=1` | n/a | 1.0-27.2 | n/a | 64 windows in 6 min, **no fault and no crash**; 22 stalls, the worst 7.3 s, all `split_wait`; pool at 2 MiB. The 0927 switch did nothing in this build (see below) |
+| b6-D | `144cced` | b6 env unchanged (rerun for comparison) | n/a | 23.2 → 29.6 → 28.4 | n/a | pool 5066 → 1574 MiB in the second the screen opens; one 606 ms stall |
+| b7-B | `a71f5fb` | b6 env, so 0927 and ReserveOver off | n/a | 28.9 → 27.0 → 26.5 → 27.8 | n/a | same as b6-D; pool 5076 → 1524 → 1208 MiB |
+| build 8 | — | 0928-0930 | n/a | n/a | n/a | does not compile: 0928 names `EnterBackPhase` before its definition |
+| build 9 | — | 0928-0930, first error fixed | n/a | n/a | n/a | does not compile: the generated scheduler uses `StallLedger` without its header |
+| b10-A | `855c8f9` | b7 env: back-profile, pool x2 and ReserveOver on | n/a | 7.1 | n/a | pool 5 GiB → 1.4 GiB in one second at the screen |
+| b10-B | `855c8f9` | pool x2 off | n/a | 7.8 | n/a | the same collapse without the switch |
+| b10-C | `855c8f9` | b10-B plus `EDEN_NX2_STALL_REPORT=100` | n/a | 7.8 | n/a | 66 frames of 134 ms: `split_wait` 67-82 ms, `gpuw_wait` 27-29, `fence_wait` 23-30, `tc_upload` 0, `dev_alloc_n` 0 |
+| b10-D | `855c8f9` | b6 env, so back-profile off | 60 | 60 until t≈745 s, then 20-29 and 9.3 | n/a | 14 min, **no fault and no crash**; 117 of 157 windows at 55-60 FPS; pool 5978 MiB flat for 13 min, then 6 MiB; 9 stalls, the worst 7.6 s |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
@@ -457,16 +475,19 @@ The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its ses
 6. Which of 0913-0918 gave the b2-B gain, and what reaches 38 FPS in Kokiri? Candidates in
    `docs/OOT-SIBLING-PORTS.md`: Lichii #1329 and #1056, viejunerd's texture switches, and Lichii
    #1334.
-7. Where does the back wait during the pure `split_wait` stalls? It cannot be answered offline:
-   `EDEN_STALL` counts emulator seconds and the free log's `t=` counts milliseconds since boot, and
-   the `EDEN_MEMORY` lines carry no timestamp. 0928 answers it on the console (`back_phase=` and
-   its age on every `EDEN_STALL` line), 0929 adds the guest's give-back time, and both need a build.
-8. What allocates the 92 buffers of exactly 16 MiB (2.7 GiB) that plateau in VRAM? They are not
+7. **Answered.** The back was in `execute` (not in a fence wait and not allocating) during every
+   slow frame measured (b10-C, `back_phase=execute`, `back_phase_ms` under 1 ms, `dev_alloc_n=0`),
+   and the guest gave nothing back through `DecommitMemoryRange` or `PageOutRange`
+   (`mem_release_ms=0`, `mem_pageout_ms=0` in every line). The front waits on a back thread that is
+   slow, not blocked.
+8. What allocates the buffers of exactly 16 MiB that plateau in VRAM (92 of them, 1.47 GiB)? They are not
    texture-cache images (cutting the cache changed nothing). Naming them needs an allocation site:
    the driver's free log has no caller, and the app's `Commit` is not on the path.
 9. Does the game's own texture pool (`EDEN_NX2_OOT_TEXTURE_POOL_X2`, Lichii #1313) change how much
-   the guest holds? Build 7 enabled the switch but the loader never called the patch (0927 alone
-   does not make `HasNSOPatch` answer); 0930 fixes that.
+   the guest holds? Build 10 confirmed that 0930 makes the loader reach the patch
+   (`ApplyOotTexturePool: ... the graphics allocator's initial pool is doubled` in `eden_log.txt`).
+   With the switch on (b10-A) and off (b10-B) the collapse was the same, so the doubling is not the
+   lever; b10-D's 13 healthy minutes had it off.
 
 **What b3-A settled.** Guest memory compression is not a cause of the stalls: `cram_unpack_ms` was
 0.0 in all 51 `EDEN_STALL` lines. The stalls are the front GPU thread waiting for the back
