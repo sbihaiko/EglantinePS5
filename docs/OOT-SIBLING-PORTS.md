@@ -212,6 +212,23 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
     `AREA_EVICT=40`): not on our pin; they need porting.
   - Lichii #1314 (texture cache) and #1334 (pipeline rebuild): open upstream, not yet read.
 
+- **Two ports held back, with what they need first.** Both were read against the pin and
+  judged worth porting only after their numbers are gathered; neither is written as a patch.
+  - **Attribute key (parent #408, the OoT stutter).** The parent counts, in one 10 s window,
+    355 pipelines and 2.8 s of draws, and says the stutter is pipeline rebuilds; its fix
+    keys pipelines on the vertex attribute description. Our tree's `fixed_pipeline_state.h`
+    holds `attribute_types` in a union with `enabled_divisors` (lines 243-246), so the mask
+    must run after the port script's static-vertex-input block and only when
+    `dynamic_vertex_input != 0`. Needed first: `EDEN_NX2_COUNTERS=1` to count how many of
+    OoT's pipelines actually differ only in the attribute description, or the port is a
+    guess.
+  - **Instance folding (Lichii #1336, the host GPU reading list words).** #1336 folds
+    repeated draws into instanced ones so the host GPU stops reading list words it wrote.
+    OoT's list draws are task and mesh draws, which this port skips
+    (`EDEN_OOT_MESH_DRAWS=skip`), so the symptom #1336 fixes is absent here. Needed first:
+    a count of list draws that reach the host with mesh draws off, which the same counters
+    would give.
+
 - **The pool runs out, and the largest block goes first (build 6, 2026-11-11).** Two sessions
   after `RADV_PS5_RETIRE_SLACK=1` had zero page faults and zero crashes — b5-A's unmapped read did
   not return, and both 150 MiB merge precursors happened again without one. What ends those
