@@ -348,6 +348,10 @@ proves a suballocation without needing any symbol at all.
 - **Install checks.** The console turns an uploaded SELF `eboot.bin` into an ELF, and ftpsrv serves
   it back decrypted. Hashes never match the ZIP; check an install with `stat` in the shell or with
   the build's strings, and install with `tools/install-ftp.py`.
+- **Delete `self-updater.elf` from the app folder after an install.** The app checks the release
+  catalog on start and can update itself in place; the log's `update: Updating to …` fires when the
+  update begins, so compare by a string only the installed build has, never by size or hash, and take
+  the helper out so a test build cannot be replaced under a session.
 - **Logs** rotate at the next launch; copy them as soon as the process exits.
 - **Profiling slows what it measures** (an estimated 135 ms a second in clock reads). Measure FPS
   with `EDEN_NX2_GPU_PROFILE` and `EDEN_NX2_COUNTERS` unset.
