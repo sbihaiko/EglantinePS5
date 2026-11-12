@@ -239,6 +239,24 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   one call, no window for another mapping). Judged by time-to-pool-exhaustion (baseline ~3 min) and
   the first stall over 1 s (baseline 2.7 s).
 
+Build 12 (`355fa35`, run 43168838891) ran the A/B on 0931 on the console (2026-11-12, base PS5,
+Docked): session b12-A without `EDEN_NX2_HEAP_GIVEBACK` had 84 windows, median 30.4 fps, quartiles
+59.9 / 59.7 / 25.5 / 30.2, 4 stalls, 0 faults; session b12-B with it had 51 windows, median 30.3,
+quartiles 59.9 / 21.1 / 26.9 / 31.1, 3 stalls, 0 faults. The switch does what it says — 96 MiB
+given back, 31 "gave back" lines — but the collapse lands at the same point and the frame rate is
+the same within noise. **0931 is not the answer to this symptom**; keep it (it is free memory) and
+look instead at the one allocation site below.
+
+The same build's free log named the collapse as a single site: 134 allocations of 16 MiB and over,
+3,762 MiB cumulative, **all from one return address**, 102 of them exactly one 16 MiB block. A
+block is a VMA block (the `EDEN_PS5_VMA_BLOCK_MIB` A/B of build 10 showed the sizes following that
+variable), so what runs out the pool is one driver-side block creation path, not a scatter of
+holders — which is why 0931's three holders changed nothing. The address could not be named: the
+symbol table shipped with the build does not cover that region of the driver. Build 13 (`37c35d9`)
+adds `self=`, `req=` and `flags=` to the same line to fix that — `caller - self` cancels the base
+the image is loaded at, and a small `req=` inside a 16 MiB block proves a suballocation without any
+symbols.
+
 Build 11 (`e7e6381`, run 43143919613) adds a `caller=` field to the free log's lines of 16 MiB and
 over, so the allocation that collapses the run is named at the source instead of guessed. Its
 session was not run: the console was off. Build 11 also carries 0931, which ports mihawk's three
