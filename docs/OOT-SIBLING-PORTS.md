@@ -284,6 +284,21 @@ heap holders (shader IR pool, upload scratch, ASTC scan buffer) behind `EDEN_NX2
 that patch measured 1,735 MiB live in play after giving the three back, and it is the cheapest
 answer yet to "placement, not total" above.
 
+**What builds 15 and 16 added (2026-11-12).** Both ended the same way and neither crashed:
+
+| session | build | what it held | where it ended |
+|---|---|---|---|
+| b15-A | 15 (`eb9f3ac`) | 0932/0933/0936/0937/0939 in the tree, all off | 60 FPS to t=414 s; from t=432 s the largest free block fell to 3 MiB, the guest held 4968 MiB of 9679 mapped and the trim gave back 0, and the loop fell to 0.2 FPS with 6-15 s gaps |
+| b16-A | 16 (`030e956`) | 0940 image recycling at its 256 MiB default | 17 min with no hang, no fault, no crash; quartiles 59.4 / 19.5 / 22.0 / 8.3; largest free block between 3 and 16 MiB and `short=1` 29 times, guest ~4.9 GiB |
+
+Build 12's free log had named one return address for every allocation of 16 MiB and over; build 16
+was the first to carry 0940, which recycles images of 4 MiB and over when they are destroyed with
+an identical create info. **It never reused an image**: not one `Image recycling` line in the
+session, while the pool was short throughout. So either Ocarina's per-frame targets are below that
+4 MiB floor, or they are not destroyed with the create info they were made with. 0941 counts every
+image created by size and every non-answer of the pool (not recyclable, under the floor, no match),
+so the session after build 18 says which; a comment saying the same was left on bc250's `65c6b779`.
+
 ## Looked at, not ported
 
 - **Null image on a memo hit** (Lichii `c2e293ec8`, #910). This pin already gates
