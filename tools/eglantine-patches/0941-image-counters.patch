@@ -1,0 +1,84 @@
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 69a8c2f..e478780 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -160,6 +160,13 @@ struct ImageRecyclePool {
+     std::deque<Entry> free;
+     u64 hits{}, kept{}, evicted{};
+     std::chrono::steady_clock::time_point last_report{};
++    // EDEN_NX2_IMAGE_COUNTERS=1: what the pool is asked for and why it does not answer.
++    u64 created{};
++    u64 bucket[6]{}; ///< <2, 2-4, 4-8, 8-16, 16-32, >=32 MiB
++    u64 not_keyed{}; ///< create info not recyclable (sparse, linear, shared)
++    u64 below_floor{}; ///< no free image, and this one is under 4 MiB
++    u64 no_match{};  ///< no free image with this create info
++    std::chrono::steady_clock::time_point last_counters{};
+ };
+ ImageRecyclePool g_image_pool;
+ constexpr u64 MinRecycledImageBytes = 4ull << 20;
+@@ -236,6 +243,40 @@ bool RecycleImage(VmaAllocator allocator, VkImage image, VmaAllocation allocatio
+     }
+     return true;
+ }
++
++bool ImageCounters() {
++    static const bool on = [] {
++        const char* const value{std::getenv("EDEN_NX2_IMAGE_COUNTERS")};
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return on;
++}
++
++void CountCreated(ImageRecyclePool& pool, u64 size) {
++    ++pool.created;
++    const u64 mib = size >> 20;
++    const size_t bucket = mib < 2 ? 0 : mib < 4 ? 1 : mib < 8 ? 2 : mib < 16 ? 3 : mib < 32 ? 4 : 5;
++    ++pool.bucket[bucket];
++}
++
++/// Every 30 s: what was created by size, and why the pool did not answer.
++void ReportImageCounters(ImageRecyclePool& pool) {
++    if (!ImageCounters()) {
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now - pool.last_counters < std::chrono::seconds{30}) {
++        return;
++    }
++    pool.last_counters = now;
++    LOG_INFO(Render_Vulkan,
++             "Image counters: created {} (<2 {} 2-4 {} 4-8 {} 8-16 {} 16-32 {} >=32 {}), "
++             "not recyclable {}, under 4 MiB {}, no match {}, recycled {}, kept {}, evicted {}, "
++             "{} MiB held",
++             pool.created, pool.bucket[0], pool.bucket[1], pool.bucket[2], pool.bucket[3],
++             pool.bucket[4], pool.bucket[5], pool.not_keyed, pool.below_floor, pool.no_match,
++             pool.hits, pool.kept, pool.evicted, pool.held >> 20);
++}
+ } // namespace
+ 
+ //MemoryCommit is now VMA-backed
+@@ -560,10 +601,21 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+         );
+     }
+ 
+-    if (recycle_key && alloc_info.size >= MinRecycledImageBytes) {
++    {
+         std::scoped_lock lock{g_image_pool.mutex};
+-        g_image_pool.candidates.emplace(handle,
+-                                        std::make_pair(std::move(*recycle_key), alloc_info.size));
++        if (recycle_key) {
++            ++g_image_pool.no_match;
++            if (alloc_info.size >= MinRecycledImageBytes) {
++                g_image_pool.candidates.emplace(
++                    handle, std::make_pair(std::move(*recycle_key), alloc_info.size));
++            } else {
++                ++g_image_pool.below_floor;
++            }
++        } else {
++            ++g_image_pool.not_keyed;
++        }
++        CountCreated(g_image_pool, alloc_info.size);
++        ReportImageCounters(g_image_pool);
+     }
+     return vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                         device.GetDispatchLoader());

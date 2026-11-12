@@ -425,6 +425,7 @@ except 0901, 0903, and 0909, which are on.
 | 0936 VMA block stats | `EDEN_NX2_VMA_STATS=1` | off | prints `eden vma-stats` for every block made and given back, with its type, size and memory, and the allocator's totals every 600 frames | ours, diagnostic |
 | 0937 pool bridge | none | n/a | `src/video_core/host_pool.h`: the core asks the application's pool (free bytes, short, critical, recover) instead of the port script injecting its `performance.h` into the core; nothing installed reads as "not known", so a build without a pool behaves as before | ours |
 | 0940 image recycling | `EDEN_NX2_IMAGE_RECYCLE_MIB=<n>` | 256 | images of 4 MiB and more are kept when destroyed and handed out again for an identical create info (bc250 `65c6b779`), so Ocarina's per-frame depth and HDR targets stop taking fresh device memory; the kept images are given back first when an allocation fails, and none is kept while the pool is short | bc250 `65c6b779` |
+| 0941 image counters | `EDEN_NX2_IMAGE_COUNTERS=1` | off | every 30 s: images created by size (<2, 2-4, 4-8, 8-16, 16-32, ≥32 MiB), and why 0940's pool did not answer (not recyclable, under the 4 MiB floor, no match), beside its recycled/kept/evicted counts | ours, diagnostic |
 | driver retire slack | `RADV_PS5_RETIRE_SLACK=<n>` | 0 | holds each freed buffer n submissions past the newest one at its destroy; 1 covers a list the split's front recorded but the back had not submitted | ours, on Mihawk `f5610fe270` |
 
 Build 14 never compiled (0932 and 0936 had errors); 0932, 0933, 0936, 0937 and 0939 land in
