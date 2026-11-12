@@ -1,0 +1,131 @@
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 3bce683279..793a35479e 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -61,6 +61,9 @@ enum class ImageFlagBits : u32 {
+     /// the parts written are uploaded.
+     SparseTiles = 1 << 23,
+     PartialDownload = 1 << 24, ///< CPU backing contains only requested GPU-written bytes.
++    /// EDEN_NX2_RT_EVICT_PRESSURE: a render target the GPU has not written yet, tracked while it
++    /// waits to see whether anything draws into it.
++    TransientTarget = 1 << 25,
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index a275259e3a..9a6ab5c6d3 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -638,6 +638,57 @@ void TextureCache<P>::TickFrame() {
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    // EDEN_NX2_RT_EVICT_PRESSURE: a render target nobody wrote into, still unused after the
++    // pressure window while the cache is over its expected budget, is released early instead of
++    // waiting for the collector to need the room (mihawk 0227, Fritchii#34). It costs an image
++    // that a later draw would have used, so a target is given four chances before it goes.
++    if (const u64 rt_evict = RtEvictPressureFrames();
++        rt_evict != 0 && total_used_memory > expected_memory) {
++        for (size_t budget = transient_targets.size(); budget != 0 && !transient_targets.empty();
++             --budget) {
++            TransientTarget entry = transient_targets.front();
++            if (frame_tick - entry.check_tick < rt_evict) {
++                break;
++            }
++            transient_targets.pop_front();
++            // The slot may have been freed since the entry was queued: SlotVector has no
++            // contains(), and its storage bit is what says the id still names a live image.
++            if (!entry.id || !slot_images.ReadStorageBit(entry.id.Value())) {
++                continue;
++            }
++            Image& image = slot_images[entry.id];
++            if (image.allocation_tick != entry.allocation_tick ||
++                False(image.flags & ImageFlagBits::TransientTarget) ||
++                False(image.flags & ImageFlagBits::Registered)) {
++                continue;
++            }
++            const u64 last_use = lru_cache.Tick(image.lru_index);
++            if (frame_tick - last_use < rt_evict || True(image.flags & ImageFlagBits::IsDecoding)) {
++                if (++entry.survived < 4) {
++                    entry.check_tick = frame_tick;
++                    transient_targets.push_back(entry);
++                } else {
++                    image.flags &= ~ImageFlagBits::TransientTarget;
++                }
++                continue;
++            }
++            MarkStale(image);
++            if (True(image.flags & ImageFlagBits::Tracked)) {
++                UntrackImage(image, entry.id);
++            }
++            UnregisterImage(entry.id);
++            DeleteImage(entry.id, false);
++            ++transient_evictions;
++        }
++    } else if (transient_targets.size() > 8192) {
++        transient_targets.erase(transient_targets.begin(),
++                                transient_targets.begin() + (transient_targets.size() - 8192));
++    }
++    if (frame_tick % 600 == 0 && transient_evictions != logged_transient_evictions) {
++        LOG_INFO(HW_GPU, "RT evict: {} unused fresh render targets deleted early so far, {} waiting",
++                 transient_evictions, transient_targets.size());
++        logged_transient_evictions = transient_evictions;
++    }
+     DeleteSupersededImages();
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+@@ -3570,6 +3621,23 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
+         return NULL_IMAGE_VIEW_ID;
+     }
+     Image& image = slot_images[image_id];
++    // EDEN_NX2_RT_EVICT_PRESSURE: a render target made but not yet written is the expensive kind
++    // of image to keep: it holds device memory the guest could use, and a draw may never touch it.
++    if (RtEvictPressureFrames() != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++        image.modification_tick == 0 && True(image.flags & ImageFlagBits::CpuModified) &&
++        False(image.flags & ImageFlagBits::GpuModified) &&
++        False(image.flags & (ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
++                             ImageFlagBits::Unbacked)) &&
++        image.dirty_layers.empty()) {
++        image.flags &= ~ImageFlagBits::CpuModified;
++        if (False(image.flags & ImageFlagBits::Tracked)) {
++            TrackImage(image, image_id);
++        }
++        if (False(image.flags & ImageFlagBits::TransientTarget)) {
++            image.flags |= ImageFlagBits::TransientTarget;
++            transient_targets.push_back({image_id, image.allocation_tick, frame_tick, 0});
++        }
++    }
+     const ImageViewType view_type = RenderTargetImageViewType(info);
+     static const bool trace_native_image = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr;
+     if (trace_native_image && info.size.width >= 1280 && info.size.height >= 720) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index da573d2af8..8cd0cc0896 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -178,6 +178,26 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     std::vector<u8> astc_scan_buffer;
+     u64 images_deleted{};
+     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
++    /// EDEN_NX2_RT_EVICT_PRESSURE=<frames>: render targets the GPU never wrote, deleted early once
++    /// they sit unused while the cache is over its expected budget (mihawk 0227, Fritchii#34).
++    /// They come out of the pool the guest shares. Unset keeps the default of 8 frames; 0 turns
++    /// it off and leaves those targets CPU-modified as before.
++    struct TransientTarget {
++        ImageId id;
++        u64 allocation_tick;
++        u64 check_tick;
++        u32 survived;
++    };
++    std::deque<TransientTarget> transient_targets;
++    u64 transient_evictions{};
++    u64 logged_transient_evictions{};
++    [[nodiscard]] static u64 RtEvictPressureFrames() {
++        static const u64 frames = [] {
++            const char* value = std::getenv("EDEN_NX2_RT_EVICT_PRESSURE");
++            return value != nullptr ? std::strtoull(value, nullptr, 10) : u64{8};
++        }();
++        return frames;
++    }
+ 
+     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
+     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
