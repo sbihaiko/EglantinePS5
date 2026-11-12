@@ -434,7 +434,9 @@ the pool's largest free block fell to 3 MiB with the guest holding 4968 MiB of 9
 the trim giving back 0 MiB, and the frame loop fell to 0.2 fps with 6-15 s gaps. That is the
 build 10 collapse reached earlier, not a crash. 0938 (pool-critical collector) is not needed
 here: `tools/prepare-vulkan-port.py` already makes the collector follow the pool's short and
-critical state in the build tree. 0940 lands in build 16 and has no session yet.
+critical state in the build tree. 0940 landed in build 16 and session b16-A never made it reuse an image: not one
+`Image recycling` line in 17 min, so whatever is spent per frame is either under the 4 MiB floor
+or is not destroyed with the create info it was made with. 0941 counts which.
 
 0913-0918 are on `pr99-test` only. Switches from the parent that matter here:
 
@@ -544,6 +546,7 @@ house.
 | b12-A | `355fa35` | b6 env (`EDEN_NX2_HEAP_GIVEBACK` absent) | n/a | 59.9 / 59.7 / 25.5 / 30.2 by quarter | n/a | 84 windows, median 30.4, 4 stalls, 0 faults; the free log names one caller for all 134 allocations of 16 MiB and over |
 | b12-B | `355fa35` | b6 env plus `EDEN_NX2_HEAP_GIVEBACK=1` | n/a | 59.9 / 21.1 / 26.9 / 31.1 by quarter | n/a | 51 windows, median 30.3, 3 stalls, 0 faults; 96 MiB given back, the collapse unchanged |
 | b15-A | `eb9f3ac` | b6 env; 0932, 0933, 0936, 0937 and 0939 in the build, every switch off | 59.9 | 59.9 until t≈414, then 26.9 by median from t≈180 | n/a | 73 windows in 8 min, no crash; from t≈432 the pool's largest free block fell to 3 MiB with 4968 MiB held of 9679 mapped and the trim giving back 0, and the frame loop fell to 0.2 FPS with gaps of 6-15 s (the b10-D collapse, about 300 s earlier) |
+| b16-A | `030e956` | b6 env; 0940 recycling on by default (256 MiB) | 59.4 by median | 59.4 / 19.5 / 22.0 / 8.3 by quarter | n/a | 64 windows in 17 min, no hang, no fault, no crash; the collapse came later than b15-A and softer, the pool's largest free block moving between 3 and 16 MiB with `short=1` 29 times and the guest holding ~4.9 GiB of 9.68; **not one `Image recycling` line**, so the 256 MiB pool never answered |
 
 The 0912 row comes from `docs/OOT-SIBLING-PORTS.md`, which does not name its sessions.
 
