@@ -188,6 +188,13 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   buffer), so the exposure value the tonemapper reads is never updated. Next: parent PR #99 +
   #100 (branch `pr99-test`), which says it fixes exposure; if the bloom stays, the cause is not
   exposure.
+  **This entry is older than the test it asks for.** The README's bloom section (written the
+  same morning, 2026-11-11 09:37 against this file's 08:09) records the opposite result on the
+  #99/#100 base: "the bloom is gone", the player reporting "a forest visible without the haze",
+  `Storage buffer failed to track` falling from about 200 lines to 0 and all 8 compute pipelines
+  building without 0912. Patches 0070-0078 carry that base and every session since ran on it, so
+  the open question is no longer the mechanism but whether the owner still sees the bloom on the
+  current build; the session log has no bloom report after b2-A.
 - **Flashes.** The whole image flashes bright for one frame, often ("lightning on a rainy
   night"). Unchanged by every switch listed for bloom. Not texture re-decode alone: the larger
   texture cache removed the long stalls and the packing passes, and the flashes stayed. Next:
