@@ -72,7 +72,9 @@ is the agent's way to see the console and its safe way back from a freeze.
 As of 2026-11-12. Builds on this page: `0f537b0` (`pr99-test`), build 3 (`30d1655`), build 4
 (`9e519f5`), build 5 (`06873bf`), build 6 (`144cced`, on `main`), and on branch `b7-memory` build 7
 (`a71f5fb`), 10 (`855c8f9`), 11 (`e7e6381`), 12 (`355fa35`), 13 (`37c35d9`), 14
-(`4a5dfa4`) and 15 (`eb9f3ac`). FPS is in 5 s windows, frame generation off.
+(`4a5dfa4`), 15 (`eb9f3ac`), 16 (`030e956`) and 18 (`2f3b581`). Build 17 was cancelled in favour of
+18. Branch `b23-parent-core` carries the parent's v1.000.002 unchanged; it is the new-base test.
+FPS is in 5 s windows, frame generation off.
 
 | criterion | target | status |
 |---|---|---|
@@ -83,6 +85,43 @@ As of 2026-11-12. Builds on this page: `0f537b0` (`pr99-test`), build 3 (`30d165
 | FPS after the house | 30 or more | not met: 20-31, and 2-18 once the pool is exhausted. The best run so far is b10-D (build 10, build 6's env): 60 FPS held for 13 min, then 20-29 and 9.3 when the pool fell to 6 MiB |
 | FPS in Kokiri Forest | 38 or more | not met: 13-38, following the pool |
 | Merge | the work on the fork's `main`, with docs | not yet: builds 1-6 are on `main`; build 7, the 0927-0930 patches and `ReserveOver` live on `b7-memory` |
+
+## The new base: the parent's v1.000.002
+
+On 2026-11-12 the parent released v1.000.002 and moved its core to upstream Eglantine nx2
+`babdb6bb75`, kept in-repo instead of as a patched submodule (parent #101). Its note names our
+front directly: *"Faster in Zelda: Ocarina of Time: gameplay holds the game's 30 FPS cap (about 20
+FPS before), at the same picture."* The measurement behind it is on the console at Link's porch:
+29.6 FPS with the pool holding ~860 MiB free.
+
+Branch `b23-parent-core` in this fork is that tag, unchanged, with nothing of ours. The reason to
+look at it before porting another 09xx: four of the PS5 edits we carry were re-anchored onto the
+newer core there, and the parent dropped the rest because upstream now covers them — DMA batching,
+the GPU fence wait, the submission policy, **16 MiB VMA blocks**, the idle spin and the atomic
+pipeline cache write.
+
+What the parent brings over the core, PS5 only (its `7c6a69f`):
+
+- `GetFlushArea`: pages no image was ever registered in skip the texture cache lock, otherwise
+  `GuestCacheLock` spins before sleeping.
+- `AstcPolicy::Draw` counts draws again, so busy frames decode ASTC in the background.
+- `DispatchWork` right after `Present`, so the next frame's GPU work starts as soon as a frame is
+  shown.
+- `HandleRasterizerWrite` records the guest core for deferred cache writes (`cpu_write_defer`).
+
+What the new core needed that did not exist before: `Tegra::DeferGpuQueue`. Handlers 102, 213, 214
+and 216 held `m_region_mutex` while pushing their `RunInOrder`/`SignalAfterGpu` onto the GPU
+thread's queue, and the back thread takes the same mutex to back sparse blocks on write; without
+the deferral the core deadlocks. With it: 29.8 / 29.5 FPS, no freeze.
+
+One result worth more than the FPS number: the parent tried this fork's direction of clamping the
+texture collector when the pool is short and **left it out** — 23.5 FPS with ~170 MiB free, against
+29.6 FPS and ~860 MiB free with upstream's collector. A tighter collector under pressure costs
+frames; the newer core does not reach that state.
+
+The dynarmic pin stays at `3140648a`, as on this fork. What the base does not answer is the two
+remaining fronts: bloom and the one-frame flashes are not addressed in v1.000.002.
+
 
 ## What we learned
 
@@ -330,6 +369,17 @@ proves a suballocation without needing any symbol at all.
   `call to 'DropRecycledImages' is ambiguous`.
 - **Compile ahead.** On an early build, before gameplay, turning it off gave 5 of 12 windows above
   40 ms against none with it on.
+- **Two logs, and only one of them is the emulator's.** `stderr.log` carries the port's own
+  `EDEN_*` and driver lines; everything the emulator core logs through `LOG_INFO` — the image
+  counters, the recycler's report, the `Critical` asserts — goes to
+  `/data/eglantineps5/user/log/eden_log.txt`. Build 16 was read as "the recycler never fired"
+  because the watcher pulled the wrong file; build 18's counters showed 111 reuses in the same
+  conditions. Before concluding a mechanism is dead, check which file its line is written to.
+- **The guest language comes from the emulator, and the launcher can say what will happen.** The
+  setting is `system.language` in `/data/eglantineps5/config/eglantineps5.json` (the file the
+  launcher writes on exit), and the accepted values are `kLanguageKeys` in
+  `headless/settings_store.h` (`pt-BR` among them). The launcher's own `eden_game_language` reports
+  the language a game will really use and warns when the game does not offer the chosen one.
 
 ## Settings that work today
 
@@ -425,7 +475,7 @@ except 0901, 0903, and 0909, which are on.
 | 0936 VMA block stats | `EDEN_NX2_VMA_STATS=1` | off | prints `eden vma-stats` for every block made and given back, with its type, size and memory, and the allocator's totals every 600 frames | ours, diagnostic |
 | 0937 pool bridge | none | n/a | `src/video_core/host_pool.h`: the core asks the application's pool (free bytes, short, critical, recover) instead of the port script injecting its `performance.h` into the core; nothing installed reads as "not known", so a build without a pool behaves as before | ours |
 | 0940 image recycling | `EDEN_NX2_IMAGE_RECYCLE_MIB=<n>` | 256 | images of 4 MiB and more are kept when destroyed and handed out again for an identical create info (bc250 `65c6b779`), so Ocarina's per-frame depth and HDR targets stop taking fresh device memory; the kept images are given back first when an allocation fails, and none is kept while the pool is short | bc250 `65c6b779` |
-| 0941 image counters | `EDEN_NX2_IMAGE_COUNTERS=1` | off | every 30 s: images created by size (<2, 2-4, 4-8, 8-16, 16-32, ≥32 MiB), and why 0940's pool did not answer (not recyclable, under the 4 MiB floor, no match), beside its recycled/kept/evicted counts | ours, diagnostic |
+| 0941 image counters | `EDEN_NX2_IMAGE_COUNTERS=1` | off | every 30 s: images created by size (<2, 2-4, 4-8, 8-16, 16-32, ≥32 MiB), and why 0940's pool did not answer (not recyclable, under the 4 MiB floor, no match), beside its recycled/kept/evicted counts. The lines go to `/data/eglantineps5/user/log/eden_log.txt`, not to `stderr.log`, and `no match` currently counts every creation that had a key rather than only the misses — corrected in 0943 | ours, diagnostic |
 | 0942 hot pages | `EDEN_NX2_HOT_PAGES=1` | off | a guest page the CPU rewrites twice within 128 frames stays modified and untracked instead of being write-protected and faulting on every write, and is uploaded once a frame; a page the GPU has written never becomes hot (Eglantine nx2 `f27522b`) | Eglantine nx2 #825 |
 | driver retire slack | `RADV_PS5_RETIRE_SLACK=<n>` | 0 | holds each freed buffer n submissions past the newest one at its destroy; 1 covers a list the split's front recorded but the back had not submitted | ours, on Mihawk `f5610fe270` |
 
