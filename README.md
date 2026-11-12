@@ -411,12 +411,16 @@ except 0901, 0903, and 0909, which are on.
 | 0933 transient targets | `EDEN_NX2_RT_EVICT_PRESSURE=<n>` | off | under pressure, a render target the GPU never wrote gives its memory back after n frames instead of waiting for the collector | mihawk-99 0227 |
 | 0936 VMA block stats | `EDEN_NX2_VMA_STATS=1` | off | prints `eden vma-stats` for every block made and given back, with its type, size and memory, and the allocator's totals every 600 frames | ours, diagnostic |
 | 0937 pool bridge | none | n/a | `src/video_core/host_pool.h`: the core asks the application's pool (free bytes, short, critical, recover) instead of the port script injecting its `performance.h` into the core; nothing installed reads as "not known", so a build without a pool behaves as before | ours |
+| 0940 image recycling | `EDEN_NX2_IMAGE_RECYCLE_MIB=<n>` | 256 | images of 4 MiB and more are kept when destroyed and handed out again for an identical create info (bc250 `65c6b779`), so Ocarina's per-frame depth and HDR targets stop taking fresh device memory; the kept images are given back first when an allocation fails, and none is kept while the pool is short | bc250 `65c6b779` |
 | driver retire slack | `RADV_PS5_RETIRE_SLACK=<n>` | 0 | holds each freed buffer n submissions past the newest one at its destroy; 1 covers a list the split's front recorded but the back had not submitted | ours, on Mihawk `f5610fe270` |
 
 Build 14 never compiled (0932 and 0936 had errors); 0932, 0933, 0936, 0937 and 0939 land in
-build 15. None of them has a session yet: their rows say what the change does, not what it
-bought. 0938 (pool-critical collector) is not needed here: `tools/prepare-vulkan-port.py`
-already makes the collector follow the pool's short and critical state in the build tree.
+build 15, which ran once (session b15-A, 2026-11-12): 60 fps in the opening, then from t=432 s
+the pool's largest free block fell to 3 MiB with the guest holding 4968 MiB of 9679 mapped and
+the trim giving back 0 MiB, and the frame loop fell to 0.2 fps with 6-15 s gaps. That is the
+build 10 collapse reached earlier, not a crash. 0938 (pool-critical collector) is not needed
+here: `tools/prepare-vulkan-port.py` already makes the collector follow the pool's short and
+critical state in the build tree. 0940 lands in build 16 and has no session yet.
 
 0913-0918 are on `pr99-test` only. Switches from the parent that matter here:
 

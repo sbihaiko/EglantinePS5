@@ -1,0 +1,298 @@
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 636adda..160c57e 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -32,6 +32,7 @@
+ #include "video_core/vulkan_common/cooperative_matrix.h"
+ #include "video_core/vulkan_common/vma.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
++#include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ 
+@@ -852,6 +853,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+ Device::~Device() {
+     SaveStaticPipelineCache();
+     ShutdownGPULogging();
++    // The images kept for reuse outlive nothing: their memory goes before the allocator does.
++    ReleaseImageRecyclePool();
+     vmaDestroyAllocator(allocator);
+ }
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 75b05d8..e115adc 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -6,8 +6,11 @@
+ 
+ #include <cstdlib>
+ #include <algorithm>
++#include <chrono>
+ #include <cstdio>
++#include <deque>
+ #include <mutex>
++#include <unordered_map>
+ #include <unistd.h>
+ #include <array>
+ #include <bit>
+@@ -39,6 +42,11 @@ extern "C" [[gnu::weak]] std::size_t eden_memory_recover(std::size_t bytes) noex
+ 
+ namespace Vulkan {
+ namespace {
++namespace {
++/// Destroys the images the recycler keeps (EDEN_NX2_IMAGE_RECYCLE_MIB) and goes on keeping.
++void DropRecycledImages();
++} // namespace
++
+ // Out of device memory: asks for memory back and tries again. The pool the console shares with the
+ // guest's memory fills with cold guest memory that can be packed (`bytes` and a 64 MiB block more);
+ // before this, the first failure ended the app. With the renderer's recovery installed
+@@ -48,6 +56,11 @@ namespace {
+ template <typename Create>
+ VkResult RecoverDeviceMemory(VkResult result, VkDeviceSize bytes, Create&& create) {
+     const int attempts = VideoCommon::HostPool::RecoveryInstalled() ? 8 : 3;
++    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++        // The images kept for reuse are the first thing to give back: the guest packing its
++        // memory costs more than reallocating one image.
++        DropRecycledImages();
++    }
+     for (int attempt = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && attempt < attempts;
+          ++attempt) {
+         const bool given = VideoCommon::HostPool::Recover(attempt);
+@@ -121,6 +134,110 @@ namespace {
+         }
+         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+     }
++
++// Image recycling (EDEN_NX2_IMAGE_RECYCLE_MIB, default 256, 0: off; ported from bc250 65c6b779).
++// Ocarina renders into transient targets at a different address every frame - a 1920x1080 depth
++// and an HDR colour target - so the texture cache deletes last frame's images as superseded and
++// creates new ones. Each new multi-mebibyte image took fresh device memory, making the kernel find
++// pages for it while the console was already close to its limit. Images of 4 MiB and more are kept
++// when destroyed (the texture cache destroys them frames after their last use) and handed out
++// again for an identical create info. A new image's contents are undefined and every first use
++// transitions it from VK_IMAGE_LAYOUT_UNDEFINED, so a recycled one behaves the same.
++struct ImageRecyclePool {
++    struct Key {
++        std::vector<u32> words;
++        bool operator==(const Key&) const = default;
++    };
++    struct Entry {
++        Key key;
++        VkImage image;
++        VmaAllocation allocation;
++        u64 size;
++    };
++    std::mutex mutex;
++    u64 cap{};
++    u64 held{};
++    VmaAllocator allocator{};
++    std::unordered_map<VkImage, std::pair<Key, u64>> candidates; ///< Recyclable images in use
++    std::deque<Entry> free;
++    u64 hits{}, kept{}, evicted{};
++    std::chrono::steady_clock::time_point last_report{};
++};
++ImageRecyclePool g_image_pool;
++constexpr u64 MinRecycledImageBytes = 4ull << 20;
++
++/// The create info as words, or nullopt when it carries anything but a view format list.
++std::optional<ImageRecyclePool::Key> RecycleKey(const VkImageCreateInfo& ci) {
++    if (ci.tiling != VK_IMAGE_TILING_OPTIMAL ||
++        (ci.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
++                     VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) != 0 ||
++        ci.sharingMode != VK_SHARING_MODE_EXCLUSIVE) {
++        return std::nullopt;
++    }
++    ImageRecyclePool::Key key;
++    key.words = {static_cast<u32>(ci.flags), static_cast<u32>(ci.imageType),
++                 static_cast<u32>(ci.format), ci.extent.width, ci.extent.height, ci.extent.depth,
++                 ci.mipLevels, ci.arrayLayers, static_cast<u32>(ci.samples), ci.usage,
++                 static_cast<u32>(ci.initialLayout)};
++    for (auto* next = static_cast<const VkBaseInStructure*>(ci.pNext); next != nullptr;
++         next = next->pNext) {
++        if (next->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
++            return std::nullopt;
++        }
++        const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
++        key.words.push_back(0xF0F0F0F0u);
++        for (u32 i = 0; i < list->viewFormatCount; ++i) {
++            key.words.push_back(static_cast<u32>(list->pViewFormats[i]));
++        }
++    }
++    return key;
++}
++
++/// Destroys the kept images, keeping the pool open. Called when memory runs out.
++void DropRecycledImages() {
++    auto& pool = g_image_pool;
++    std::deque<ImageRecyclePool::Entry> destroy;
++    {
++        std::scoped_lock lock{pool.mutex};
++        destroy.swap(pool.free);
++        pool.held = 0;
++    }
++    for (const auto& entry : destroy) {
++        vmaDestroyImage(pool.allocator, entry.image, entry.allocation);
++    }
++}
++
++bool RecycleImage(VmaAllocator allocator, VkImage image, VmaAllocation allocation) noexcept {
++    auto& pool = g_image_pool;
++    std::vector<ImageRecyclePool::Entry> destroy;
++    {
++        std::scoped_lock lock{pool.mutex};
++        const auto it = pool.candidates.find(image);
++        if (it == pool.candidates.end() || allocator != pool.allocator) {
++            return false;
++        }
++        // While the guest is short of memory, keeping device memory for later would be taking it
++        // from the frame being drawn.
++        if (VideoCommon::HostPool::IsShort()) {
++            pool.candidates.erase(it);
++            return false;
++        }
++        pool.free.push_back({std::move(it->second.first), image, allocation, it->second.second});
++        pool.held += it->second.second;
++        pool.candidates.erase(it);
++        ++pool.kept;
++        while (pool.held > pool.cap && !pool.free.empty()) {
++            pool.held -= pool.free.front().size;
++            destroy.push_back(std::move(pool.free.front()));
++            pool.free.pop_front();
++            ++pool.evicted;
++        }
++    }
++    for (const auto& entry : destroy) {
++        vmaDestroyImage(allocator, entry.image, entry.allocation);
++    }
++    return true;
++}
+ } // namespace
+ 
+ //MemoryCommit is now VMA-backed
+@@ -238,10 +355,32 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
+             }
+         });
+     }
++    {
++        static const u64 recycle_cap = [] {
++            const char* value = std::getenv("EDEN_NX2_IMAGE_RECYCLE_MIB");
++            return (value != nullptr ? std::strtoull(value, nullptr, 10) : u64{256}) << 20;
++        }();
++        std::scoped_lock lock{g_image_pool.mutex};
++        if (recycle_cap != 0 && g_image_pool.allocator == nullptr) {
++            g_image_pool.cap = recycle_cap;
++            g_image_pool.allocator = allocator;
++            vk::g_image_recycler = RecycleImage;
++        }
++    }
+ }
+ 
+ MemoryAllocator::~MemoryAllocator() = default;
+ 
++void ReleaseImageRecyclePool() {
++    vk::g_image_recycler = nullptr;
++    DropRecycledImages();
++    std::scoped_lock lock{g_image_pool.mutex};
++    // Candidates still belong to their vk::Image and are destroyed with it.
++    g_image_pool.candidates.clear();
++    g_image_pool.cap = 0;
++    g_image_pool.allocator = nullptr;
++}
++
+ void MemoryAllocator::DestroySparsePools() {
+     for (VmaPool& pool : sparse_pools) {
+         if (pool != VK_NULL_HANDLE) {
+@@ -284,6 +423,31 @@ VmaPool MemoryAllocator::SparsePool(u32 memory_type) const {
+ 
+ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+ {
++    std::optional<ImageRecyclePool::Key> recycle_key;
++    if (g_image_pool.cap != 0) {
++        recycle_key = RecycleKey(ci);
++        if (recycle_key) {
++            auto& pool = g_image_pool;
++            std::scoped_lock lock{pool.mutex};
++            const auto it = std::ranges::find(pool.free, *recycle_key, &ImageRecyclePool::Entry::key);
++            if (it != pool.free.end()) {
++                const ImageRecyclePool::Entry entry = std::move(*it);
++                pool.free.erase(it);
++                pool.held -= entry.size;
++                pool.candidates.emplace(entry.image, std::make_pair(entry.key, entry.size));
++                ++pool.hits;
++                const auto now = std::chrono::steady_clock::now();
++                if (now - pool.last_report > std::chrono::seconds{30}) {
++                    pool.last_report = now;
++                    LOG_INFO(Render_Vulkan,
++                             "Image recycling: {} reused, {} kept, {} evicted, {} MiB held",
++                             pool.hits, pool.kept, pool.evicted, pool.held >> 20);
++                }
++                return vk::Image(entry.image, ci.usage, *device.GetLogical(), allocator,
++                                 entry.allocation, device.GetDispatchLoader());
++            }
++        }
++    }
+     const VmaAllocationCreateInfo alloc_ci = {
+             .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
+                      (dedicated ? VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT}
+@@ -398,6 +562,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+         );
+     }
+ 
++    if (recycle_key && alloc_info.size >= MinRecycledImageBytes) {
++        std::scoped_lock lock{g_image_pool.mutex};
++        g_image_pool.candidates.emplace(handle,
++                                        std::make_pair(std::move(*recycle_key), alloc_info.size));
++    }
+     return vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                         device.GetDispatchLoader());
+ }
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+index fc2d36e..4264db3 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+@@ -86,6 +86,10 @@ namespace Vulkan {
+         void *mapped_ptr{};  ///< Optional persistent mapped pointer
+     };
+ 
++/// Destroys the images kept for recycling and stops keeping more: called before the VMA
++/// allocator goes (EDEN_NX2_IMAGE_RECYCLE_MIB).
++void ReleaseImageRecyclePool();
++
+ /// Memory allocator container.
+ /// Allocates and releases memory allocations on demand.
+     class MemoryAllocator {
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index 557bf64..1852c1b 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -543,6 +543,12 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
+ 
+ void Image::Release() const noexcept {
+     if (handle) {
++        // EDEN_NX2_IMAGE_RECYCLE_MIB: the image goes back to the recycler instead of to the
++        // driver, which keeps its memory for the next image with the same create info.
++        if (allocation != nullptr && g_image_recycler != nullptr &&
++            g_image_recycler(allocator, handle, allocation)) {
++            return;
++        }
+         vmaDestroyImage(allocator, handle, allocation);
+     }
+ }
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index d725dbb..27fb23b 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -683,6 +683,12 @@ public:
+     }
+ };
+ 
++/// Called with an image about to be destroyed; true keeps the image and its memory for reuse
++/// instead (MemoryAllocator's image recycling, EDEN_NX2_IMAGE_RECYCLE_MIB), false destroys it as
++/// usual.
++using ImageRecycler = bool (*)(VmaAllocator allocator, VkImage image, VmaAllocation allocation) noexcept;
++inline ImageRecycler g_image_recycler{};
++
+ class Image {
+ public:
+     VkDeviceSize AllocationBytesProbe() const noexcept;
