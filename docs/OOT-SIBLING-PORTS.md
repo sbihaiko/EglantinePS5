@@ -300,11 +300,25 @@ answer yet to "placement, not total" above.
 
 Build 12's free log had named one return address for every allocation of 16 MiB and over; build 16
 was the first to carry 0940, which recycles images of 4 MiB and over when they are destroyed with
-an identical create info. **It never reused an image**: not one `Image recycling` line in the
-session, while the pool was short throughout. So either Ocarina's per-frame targets are below that
-4 MiB floor, or they are not destroyed with the create info they were made with. 0941 counts every
-image created by size and every non-answer of the pool (not recyclable, under the floor, no match),
-so the session after build 18 says which; a comment saying the same was left on bc250's `65c6b779`.
+an identical create info. Build 16's session appeared to show the recycler never firing — **that
+reading was wrong, and the error was the instrument**: these lines go to
+`/data/eglantineps5/user/log/eden_log.txt`, not to the `stderr.log` the watcher pulled. Build 18,
+the first with 0941's counters, measured it properly in a 347-second session:
+
+| quantity | value |
+|---|---|
+| images created | 43,207 (≈108 per second) |
+| under 2 MiB / 2-4 / 4-8 / 8-16 / 16-32 / 32+ | 32,846 / 4,104 / 3,590 / 2,630 / 27 / 10 |
+| creations under the 4 MiB floor | 36,950 (85%) |
+| reused / kept / evicted | 111 / 179 / 68 |
+| memory held at the end | 0 MiB |
+
+So the recycler answers, but 85% of the traffic never reaches it because the 4 MiB floor is
+bc250's, calibrated on a profile where this device is not. It also stops answering: the
+reused/kept/evicted counts reached 111/179/68 at t=158 s and did not move again while 27,000 more
+images were created, which means either nothing above the floor is destroyed with a matching create
+info after that point, or the exact-match key stops agreeing. The next test is a 1 MiB floor with
+the same counters. The public comment on bc250's `65c6b779` carries the same correction.
 
 ## Looked at, not ported
 
