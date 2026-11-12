@@ -1,5 +1,5 @@
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index ab0188a1c3..c78762c899 100644
+index ab0188a..816784a 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
 @@ -2408,7 +2408,9 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
@@ -13,7 +13,7 @@ index ab0188a1c3..c78762c899 100644
          std::ranges::for_each(bindings, scalar_replace);
      };
  
-@@ -2451,6 +2453,54 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+@@ -2451,6 +2453,55 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
          channel_state->uniform_buffer_binding_sizes.fill({});
      }
  
@@ -54,9 +54,10 @@ index ab0188a1c3..c78762c899 100644
 +            replace(channel.transform_feedback_buffers);
 +            scalar_replace(channel.count_buffer_binding);
 +            scalar_replace(channel.indirect_buffer_binding);
-+            std::ranges::for_each(channel.compute_uniform_buffers, replace);
-+            std::ranges::for_each(channel.compute_storage_buffers, replace);
-+            std::ranges::for_each(channel.compute_texture_buffers, replace);
++            // The compute bindings are flat arrays of one binding each, not arrays of arrays.
++            std::ranges::for_each(channel.compute_uniform_buffers, scalar_replace);
++            std::ranges::for_each(channel.compute_storage_buffers, scalar_replace);
++            std::ranges::for_each(channel.compute_texture_buffers, scalar_replace);
 +            if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
 +                channel.dirty_uniform_buffers.fill(~u32{0});
 +                channel.uniform_buffer_binding_sizes.fill({});
