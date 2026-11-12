@@ -10,7 +10,9 @@ large release. With the variable set, stderr.log gets, each line starting
 - free: every buffer of 16 MiB or more destroyed, with its address range, whether it was in
   2 MiB pieces, its RADV priority, and the newest submission against the one the GPU has run
   (submitted > completed: the GPU may still read it);
-- alloc: every buffer of 16 MiB or more created, the same fields (pieces=1 is the pieced case);
+- alloc: every buffer of 16 MiB or more created, the same fields (pieces=1 is the pieced case)
+  and caller=, the address radv_ps5_buffer_create returns to, so the site that asked for the
+  buffer can be named offline against the driver's symbols;
 - sparse: each sparse bind and unbind, the range and the backing address;
 - replace: the queue's scratch, compute scratch, ES/GS and GS/VS rings and descriptor buffer
   when radv_update_preamble_cs replaces them (old and new range; the old one is freed at once);
@@ -111,7 +113,7 @@ radv_ps5_free_log_allow(enum radv_ps5_free_log_kind kind)
 
 BO_LOG = '''/* ''' + MARK + ''' (tools/patch-radv-free-log.py): a buffer of 16 MiB or more created or freed. */
 static void
-radv_ps5_free_log_bo(const char *what, const struct radv_ps5_bo *bo)
+radv_ps5_free_log_bo(const char *what, const struct radv_ps5_bo *bo, const void *caller)
 {
    if (bo->memory.bytes < (UINT64_C(16) << 20) || !radv_ps5_free_log_allow(RADV_PS5_FREE_LOG_MEMORY))
       return;
@@ -121,10 +123,10 @@ radv_ps5_free_log_bo(const char *what, const struct radv_ps5_bo *bo)
    const uint64_t va = (uint64_t)(uintptr_t)bo->memory.cpu;
    fprintf(stderr,
            "radv/ps5 free-log t=%" PRIu64 " %s va=0x%" PRIx64 "-0x%" PRIx64 " (%" PRIu64 " MiB) sparse=%d pieces=%d "
-           "priority=%u domain=0x%x submitted=%" PRIu64 " completed=%" PRIu64 "\\n",
+           "priority=%u domain=0x%x submitted=%" PRIu64 " completed=%" PRIu64 " caller=%p\\n",
            radv_ps5_free_log_ms(), what, va, va + bo->memory.bytes, bo->memory.bytes >> 20, (int)bo->sparse,
            bo->memory.pieces != NULL, (unsigned)bo->report_priority, (unsigned)bo->base.initial_domain, submitted,
-           completed);
+           completed, caller);
 }
 
 /* The queue replaced one of its buffers (radv_update_preamble_cs); the old one is destroyed next. */
@@ -206,7 +208,7 @@ radv_ps5_buffer_create('''),
         ('''   p_atomic_add(&radv_ps5_allocated_bytes, bo->memory.bytes);
 ''', '''   p_atomic_add(&radv_ps5_allocated_bytes, bo->memory.bytes);
    if (radv_ps5_free_log_on())
-      radv_ps5_free_log_bo("alloc", bo);
+      radv_ps5_free_log_bo("alloc", bo, __builtin_return_address(0));
 '''),
         ('''   if (!bo)
       return;
@@ -214,7 +216,7 @@ radv_ps5_buffer_create('''),
 ''', '''   if (!bo)
       return;
    if (radv_ps5_free_log_on() && !bo->imported)
-      radv_ps5_free_log_bo("free", bo);
+      radv_ps5_free_log_bo("free", bo, NULL);
    if (bo->sparse) {
 '''),
         ('''   if (!done)
