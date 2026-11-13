@@ -26,7 +26,7 @@ namespace Shader::Backend::SPIRV {
 bool NanGuard() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_NAN_GUARD");
-        return value != nullptr && value[0] != '0';
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
 }
@@ -34,7 +34,7 @@ bool NanGuard() {
 bool PositionInvariant() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_POSITION_INVARIANT");
-        return value != nullptr && value[0] != '0';
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
 }

@@ -63,7 +63,7 @@ namespace VideoCommon {
 [[nodiscard]] inline bool SupersededImagesEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
-        return value != nullptr && value[0] != '0';
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
 }
@@ -187,7 +187,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // use (Lichii #1306).
         static const bool past_critical = [] {
             const char* const value = std::getenv("EDEN_NX2_TC_PAST_CRITICAL");
-            return value != nullptr && value[0] != '0';
+            return value != nullptr && value[0] == '1' && value[1] == '\0';
         }();
         if (past_critical && aggressive_mode && total_used_memory > critical_memory) {
             const u64 over = total_used_memory - critical_memory;
@@ -1093,7 +1093,7 @@ void TextureCache<P>::DeleteSupersededImages() {
 [[nodiscard]] inline bool PaddedSquareDepthEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_TC_PADDED_SQUARE");
-        return value != nullptr && value[0] != '0';
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
 }
