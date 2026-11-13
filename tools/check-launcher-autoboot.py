@@ -53,7 +53,9 @@ program = r'''
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 struct Entry {
@@ -69,6 +71,12 @@ std::string AssetsPath(const char*) { return "/roms"; }
 std::vector<Entry> ReadNativeDirectory(const std::string& folder, std::error_code&) {
     return folder == "/roms" ? entries : std::vector<Entry>{};
 }
+std::string ResolveForwardedRom(std::string_view rom, std::string_view roms_dir) {
+    if (!rom.empty() && rom.front() == '/') return std::string{rom};
+    return std::string{roms_dir} + "/" + std::string{rom};
+}
+std::string ExtractedGameMain(const std::string&) { return {}; }
+bool FileExists(const std::string& path) { return std::filesystem::exists(path); }
 namespace BootTrace { template <typename... T> void Line(const char*, T...) {} }
 }
 std::uint64_t eden_game_title_id(const char*) { return metadata; }
@@ -106,6 +114,22 @@ int main() {
     assert(launcher_calls == 0 && matched.probe);
     auto first = Select(false);
     assert(first.selected == launcher_choice && first.error.empty() && launcher_calls == 1 && !first.probe);
+    // EDEN_LAUNCHER_AUTOPICK: a named game starts without the launcher; a game that is not there
+    // says so, and the launcher still opens.
+    {
+        const auto picked = std::filesystem::temp_directory_path() / "eden-autopick.nsp";
+        std::ofstream(picked).put('x');
+        setenv("EDEN_LAUNCHER_AUTOPICK", picked.c_str(), 1);
+        launcher_calls = 0;
+        auto automatic = Select(false);
+        assert(automatic.selected == picked.string() && automatic.error.empty() && launcher_calls == 0);
+        setenv("EDEN_LAUNCHER_AUTOPICK", "/roms/absent.nup", 1);
+        launcher_calls = 0;
+        auto absent = Select(false);
+        assert(absent.selected == launcher_choice && launcher_calls == 1);
+        assert(absent.error.find("Autopicked game not found: /roms/absent.nup") != std::string::npos);
+        unsetenv("EDEN_LAUNCHER_AUTOPICK");
+    }
     launcher_choice.clear();
     auto quit = Select(false);
     assert(quit.selected.empty() && quit.error.empty() && launcher_calls == 2);
@@ -121,6 +145,6 @@ with tempfile.TemporaryDirectory(prefix='eden-launcher-autoboot-') as temporary:
     wait_cpp.write_text(wait_program)
     subprocess.run(['g++', '-std=c++20', str(wait_cpp), '-o', str(wait_binary)], check=True)
     subprocess.run([str(wait_binary)], check=True)
-print('Launcher startup: missing title fallback, filename/metadata autoboot, launcher-first/manual selection stays outside timed probes, and quit PASS')
+print('Launcher startup: missing title fallback, filename/metadata autoboot, launcher-first/manual selection stays outside timed probes, unattended autopick and quit PASS')
 
 print('Actual observation branch: Library gameplay waits without a timer; automatic probe samples120x5seconds PASS')
