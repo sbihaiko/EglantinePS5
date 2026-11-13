@@ -117,6 +117,7 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 
 template <class P>
 void BufferCache<P>::TickFrame() {
+    VideoCommon::g_hot_page_epoch.fetch_add(1, std::memory_order_relaxed);
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
@@ -4079,7 +4080,9 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
             binding.buffer_id = BufferId{};
         }
     };
-    const auto replace = [scalar_replace](std::span<Binding> bindings) {
+    // Any binding array: a channel's texture buffers hold TextureBufferBinding, which does not
+    // become a std::span<Binding>.
+    const auto replace = [scalar_replace](auto& bindings) {
         std::ranges::for_each(bindings, scalar_replace);
     };
 
@@ -4124,6 +4127,55 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         channel_state->dirty_uniform_buffers.fill(~u32{0});
         channel_state->uniform_buffer_binding_sizes.fill({});
+    }
+
+    // EDEN_NX2_SCRUB_ALL_CHANNELS=1 (Lichii #1459): the other active channels keep the id of the
+    // buffer that just went away. A graphics uniform buffer's resolved id survives across draws
+    // (UpdateUniformBuffers only resolves the ones whose id is unset), so once another buffer takes
+    // the freed slot those channels draw it at the old address's offset until the game binds the
+    // slot again. Ocarina of Time draws from four channels, and upstream PR #503 attributes its
+    // one-frame white flashes of the ground, moss and wood to exactly these stale constants. Only
+    // the current channel's host vertex slots are updated; the others are marked dirty instead.
+    static const bool scrub_all_channels{[] {
+        const char* const value{std::getenv("EDEN_NX2_SCRUB_ALL_CHANNELS")};
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }()};
+    if (scrub_all_channels) {
+        for (const size_t other_id : active_channel_ids) {
+            auto& channel = channel_storage[other_id];
+            if (&channel == channel_state) {
+                continue;
+            }
+            auto& other_flags = channel.maxwell3d.dirty.flags;
+            if (channel.index_buffer.buffer_id == buffer_id) {
+                channel.index_buffer.buffer_id = BufferId{};
+                other_flags[Dirty::IndexBuffer] = true;
+            }
+            for (u32 index = 0; index < channel.vertex_buffers.size(); index++) {
+                auto& binding = channel.vertex_buffers[index];
+                if (binding.buffer_id != buffer_id) {
+                    continue;
+                }
+                binding.buffer_id = BufferId{};
+                other_flags[Dirty::VertexBuffers] = true;
+                other_flags[Dirty::VertexBuffer0 + index] = true;
+            }
+            std::ranges::for_each(channel.uniform_buffers, replace);
+            std::ranges::for_each(channel.storage_buffers, replace);
+            std::ranges::for_each(channel.texture_buffers, replace);
+            replace(channel.transform_feedback_buffers);
+            scalar_replace(channel.count_buffer_binding);
+            scalar_replace(channel.indirect_buffer_binding);
+            // The compute bindings are flat arrays of one binding each, not arrays of arrays.
+            std::ranges::for_each(channel.compute_uniform_buffers, scalar_replace);
+            std::ranges::for_each(channel.compute_storage_buffers, scalar_replace);
+            std::ranges::for_each(channel.compute_texture_buffers, scalar_replace);
+            if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
+                channel.dirty_uniform_buffers.fill(~u32{0});
+                channel.uniform_buffer_binding_sizes.fill({});
+            }
+            channel.has_deleted_buffers = true;
+        }
     }
 
     auto& flags = maxwell3d->dirty.flags;
@@ -4254,10 +4306,35 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             const u32 packed_size = static_cast<u32>(next_qword);
             const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
                                             packed_size != 0 && packed_size <= memory_layout_size;
-            if (next_qword_is_size) {
+            // A word past 256 MiB after the pointer is another parameter, not a size: Ocarina of
+            // Time's Kokiri Forest load has the float 1.0 (0x3F800000) there inside a mapping
+            // larger than that, and the 1 GiB buffer it asked for ended the session out of device
+            // memory (viejunerd/Eglantine-PS5- 15cde68). Such a binding is a bare pointer: up to
+            // 8 MiB, stopping where the mapping does. EDEN_NX2_STORAGE_SIZE_WORD=0 restores the
+            // old reading.
+            static const bool reject_implausible = [] {
+                const char* const value = std::getenv("EDEN_NX2_STORAGE_SIZE_WORD");
+                return value == nullptr || value[0] != '0';
+            }();
+            constexpr u32 MaxStorageSizeWord = static_cast<u32>(256_MiB);
+            if (next_qword_is_size && (!reject_implausible || packed_size <= MaxStorageSizeWord)) {
                 return packed_size;
             }
-            return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+            const u32 fallback = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+            if (next_qword_is_size) {
+                static std::atomic<u32> reports{};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(HW_GPU,
+                                "Storage buffer size word {:#x} at {:#x} is not a size: bound as "
+                                "a bare pointer",
+                                packed_size, ssbo_addr + 8);
+                    std::fprintf(stderr,
+                                 "EDEN_SSBO_SIZE_WORD word=%#x at=%#llx bound_as_pointer=1\n",
+                                 packed_size, static_cast<unsigned long long>(ssbo_addr + 8));
+                }
+                return static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, fallback));
+            }
+            return fallback;
         }();
         if ((native_pointer || table_pointer) && size != 0) {
             // Stop where the mapping or its device range does: the binding is one device range, and

@@ -168,6 +168,24 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+        // EDEN_NX2_TC_PAST_CRITICAL=1: past the critical memory, 40 images a frame is not enough
+        // where the game makes more: breaking pots in Ocarina of Time's Hyrule Castle makes ~55 a
+        // frame (25 384x384 shadow maps and the frame's targets, at addresses that move every
+        // frame), none of which replaces an older one (bad overlaps). The cache grew ~15 images a
+        // frame, 4 GiB in two seconds, until the device heap was full and the driver crashed on
+        // the next image. So delete more the further past it, and sooner after an image's last
+        // use (Lichii #1306).
+        static const bool past_critical = [] {
+            const char* const value = std::getenv("EDEN_NX2_TC_PAST_CRITICAL");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (past_critical && aggressive_mode && total_used_memory > critical_memory) {
+            const u64 over = total_used_memory - critical_memory;
+            num_iterations += static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
+            if (over >= 1_GiB) {
+                ticks_to_destroy = (std::max)(min_age, u64{3});
+            }
+        }
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
                           &evict_old_costly, out_of_memory](ImageId image_id) {
@@ -598,6 +616,15 @@ void TextureCache<P>::TickFrame() {
                  "for buffer-written pages; {} MiB of pages marked stale",
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
+        if (SupersededImagesEnabled()) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: superseded images deleted {} ({} held GPU "
+                     "data rewritten by newer images); GPU-written candidates without that proof, "
+                     "summed over frames: {}",
+                     superseded_clean_deletes + superseded_rewritten_deletes,
+                     superseded_rewritten_deletes, superseded_unproven);
+            superseded_clean_deletes = superseded_rewritten_deletes = superseded_unproven = 0;
+        }
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
@@ -625,6 +652,7 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
+    DeleteSupersededImages();
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
@@ -1002,6 +1030,72 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
     }
 }
 
+// EDEN_NX2_TC_SUPERSEDED=1: delete images whose memory went entirely to newer images
+// (DeleteSupersededImages; Lichii #1314).
+[[nodiscard]] inline bool SupersededImagesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+template <class P>
+void TextureCache<P>::DeleteSupersededImages() {
+    // EDEN_NX2_TC_SUPERSEDED=1 (Lichii #1314): Ocarina of Time moves its render targets within a
+    // memory pool every frame while the camera moves (about 45 images a frame in the Castle Town
+    // guard house). The old images stayed registered until the age-based collector reached them,
+    // far slower than they arrived, and VRAM spilled. Once the memory of an image belongs
+    // entirely to newer images (see ClassifySuperseded for what that has to prove) nothing can
+    // read it any more. Switch 2 titles only.
+    static constexpr u64 MinFramesUnused = 2;
+    if (!SupersededImagesEnabled() || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        frame_tick <= MinFramesUnused ||
+        frame_tick - superseded_activity_frame > MinFramesUnused + 1) {
+        return;
+    }
+    superseded_ids.clear();
+    lru_cache.ForEachItemBelow(frame_tick - MinFramesUnused, [this](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (image.overlapping_images.empty()) {
+            return false;
+        }
+        switch (ClassifySuperseded(slot_images, image)) {
+        case Supersession::Clean:
+        case Supersession::Rewritten:
+            superseded_ids.push_back(image_id);
+            break;
+        case Supersession::Unproven:
+            ++superseded_unproven;
+            break;
+        case Supersession::None:
+            break;
+        }
+        return false;
+    });
+    for (const ImageId image_id : superseded_ids) {
+        Image& image = slot_images[image_id];
+        ++(image.IsSafeGpuCopy() ? superseded_rewritten_deletes : superseded_clean_deletes);
+        // Not marked stale (MarkStale): the covering images hold the bytes, and marking their
+        // pages would let an image made over them skip its upload without being filled.
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    }
+}
+
+// EDEN_NX2_TC_PADDED_SQUARE=1: a depth target padded to whole GOBs is looked up as the square it
+// is (FindDepthBuffer; Lichii #1314).
+[[nodiscard]] inline bool PaddedSquareDepthEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_PADDED_SQUARE");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 template <class P>
 bool TextureCache<P>::RescaleRenderTargets() {
     auto& flags = maxwell3d->dirty.flags;
@@ -1045,7 +1139,10 @@ bool TextureCache<P>::RescaleRenderTargets() {
             }
             check_rescale(color_buffer_id, tmp_color_images[index]);
         }
-        if (flags[Dirty::ZetaBuffer] || force) {
+        // The surface clip, which a padded depth target's size depends on, has no flag of its
+        // own (it marks only RenderTargets), so look the target up again while it is padded.
+        // depth_target_padded stays false without EDEN_NX2_TC_PADDED_SQUARE.
+        if (flags[Dirty::ZetaBuffer] || force || depth_target_padded) {
             flags[Dirty::ZetaBuffer] = false;
             BindRenderTarget(&render_targets.depth_buffer_id, FindDepthBuffer());
         }
@@ -1116,6 +1213,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        if (is_clear && SupersededImagesEnabled()) {
+            NoteWholeClears();
+        }
         return;
     }
 
@@ -1134,6 +1234,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
     PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+    if (is_clear && SupersededImagesEnabled()) {
+        NoteWholeClears();
+    }
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -3375,6 +3478,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    if (!join_bad_overlap_ids.empty() && SupersededImagesEnabled()) {
+        superseded_activity_frame = frame_tick;
+    }
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
@@ -3690,6 +3796,7 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
 template <class P>
 ImageViewId TextureCache<P>::FindDepthBuffer() {
     const auto& regs = maxwell3d->regs;
+    depth_target_padded = false;
     if (!regs.zeta_enable) {
         return ImageViewId{};
     }
@@ -3697,7 +3804,21 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // EDEN_NX2_TC_PADDED_SQUARE=1 (Lichii #1314): Ocarina of Time draws its local shadow maps into
+    // D32_FLOAT depth targets padded to whole GOBs (800x793) and samples them as the square
+    // textures they are (793x793) at the same address. Image lookups compare sizes strictly, so
+    // each shadow map was two images and a copy between them, for every new size while the camera
+    // moves. The padding is not part of the image: the surface clip bounds rendering, so a clip
+    // inside the square never reaches it, and one image then serves both. A clip that reaches the
+    // padding keeps the size the game gave.
+    if (PaddedSquareDepthEnabled()) {
+        depth_target_padded = IsPaddedSquare(info);
+        const u32 clip_right = regs.surface_clip.x.Value() + regs.surface_clip.width.Value();
+        if (depth_target_padded && clip_right <= info.size.height) {
+            info.size.width = info.size.height;
+        }
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 
@@ -4439,6 +4560,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    if (SupersededImagesEnabled()) {
+        image.last_use_frame = frame_tick;
+    }
 }
 
 template <class P>
@@ -4632,6 +4756,76 @@ bool TextureCache<P>::ClearCovers(u32 width, u32 height) const {
     const s32 bottom = lower_left ? clip_height - min_y : max_y;
     return scissor.min_x == 0 && top <= 0 && scissor.max_x >= width &&
            bottom >= static_cast<s32>(height);
+}
+
+template <class P>
+bool TextureCache<P>::ClearOverwritesWhole(const ImageInfo& new_info, GPUVAddr gpu_addr) const {
+    // Lichii's check for a new target a clear overwrites whole (#817), which this core does not
+    // have; here only NoteWholeClears calls it, during a clear.
+    if (new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
+        new_info.resources.layers != 1 || new_info.num_samples != 1) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& surface = regs.clear_surface;
+    if (surface.layer != 0) {
+        return false;
+    }
+    const u32 width = new_info.size.width;
+    const u32 height = new_info.size.height;
+    if (!ClearCovers(width, height)) {
+        return false;
+    }
+    // The clear covers the framebuffer's render area, the smallest bound target.
+    for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+        const auto& rt = regs.rt[index];
+        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+            (rt.width < width || rt.height < height)) {
+            return false;
+        }
+    }
+    if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+        (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
+        return false;
+    }
+    const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+    const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
+    switch (VideoCore::Surface::GetFormatType(new_info.format)) {
+    case VideoCore::Surface::SurfaceType::ColorTexture: {
+        // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
+        const u32 index = surface.RT;
+        return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
+               index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+               regs.rt[index].Address() == gpu_addr;
+    }
+    case VideoCore::Surface::SurfaceType::Depth:
+        return is_depth_target && surface.Z;
+    case VideoCore::Surface::SurfaceType::Stencil:
+        return is_depth_target && full_stencil;
+    case VideoCore::Surface::SurfaceType::DepthStencil:
+        return is_depth_target && surface.Z && full_stencil;
+    default:
+        return false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteWholeClears() {
+    const auto note = [this](ImageViewId view_id) {
+        if (!PreparesImage(slot_image_views, view_id)) {
+            return;
+        }
+        Image& image = slot_images[slot_image_views[view_id].image_id];
+        if (ClearOverwritesWhole(image.info, image.gpu_addr) &&
+            slot_image_views[view_id].size == image.info.size) {
+            image.full_write_tick = image.modification_tick;
+            superseded_activity_frame = frame_tick;
+        }
+    };
+    for (const ImageViewId view_id : render_targets.color_buffer_ids) {
+        note(view_id);
+    }
+    note(render_targets.depth_buffer_id);
 }
 
 template <class P>
