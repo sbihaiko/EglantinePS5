@@ -15,7 +15,9 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 prepare = (root / 'tools/prepare-build.sh').read_text()
 build = (root / 'tools/build-radv-dependencies.sh').read_text()
-scripts = {'patch-radv-gs-compute.py': 'EDEN_GS_COMPUTE_SHA256'}
+scripts = {'patch-radv-gs-compute.py': 'EDEN_GS_COMPUTE_SHA256',
+           'patch-radv-retire.py': 'EDEN_RETIRE_SHA256',
+           'patch-radv-free-log.py': 'EDEN_FREE_LOG_SHA256'}
 
 for name, stamp_name in scripts.items():
     script = root / 'tools' / name
