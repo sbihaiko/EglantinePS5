@@ -3493,6 +3493,12 @@ public:
              "CalculateDecoderImagePoolBuffer"},
             {901, &INx2GraphicsSystemSession::Stub, "VideoInitialize (guessed)"},
             {902, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession (guessed)"},
+            // nn::codec::video::detail::ipc::Finalize (FinalizeServerContext in newer SDKs) sends 903
+            // after closing its sessions and reads only the result: it pairs with 901, and 1003 is
+            // the encoder twin (vexcited/fefw, video_server_context.cpp). Ocarina of Time sends it
+            // after vdecsvc flush/stop/finalize and stopped there (Lichii #1239, CheezyEmu 011647f,
+            // Orchid 96dd790).
+            {903, &INx2GraphicsSystemSession::StubReplyZeroed, "VideoFinalize (guessed)"},
             {905, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithFlag"},
             {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithVersion"},
             {1001, &INx2GraphicsSystemSession::Stub, "VideoInitialize2 (guessed)"},
