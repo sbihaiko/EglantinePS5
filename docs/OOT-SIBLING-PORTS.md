@@ -180,6 +180,22 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 
 ## Open investigations
 
+- **The base survives; the ported patch set is what ends the session (2026-11-13).** On
+  `b24-hle-only` — v1.000.002 plus the 903 answer and the auto-stub change, no driver patch — OoT
+  ran unattended from t=4 s to t=1978 s (33 minutes) at 600 frames per 10 s window (60 FPS,
+  `over33=0`, `over100=0`), the only `<Critical>` line being the boot-time
+  `internal_network/network.cpp` assert (errno=13). `b24-keeps` died in every run, between 74 s and
+  458 s, with no crash report and the log cut mid-line. So the 55 s stop is the 903 assert, and
+  what ends the patched build is inside the patch commit.
+  Two defects made that comparison wrong until now. Five ported switches — 0911's
+  `EDEN_NX2_NAN_GUARD` and `EDEN_NX2_POSITION_INVARIANT`, 0915 `EDEN_NX2_TC_PAST_CRITICAL`, 0916
+  `EDEN_NX2_TC_PADDED_SQUARE` and 0917 `EDEN_NX2_TC_SUPERSEDED` — tested `value[0] != '0'`, which
+  is *on* when the variable is absent, so a session that set nothing ran the whole set; only 0903
+  is meant to be on by default. `7d17e29` makes them strict (`== '1'`). The next `b24-keeps`
+  session runs 0903 alone, and each switch then goes on through `env.txt` without a rebuild.
+  New instrument: `EDEN_LAUNCHER_AUTOPICK=<file name in the game files folder>` starts that game
+  without the launcher in a release build (unset, nothing changes), which is what let these
+  sessions run with nobody at the controller.
 - **The parent's new core stops OoT 55 s in, at the end of the intro video (2026-11-13).**
   On v1.000.002 (installed as the pure base, `env.txt` with only the two observational
   switches) the game boots, plays the intro at 59.6-60.0 FPS from the stutter trace, and dies at
