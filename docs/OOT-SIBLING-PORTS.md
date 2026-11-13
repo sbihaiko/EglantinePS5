@@ -180,6 +180,20 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 
 ## Open investigations
 
+- **The five-hour crash is the kernel's session slab, not the GPU (2026-11-13).** The all-on
+  session (`b24-keeps`, all five switches on) ran from 05:51 to 11:08:49 — 19,010 s — and then
+  crashed with SIGSEGV at address 0x8 on `CPUCore_3`, `eboot+0x3be1ee`. The app relaunched itself
+  ("then: the app starts again"), which is why the process never left `ps` and the session looked
+  longer than it was. Symbols from that run's `EglantinePS5-symbols` artifact resolve the fault to
+  `Kernel::KSession::Initialize`, called from `CreateRawSession<INx2VideoSession>`, called from
+  `INx2GraphicsSystemSession::OpenVideoSession`; `rdi` is 0, so `KSession::Create` returned null.
+  The slab holds 1,133 `KSession` objects (`SlabCountKSession` in `init_slab_setup.cpp`) and the
+  run's log holds 706 `OpenVideoSession` calls and 353 `TIPC 1001` encoder-creator sessions with
+  **zero** `903` finalizations: every lap of the intro loop opens new decoder sessions and never
+  releases them. `b26-session-guard` adds the missing null check — a `<Critical>` with the live
+  count, and `ResultUnknown` to the guest instead of a crash — plus `EDEN_NX2_SESSION_TRACE=1`,
+  which logs the live session count on every creation. This also corrects the earlier reading of
+  this session as "no crash in eight hours".
 - **The base survives; the ported patch set is what ends the session (2026-11-13).** On
   `b24-hle-only` — v1.000.002 plus the 903 answer and the auto-stub change, no driver patch — OoT
   ran unattended from t=4 s to t=1978 s (33 minutes) at 600 frames per 10 s window (60 FPS,
