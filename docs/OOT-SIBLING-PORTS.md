@@ -320,6 +320,15 @@ images were created, which means either nothing above the floor is destroyed wit
 info after that point, or the exact-match key stops agreeing. The next test is a 1 MiB floor with
 the same counters. The public comment on bc250's `65c6b779` carries the same correction.
 
+- **Bloom on the parent's v1.000.002 (2026-11-13).** The new base's core is upstream nx2
+  `babdb6bb75`, not our `pr99-test`, and the patches that fixed the bloom for us there (the
+  parent's 0070 and 0072-0078) are named for the old core. Grepping the new tree for their
+  identifiers is inconclusive: `texture_handle` and `preflush` are present, while `storage_trace`,
+  `max_continuous`, `WalkAhead` and `covered_range` are absent — so the mechanisms are not
+  identifiable by name either way. The first session on the pure base should treat the bloom as a
+  first-class observation: if the glow is gone there too, the fix arrived with the new upstream and
+  our 09xx set does not need to carry it; if it is back, the missing piece is named in this list.
+
 ## Looked at, not ported
 
 - **Null image on a memo hit** (Lichii `c2e293ec8`, #910). This pin already gates
