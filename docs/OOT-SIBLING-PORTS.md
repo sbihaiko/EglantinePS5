@@ -205,6 +205,13 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   game was started: the ones that died were picked from the launcher; these were started by
   `EDEN_LAUNCHER_AUTOPICK`, which never opens the launcher at all. Next test: OoT started *from the
   launcher* on this build, which needs someone at the controller.
+- **The flashes candidate is already in the base (2026-11-13).** Lichii #1199 (sub 102 unmaps every
+  GPU range still reaching a destroyed memory, GPU-only region tiles dropped) and #1236
+  (`ReleaseBacking`, reused-device-range refresh) are both in the vendored `Eglantine/` core of
+  v1.000.002 — `SubDestroyMemory` in `nx2_gsv.h` does `UnmapMemory`, `MapAt` back what does not
+  reach the memory, then `ReleaseBacking`. The old patch pair 0913/0914 has nothing left to add;
+  the patches do not apply (the base changed the structures) and nothing needs porting here. What
+  flashes remain, if any, come from somewhere else.
 - **The parent's new core stops OoT 55 s in, at the end of the intro video (2026-11-13).**
   On v1.000.002 (installed as the pure base, `env.txt` with only the two observational
   switches) the game boots, plays the intro at 59.6-60.0 FPS from the stutter trace, and dies at
