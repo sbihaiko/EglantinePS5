@@ -35,15 +35,14 @@ enum class Supersession : u8 {
 /// Known limit (from Lichii): bytes of the range that belong to no image's texels (block-linear
 /// padding at the bottom of an image) count as covered.
 ///
-/// This core also excludes PartialDownload images (Mario Kart World partial readback): their GPU
-/// data is only partly written back and GpuModified may be clear while it is pending, so
-/// IsSafeGpuCopy would call them clean.
+/// This core has no partial-readback images (Mario Kart World's), so there is no flag for them to
+/// exclude: a download is always whole.
 template <typename Images>
 [[nodiscard]] Supersession ClassifySuperseded(const Images& images, const ImageBase& image) {
     constexpr ImageFlagBits Excluded =
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
         ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse | ImageFlagBits::Remapped |
-        ImageFlagBits::IsDecoding | ImageFlagBits::TrimmedLevels | ImageFlagBits::PartialDownload;
+        ImageFlagBits::IsDecoding | ImageFlagBits::TrimmedLevels;
     if (image.overlapping_images.empty() || !image.aliased_images.empty() ||
         True(image.flags & Excluded) || image.cpu_addr >= image.cpu_addr_end) {
         return Supersession::None;
