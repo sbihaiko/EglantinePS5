@@ -339,3 +339,45 @@ the same counters. The public comment on bc250's `65c6b779` carries the same cor
 ## Runs so far
 
 See issue #1 of this fork for run3 to run11.
+
+## Against the parent's v1.000.002 core (2026-11-13)
+
+Two reviewers read the whole 09xx series against the new base — the parent's v1.000.002, whose core is
+upstream Eglantine nx2 `babdb6bb75` kept in-repo — and judged each patch `COVERED` (the new core
+already does it), `KEEP` (absent and still meaningful), `DROPPED` (its target is gone) or
+`UNMEASURABLE`. Verdicts came from reading code, not from a session, so every `KEEP` still needs the
+console.
+
+**0901-0926: five survive.** `COVERED`, so their switches and A/Bs are gone: 0901 colour output mask,
+0902 AMD shader fixes, 0905 fence batching, 0906 submit/GPU-wait profiling, 0907 drain-site
+profiling, 0909 fence work on the back, 0913 destroy-unmap-all, 0914 refresh reused ranges, 0920
+flash fixes, 0921 pending poll, 0922 loop writes, 0924 upload batch, 0925 dispatch barrier, 0926
+device alloc. `DROPPED` because the target is gone: 0910 count-only counters, 0923 DMA read reported
+(the new core's `WaitForWrites` and `QueryDma::HoldsReports` are the alternative our notes named).
+`KEEP`, in order of value: **0903** storage size word (`buffer_cache.h:4254-4260` still binds
+without the 256 MiB guard, and Kokiri's 1 GiB binding is what it was written for), **0916** padded
+square depth and **0917** superseded images (texture-cache growth, none upstream; 0917 is the costly
+re-anchor), **0915** past critical (trivial; measure whether the new `out_of_memory` pass already
+stops the growth), **0911** NaN guard (cheap, but the root causes it sat beside are now upstream, so
+count flashes before and after). `UNMEASURABLE`: 0908, because the new core turns fence batching back
+on by default at 500 us — the crash that made us turn it off should be covered by upstream's version
+of 0909, and only a session says so.
+
+**0927-0942 and the driver: two core keeps, one driver gap.** `COVERED` or `DROPPED`: 0927 (texture
+pool x2 is now a **built-in patch**, on by default), 0928, 0929, 0930, 0933, 0936, 0937, 0939 (its
+`RecoverDeviceMemory` anchor is gone; the new core has its own fallback chain and a larger collector
+pass), 0940 and 0941 (our own measurement is the argument: 43,207 images in 347 s, 85% under the
+4 MiB floor, 111 reused, reuse frozen after t=158 s while the pool was short — port the recycler only
+if the stutter trace shows image creation in long frames). `KEEP`: **0942** hot pages (absent;
+`word_manager.h` has no `Hot`/`Flip`, and the hot path must respect the new `NoteCleanWord`), **0932**
+scrub all channels (absent; short re-anchor in `DeleteBuffer`), and 0931 at low value (96 MiB back,
+frame rate unchanged).
+
+The gap that can cost a session is **driver-side**: the same ps5-mesa pin `7b59ef27c1b0` with none of
+`patch-radv-retire.py`, `patch-radv-free-log.py` or the `0f86253f` mesh-ring patch. Branch
+`b23b-driver` (build 23b, run 43334891158) adds exactly those three and nothing of the core.
+
+Two changes to the baseline the next comparison must carry: the new base ships **"Texture Pool x2"
+and "Max Resolution" on by default**, and the diagnostics were renamed — `EDEN_STALL` and `back_phase`
+are gone; use `EDEN_NX2_STUTTER_TRACE=1` (`Nx2Stutter`, `Nx2StutterSummary` with a 10 s frame-time
+histogram), `EDEN_NX2_TC_LOG`, `EDEN_NX2_MEM_TRACE` and `RADV_PS5_MEMORY_REPORT=1`.
