@@ -912,6 +912,17 @@ bool EdenAttributelessStaticKey(const FixedPipelineState& state) {
            std::ranges::none_of(state.attributes,
                                 [](const auto& attribute) { return attribute.raw != 0; });
 }
+
+// EDEN_NX2_ATTRIBUTELESS_PRECACHE=1: KeyFitsDevice accepts the attributeless static key on a
+// device with dynamic vertex input, so the pipelines the cache already holds are built at launch
+// instead of on the GPU thread mid-game (heydemoura/EglantinePS5#105).
+bool AttributelessPrecacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_ATTRIBUTELESS_PRECACHE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
@@ -1186,6 +1197,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 }
 
 bool PipelineCache::KeyFitsDevice(const GraphicsPipelineCacheKey& key) const {
+    // A vertex shader that reads no attribute is drawn with a static key; the cache holds those
+    // keys and the device can draw them, so build them at launch rather than clearing the cache
+    // of them and compiling them again on the GPU thread mid-game.
+    const bool key_static_attributeless =
+        AttributelessPrecacheEnabled() && dynamic_features.has_dynamic_vertex_input &&
+        ::Eden::DevVulkan::static_vertex_input && EdenAttributelessStaticKey(key.state);
     if ((key.state.extended_dynamic_state != 0) != dynamic_features.has_extended_dynamic_state ||
         (key.state.extended_dynamic_state_2 != 0) !=
             dynamic_features.has_extended_dynamic_state_2 ||
@@ -1196,7 +1213,8 @@ bool PipelineCache::KeyFitsDevice(const GraphicsPipelineCacheKey& key) const {
         (key.state.extended_dynamic_state_3_enables != 0) !=
             dynamic_features.has_extended_dynamic_state_3_enables ||
         (key.state.color_write_enable_dynamic != 0) != dynamic_features.has_color_write_enable ||
-        (key.state.dynamic_vertex_input != 0) != dynamic_features.has_dynamic_vertex_input) {
+        ((key.state.dynamic_vertex_input != 0) != dynamic_features.has_dynamic_vertex_input &&
+         !key_static_attributeless)) {
         return false;
     }
     const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
