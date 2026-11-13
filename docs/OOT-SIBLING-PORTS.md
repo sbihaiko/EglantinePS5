@@ -188,9 +188,11 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   `Kernel::KSession::Initialize`, called from `CreateRawSession<INx2VideoSession>`, called from
   `INx2GraphicsSystemSession::OpenVideoSession`; `rdi` is 0, so `KSession::Create` returned null.
   The slab holds 1,133 `KSession` objects (`SlabCountKSession` in `init_slab_setup.cpp`) and the
-  run's log holds 706 `OpenVideoSession` calls and 353 `TIPC 1001` encoder-creator sessions with
-  **zero** `903` finalizations: every lap of the intro loop opens new decoder sessions and never
-  releases them. `b26-session-guard` adds the missing null check — a `<Critical>` with the live
+  run's log holds 706 `OpenVideoSession` calls and 353 `TIPC 1001` encoder-creator sessions —
+  about 1,059 of the 1,133. How many of them were released is not in the log: `903`
+  (`VideoFinalize`) is answered by `StubReplyZeroed`, which logs nothing, so the log cannot say
+  whether the guest finalized. What it does say is that the intro loop opens a new decoder
+  session on every lap. `b26-session-guard` adds the missing null check — a `<Critical>` with the live
   count, and `ResultUnknown` to the guest instead of a crash — plus `EDEN_NX2_SESSION_TRACE=1`,
   which logs the live session count on every creation. This also corrects the earlier reading of
   this session as "no crash in eight hours".
