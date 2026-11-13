@@ -58,6 +58,16 @@ namespace VideoCommon {
     return enabled;
 }
 
+// EDEN_NX2_TC_SUPERSEDED=1: delete images whose memory went entirely to newer images
+// (DeleteSupersededImages; Lichii #1314).
+[[nodiscard]] inline bool SupersededImagesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -1032,14 +1042,6 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
 
 // EDEN_NX2_TC_SUPERSEDED=1: delete images whose memory went entirely to newer images
 // (DeleteSupersededImages; Lichii #1314).
-[[nodiscard]] inline bool SupersededImagesEnabled() {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
-        return value != nullptr && value[0] != '0';
-    }();
-    return enabled;
-}
-
 template <class P>
 void TextureCache<P>::DeleteSupersededImages() {
     // EDEN_NX2_TC_SUPERSEDED=1 (Lichii #1314): Ocarina of Time moves its render targets within a
