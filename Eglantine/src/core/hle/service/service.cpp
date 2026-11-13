@@ -180,13 +180,17 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
     buf.push_back('}');
 
     system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
-    UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
     if (auto_stub) {
-        LOG_WARNING(Service, "Using auto stub fallback (repeats of this command are not logged)");
+        // An auto-stubbed command is answered, not a failure: on ARM64 the soft assert below is a
+        // brk, which took the whole process down (Ocarina of Time, nx2:gsv 903, right after the
+        // video decoder's finalize).
+        LOG_WARNING(Service, "Unknown / unimplemented {}, auto-stubbed", fmt::to_string(buf));
         IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
         rb.Push(ResultSuccess);
         PushStubZeroes(rb);
+        return;
     }
+    UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
 }
 
 void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
