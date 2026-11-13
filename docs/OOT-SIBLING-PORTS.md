@@ -180,6 +180,21 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
 
 ## Open investigations
 
+- **The parent's new core stops OoT 55 s in, at the end of the intro video (2026-11-13).**
+  On v1.000.002 (installed as the pure base, `env.txt` with only the two observational
+  switches) the game boots, plays the intro at 59.6-60.0 FPS from the stutter trace, and dies at
+  t=55.3 s: `nx2:vdecsvc` calls flush (8), stop (207) and finalize (115), and the next request —
+  `nx2:gsv` command **903** — is answered by `ReportUnimplementedFunction`, whose
+  `UNIMPLEMENTED_MSG` is an `ASSERT_MSG`: on ARM64 the soft assert is `brk #0`, so the process
+  ends (one run left it alive but frozen, log file and frame counters stalled). `EDEN_NX2_AUTO_STUB=1`
+  does not help — the assert is emitted before the stub replies.
+  Found: 903 is `nn::codec::video::detail::ipc::Finalize` (`FinalizeServerContext` in newer
+  SDKs), the pair of 901 with 1003 as the encoder twin (vexcited/fefw
+  `video_server_context.cpp`), and this core registers 901, 902, 905, 906, 1001, 1002 and 1003
+  but not 903. Lichii #1239 is the same report, open and unanswered. Orchid `96dd790`, CheezyEmu
+  `011647f` and viejunerd's PS5 `0027` already answer it. Build 24 (`b24-keeps`) carries
+  `{903, StubReplyZeroed}` and stops asserting on commands it is about to stub; whether the
+  guest accepts the zeroed reply is the next thing the fixed route answers.
 - **Bloom.** The glow around lights and the sky is blown out in every session since gameplay
   was first reached on this base, and no switch so far has changed it: the colour output mask
   (0901), `EDEN_NX2_AMD_SHADER_FIXES=1`, the NaN guard and invariant position (0911), routed
