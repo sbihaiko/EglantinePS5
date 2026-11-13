@@ -90,9 +90,29 @@ inline Kernel::KClientSession* CreateRawSession(Core::System& system, HLERequest
     ASSERT(Kernel::GetCurrentProcess(kernel).GetResourceLimit()->Reserve(
         kernel, Kernel::LimitableResource::SessionCountMax, 1));
 
+    static const bool trace_sessions = [] {
+        const char* const value = std::getenv("EDEN_NX2_SESSION_TRACE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+
     auto* session = Kernel::KSession::Create(kernel);
+    if (session == nullptr) {
+        // The session slab is full. Dereferencing the null here was a SIGSEGV on CPUCore_3 after
+        // five hours in Ocarina of Time's intro loop (crash-20261113-110849, eboot+0x3be1ee).
+        const size_t slab_size = Kernel::KSession::GetSlabHeapSize(kernel);
+        LOG_CRITICAL(Service,
+                     "nx2: session slab exhausted, {} of {} session objects live; the request gets "
+                     "an error instead of a session",
+                     slab_size - Kernel::KSession::GetNumRemaining(kernel), slab_size);
+        return nullptr;
+    }
     session->Initialize(kernel, nullptr, 0);
     Kernel::KSession::Register(kernel, session);
+    if (trace_sessions) {
+        const size_t slab_size = Kernel::KSession::GetSlabHeapSize(kernel);
+        LOG_INFO(Service, "nx2: session created, {} of {} session objects live",
+                 slab_size - Kernel::KSession::GetNumRemaining(kernel), slab_size);
+    }
 
     auto manager =
         std::make_shared<SessionRequestManager>(kernel, ctx.GetManager()->GetServerManager());
@@ -128,6 +148,11 @@ inline void TipcHandshake(HLERequestContext& ctx, std::string_view session) {
 template <class T>
 inline void ReturnRawSession(Core::System& system, HLERequestContext& ctx, std::shared_ptr<T> iface) {
     auto* client = CreateRawSession(system, ctx, std::move(iface));
+    if (client == nullptr) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultUnknown);
+        return;
+    }
     IPC::ResponseBuilder rb{ctx, 2, 1, 0};
     rb.Push(ResultSuccess);
     rb.PushCopyObjects(ctx, *client);
