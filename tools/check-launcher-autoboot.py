@@ -7,9 +7,12 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'headless/main.cpp').read_text()
-start = source.index('        if (std::exchange(autoboot_pending, false)) {')
-end = source.index('#else\n        Eden::BootTrace::Line("opening the launcher");', start)
+start = source.index('#if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)\n'
+                     '        if (std::exchange(autoboot_pending, false)) {')
+end = source.index('        Eden::BootTrace::Line("launcher closed: %s"', start)
 branch = source[start:end]
+helper_start = source.index('// Unattended sessions on the console: EDEN_LAUNCHER_AUTOPICK names a game')
+helper = source[helper_start:source.index('\n}\n', helper_start) + 3]
 wait_start = source.index('#elif defined(EDEN_DEV_ROM_ID)\n                        // Library and forwarded launches')
 wait_start = source.index('\n', wait_start) + 1
 wait_end = source.index('#else\n                        completion->wake.wait(lock, completed);', wait_start)
@@ -84,6 +87,7 @@ std::string SelectEglantinePS5Game(int, const std::string&) {
     ++launcher_calls;
     return launcher_choice;
 }
+HELPER
 struct Result { std::string selected, error; bool pending, probe; };
 Result Select(bool autoboot_pending) {
     int rooms = 0;
@@ -134,7 +138,7 @@ int main() {
     auto quit = Select(false);
     assert(quit.selected.empty() && quit.error.empty() && launcher_calls == 2);
 }
-'''.replace('BRANCH', branch)
+'''.replace('HELPER', helper).replace('BRANCH', branch)
 with tempfile.TemporaryDirectory(prefix='eden-launcher-autoboot-') as temporary:
     folder = Path(temporary)
     cpp, executable = folder / 'test.cpp', folder / 'test'

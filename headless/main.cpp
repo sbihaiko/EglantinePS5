@@ -265,6 +265,23 @@ static void UpdateGrips(Core::System& system, Eden::Pad& pad) {
 void EdenRegisterNirBackend(); // nir_backend.cpp
 #endif
 
+// Unattended sessions on the console: EDEN_LAUNCHER_AUTOPICK names a game (a file name in the
+// game files folder, or a path) that starts without the launcher, for the console experiments
+// nobody is watching. Unset, it returns nothing and the launcher opens as usual; set to a game
+// that is not there, it says so instead of a silent menu.
+static std::string AutopickedGame(std::string& launch_error) {
+    const char* pick = std::getenv("EDEN_LAUNCHER_AUTOPICK");
+    if (pick == nullptr || *pick == '\0') return {};
+    std::string path = Eden::ResolveForwardedRom(pick, Eden::AssetsPath("roms"));
+    if (const auto extracted = Eden::ExtractedGameMain(path); !extracted.empty()) path = extracted;
+    if (!Eden::FileExists(path)) {
+        launch_error = "Autopicked game not found: " + path;
+        return {};
+    }
+    Eden::BootTrace::Line("autopicked game: %s", path.c_str());
+    return path;
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef EDEN_PS5_RADV
@@ -657,19 +674,10 @@ int main(int argc, char** argv) {
             launch_error = "Configured game was not found. Select another game.";
         }
         }
-        // Unattended sessions on the console: EDEN_LAUNCHER_AUTOPICK names a game (a file name in
-        // the game files folder, or a path) that starts without the launcher. Unset, the launcher
-        // opens as usual; set, a game that is not there says so instead of a silent menu.
-        if (selected_game.empty()) {
-            if (const char* pick = std::getenv("EDEN_LAUNCHER_AUTOPICK"); pick && *pick) {
-                std::string path = Eden::ResolveForwardedRom(pick, Eden::AssetsPath("roms"));
-                if (const auto extracted = Eden::ExtractedGameMain(path); !extracted.empty()) path = extracted;
-                if (Eden::FileExists(path)) selected_game = path;
-                else launch_error = std::string{"Autopicked game not found: "} + path;
-                Eden::BootTrace::Line("autopicked game: %s",
-                                      selected_game.empty() ? launch_error.c_str() : selected_game.c_str());
-            }
-        }
+#endif
+        // Unattended sessions on the console: EDEN_LAUNCHER_AUTOPICK names a game that starts
+        // without the launcher, for the console experiments nobody is watching.
+        if (selected_game.empty()) selected_game = AutopickedGame(launch_error);
         if (selected_game.empty()) {
 #if defined(EDEN_DEV_ROM_ID) && !defined(EDEN_DEV_PROFILE)
             compatibility_probe = false;
@@ -677,10 +685,6 @@ int main(int argc, char** argv) {
             Eden::BootTrace::Line("opening the launcher");
             selected_game = SelectEglantinePS5Game(rooms, launch_error);
         }
-#else
-        Eden::BootTrace::Line("opening the launcher");
-        selected_game = SelectEglantinePS5Game(rooms, launch_error);
-#endif
         Eden::BootTrace::Line("launcher closed: %s", selected_game.empty() ? "no game (quit)" : "a game was chosen");
         }
         if (selected_game.empty()) {
