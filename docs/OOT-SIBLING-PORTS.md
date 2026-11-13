@@ -196,6 +196,15 @@ Each item below is behind an environment switch (`env.txt` in the app folder, re
   New instrument: `EDEN_LAUNCHER_AUTOPICK=<file name in the game files folder>` starts that game
   without the launcher in a release build (unset, nothing changes), which is what let these
   sessions run with nobody at the controller.
+
+  The switches are cleared as the cause. Four unattended sessions on `b24-keeps`, the intro looping
+  throughout (132 AV1 decoder opens in the longest), each ran 28-60 min with no guest fault and no
+  crash: 0903 alone (28.5 min), 0903 + NaN guard + position invariant + past-critical (28.7 min),
+  0903 + padded square + superseded (28.8 min), and all five on (59.7 min) — the last being the
+  configuration of the runs that used to die. What differs between those runs and these is how the
+  game was started: the ones that died were picked from the launcher; these were started by
+  `EDEN_LAUNCHER_AUTOPICK`, which never opens the launcher at all. Next test: OoT started *from the
+  launcher* on this build, which needs someone at the controller.
 - **The parent's new core stops OoT 55 s in, at the end of the intro video (2026-11-13).**
   On v1.000.002 (installed as the pure base, `env.txt` with only the two observational
   switches) the game boots, plays the intro at 59.6-60.0 FPS from the stutter trace, and dies at
